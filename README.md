@@ -267,6 +267,7 @@ If you use Vibecut in your research, please cite:
 | File | What's there |
 |---|---|
 | [CONFIG.md](CONFIG.md) | Complete TOML schema reference for hand-authored projects. |
+| [WIZARD.md](WIZARD.md) | Web UI's guided config editor, step by step. No TOML required. |
 | [DOCKER.md](DOCKER.md) | Docker build / run / wire-up guide. Includes the CLI workflow. |
 | [scripts/](scripts/) | PowerShell helpers for CLI, Docker, and web-layer dev workflows. |
 
