@@ -1,10 +1,10 @@
 # Start the MCP server in detached mode. Bind-mounts host paths into
-# the container; defaults assume the masinuta footage and the in-repo
-# `out/mcp/` projects directory, but both are overridable.
+# the container; the projects dir defaults to the in-repo `out/mcp/`
+# folder, but -Footage has no default — it's your footage, not ours.
 #
 # Usage:
-#   scripts\serve-mcp.ps1
-#   scripts\serve-mcp.ps1 -Footage "E:\different\footage" -Projects "C:\elsewhere\projects"
+#   scripts\serve-mcp.ps1 -Footage "E:\footage"
+#   scripts\serve-mcp.ps1 -Footage "E:\footage" -Projects "C:\elsewhere\projects"
 #   scripts\serve-mcp.ps1 -Stop
 #
 # After the server is up, point Claude Desktop / LM Studio at
@@ -12,7 +12,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Footage  = 'E:/DATA/GOPRO VIDEO/2020.04 - Ne dăm cu mașinuța electrică',
+    [string]$Footage,
     [string]$Projects = (Join-Path (Split-Path -Parent $PSScriptRoot) 'out\mcp'),
     [int]   $Port     = 8080,
     [switch]$NoGpu,
@@ -30,6 +30,10 @@ if ($Stop) {
     exit 0
 }
 
+if (-not $Footage) {
+    Write-Host "ERROR: -Footage is required (path to your GoPro/DJI footage folder)" -ForegroundColor Red
+    exit 2
+}
 if (-not (Test-Path $Footage)) {
     Write-Host "ERROR: footage path not found: $Footage" -ForegroundColor Red
     exit 2

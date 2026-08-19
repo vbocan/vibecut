@@ -4,10 +4,7 @@ and surface the final mp4 path. Equivalent to what the Python-era
 `mcp_server.python/run_edit.py` did, retargeted to the all-Rust server's
 Streamable HTTP transport.
 
-    python vibecut-mcp/run_edit.py --gpus --target 1m30s
-
-Defaults match the masinuta example so a bare invocation does something
-useful on this machine.
+    python vibecut-mcp/run_edit.py --gpus --target 1m30s --footage "E:/footage"
 """
 from __future__ import annotations
 
@@ -23,7 +20,6 @@ from pathlib import Path
 
 PROTOCOL_VERSION = "2025-03-26"
 
-DEFAULT_FOOTAGE = "E:/DATA/GOPRO VIDEO/2020.04 - Ne dăm cu mașinuța electrică"
 DEFAULT_PROJECTS = "C:/Users/vboca/OneDrive/Playground/Vibecut/out/mcp"
 
 
@@ -59,7 +55,7 @@ def post(base_url: str, body: dict, session_id: str | None = None, timeout_s: fl
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="vibecut:latest")
-    parser.add_argument("--footage", default=DEFAULT_FOOTAGE)
+    parser.add_argument("--footage", required=True, help="Path to your GoPro/DJI footage folder")
     parser.add_argument("--projects", default=DEFAULT_PROJECTS)
     parser.add_argument("--target", default="3m")
     parser.add_argument("--vibe", default="kid_reel")

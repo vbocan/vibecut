@@ -2,14 +2,13 @@
 
 Runs every vibe in the library (or a chosen subset) against the same
 footage folder and writes the rendered outputs side by side under
-`/projects/sweep/<vibe>.mp4`. Produces a comparison table the systems
-paper can cite directly: same source → six aesthetics, all from one
-toolchain, all reproducible from the same seed.
+`/projects/sweep/<vibe>.mp4`. Useful for eyeballing all six aesthetics
+against the same source in one pass — same seed, so it's reproducible.
 
 Usage:
 
-    python vibecut-mcp/sweep.py --gpus
-    python vibecut-mcp/sweep.py --vibes kid_reel,drone_cinematic --gpus
+    python vibecut-mcp/sweep.py --footage "E:/footage" --gpus
+    python vibecut-mcp/sweep.py --footage "E:/footage" --vibes kid_reel,drone_cinematic --gpus
 
 The summary lands at `/projects/sweep/sweep_summary.json` (mounted
 back to the host's `out/mcp/sweep/`).
@@ -29,7 +28,6 @@ from pathlib import Path
 
 PROTOCOL_VERSION = "2025-03-26"
 
-DEFAULT_FOOTAGE = "E:/DATA/GOPRO VIDEO/2020.04 - Ne dăm cu mașinuța electrică"
 DEFAULT_PROJECTS = "C:/Users/vboca/OneDrive/Playground/Vibecut/out/mcp"
 
 ALL_VIBES = [
@@ -115,7 +113,7 @@ def rewrite_output_path(toml_text: str, new_output_path: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="vibecut:latest")
-    parser.add_argument("--footage", default=DEFAULT_FOOTAGE)
+    parser.add_argument("--footage", required=True, help="Path to your GoPro/DJI footage folder")
     parser.add_argument("--projects", default=DEFAULT_PROJECTS)
     parser.add_argument("--vibes",
                         default=",".join(ALL_VIBES),

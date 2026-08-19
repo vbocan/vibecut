@@ -29,7 +29,7 @@ export interface RenderHistoryEntry {
 
 class AppState {
 	// ---------- Sources ----------
-	folder = $state('masinuta');
+	folder = $state('');
 	discovering = $state(false);
 	discoverResult = $state<api.DiscoverResult | null>(null);
 	discoverError = $state<string | null>(null);

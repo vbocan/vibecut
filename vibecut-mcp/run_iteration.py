@@ -11,7 +11,7 @@ client had decided to iterate. Validates that:
 
 Usage:
 
-    python vibecut-mcp/run_iteration.py --gpus
+    python vibecut-mcp/run_iteration.py --footage "E:/footage" --gpus
 
 By default exercises the `Calmer` action against an `action_highlight`
 proposal. Pass --action calmer | punchier | scale_shorter | scale_longer
@@ -31,7 +31,6 @@ from pathlib import Path
 
 PROTOCOL_VERSION = "2025-03-26"
 
-DEFAULT_FOOTAGE = "E:/DATA/GOPRO VIDEO/2020.04 - Ne dăm cu mașinuța electrică"
 DEFAULT_PROJECTS = "C:/Users/vboca/OneDrive/Playground/Vibecut/out/mcp"
 
 
@@ -74,7 +73,7 @@ def post(base_url: str, body: dict, sid: str | None = None,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="vibecut:latest")
-    parser.add_argument("--footage", default=DEFAULT_FOOTAGE)
+    parser.add_argument("--footage", required=True, help="Path to your GoPro/DJI footage folder")
     parser.add_argument("--projects", default=DEFAULT_PROJECTS)
     parser.add_argument("--vibe", default="action_highlight")
     parser.add_argument("--action", default="calmer", choices=list(ACTIONS))

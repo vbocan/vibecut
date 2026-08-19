@@ -14,7 +14,7 @@ Usage:
 
     # Replay against a fresh container (script spins one up):
     python vibecut-mcp/replay.py --log out/mcp/sessions/<file>.jsonl \\
-        --footage "E:/.../masinuta" --gpus
+        --footage "E:/footage" --gpus
 
     # Replay against an existing running server:
     python vibecut-mcp/replay.py --log <file>.jsonl \\
@@ -227,8 +227,8 @@ def main() -> int:
                         help="MCP server URL. If omitted, the script spins up a temporary container.")
     parser.add_argument("--image", default="vibecut:latest")
     parser.add_argument("--footage",
-                        default="E:/DATA/GOPRO VIDEO/2020.04 - Ne dăm cu mașinuța electrică",
-                        help="Footage bind-mount source (used only when spawning a container)")
+                        default=None,
+                        help="Footage bind-mount source (required only when spawning a container, i.e. when --base-url is omitted)")
     parser.add_argument("--projects",
                         default="C:/Users/vboca/OneDrive/Playground/Vibecut/out/mcp")
     parser.add_argument("--port", type=int, default=18084)
@@ -264,6 +264,9 @@ def main() -> int:
     if args.base_url:
         base_url = args.base_url
     else:
+        if not args.footage:
+            print("ERROR: --footage is required when --base-url is not given")
+            return 2
         if not Path(args.footage).exists():
             print(f"ERROR: footage path not found: {args.footage}")
             return 2

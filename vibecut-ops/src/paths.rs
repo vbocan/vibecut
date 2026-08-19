@@ -52,8 +52,8 @@ mod tests {
 
     #[test]
     fn slugify_basic() {
-        assert_eq!(slugify("Ne dăm cu mașinuța"), "ne_d_m_cu_ma_inu_a");
-        assert_eq!(slugify("Tomești 2026"), "tome_ti_2026");
+        assert_eq!(slugify("Zi însorită la mare"), "zi_nsorit_la_mare");
+        assert_eq!(slugify("Excursie 2026"), "excursie_2026");
         assert_eq!(slugify(""), "edit");
         assert_eq!(slugify("simple"), "simple");
         assert_eq!(slugify("ALL_CAPS"), "all_caps");
@@ -63,8 +63,8 @@ mod tests {
     fn path_helpers_resolve() {
         assert_eq!(resolve_footage(""), PathBuf::from("/footage"));
         assert_eq!(
-            resolve_footage("masinuta"),
-            PathBuf::from("/footage/masinuta")
+            resolve_footage("vacation"),
+            PathBuf::from("/footage/vacation")
         );
         assert_eq!(resolve_footage("/abs"), PathBuf::from("/abs"));
         assert_eq!(

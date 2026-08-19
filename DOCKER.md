@@ -86,11 +86,10 @@ docker stop vibecut-smoke
 **Real edit on real footage:**
 
 ```bash
-python vibecut-mcp/run_edit.py --gpus --vibe action_highlight
+python vibecut-mcp/run_edit.py --gpus --vibe action_highlight --footage "E:/footage"
 ```
 
 Drives `discover_sources` → `propose_vibe` → `render` end-to-end.
-Defaults to the masinuta footage on E:/; override with `--footage`.
 
 **Interactive UI** (`mcp-inspector`, requires Node):
 

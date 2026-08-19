@@ -18,7 +18,7 @@ The pipeline is wrapped in a Model Context Protocol (MCP) server so an LLM clien
 The conversation loop, end-to-end:
 
 ```
-turn 1 (user)  drops folder /footage/masinuta
+turn 1 (user)  drops folder /footage/summer_trip
 turn 1 (LLM)   discover_sources → list_vibes
                "12 sources, 40 min, kid play. Two options: kid_reel or family_chronicle?"
 
@@ -238,13 +238,15 @@ The web UI has no automated tests yet — `npm run check` (TypeScript + Svelte t
 End-to-end smokes (require Docker):
 
 ```bash
-python vibecut-mcp/http_smoke.py --call-discover    # MCP protocol handshake
-python vibecut-mcp/run_iteration.py --gpus          # propose → render → feedback → render
-python vibecut-mcp/sweep.py --gpus                  # all six vibes against one source
-python vibecut-mcp/replay.py --log <session.jsonl>  # determinism replay
-python vibecut-mcp/inspect_smoke.py                 # multimodal frame extraction
-python vibecut-mcp/async_smoke.py --gpus            # render_async / render_status
+python vibecut-mcp/http_smoke.py --call-discover                       # MCP protocol handshake
+python vibecut-mcp/run_iteration.py --footage <folder> --gpus          # propose → render → feedback → render
+python vibecut-mcp/sweep.py --footage <folder> --gpus                  # all six vibes against one source
+python vibecut-mcp/replay.py --log <session.jsonl> --footage <folder>  # determinism replay
+python vibecut-mcp/inspect_smoke.py --footage <folder>                 # multimodal frame extraction
+python vibecut-mcp/async_smoke.py --footage <folder> --gpus            # render_async / render_status
 ```
+
+`<folder>` is a path to your own GoPro/DJI footage — none of these scripts ship with a default.
 
 ## Citation
 

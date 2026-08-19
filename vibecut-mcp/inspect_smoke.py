@@ -25,7 +25,6 @@ from pathlib import Path
 
 PROTOCOL_VERSION = "2025-03-26"
 
-DEFAULT_FOOTAGE = "E:/DATA/GOPRO VIDEO/2020.04 - Ne dăm cu mașinuța electrică"
 DEFAULT_PROJECTS = "C:/Users/vboca/OneDrive/Playground/Vibecut/out/mcp"
 
 
@@ -59,7 +58,7 @@ def post(base_url: str, body: dict, sid: str | None = None,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="vibecut:latest")
-    parser.add_argument("--footage", default=DEFAULT_FOOTAGE)
+    parser.add_argument("--footage", required=True, help="Path to your GoPro/DJI footage folder")
     parser.add_argument("--projects", default=DEFAULT_PROJECTS)
     parser.add_argument("--mp4", default="/projects/out/footage.mp4",
                         help="Container path of an already-rendered mp4")
