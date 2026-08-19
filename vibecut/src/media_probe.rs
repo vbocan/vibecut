@@ -1,0 +1,478 @@
+//! Media file discovery and metadata extraction.
+//!
+//! Wraps the system `ffprobe` binary to extract container / codec / stream
+//! info, plus dedicated helpers for the GoPro use case (extracting the
+//! `gpmd` data track for [`crate::gopro_metadata`] to parse, scanning a
+//! file's tail for the legacy MP4 `udta` HMMT atom).
+//!
+//! # Surfaces
+//!
+//! - **Folder discovery** ([`discover`]) — walk a directory and return paths
+//!   matching the configured include patterns. Sorted, UTF-8 paths only.
+//!
+//! - **Probing**
+//!   - [`probe_metadata`] — *fast path*. ffprobe + filesystem stat, no
+//!     content hash. Used by the render pipeline; avoids re-hashing
+//!     multi-GB files on every run.
+//!   - [`probe_one`] — *slow path*. Same plus a streaming blake3 hash of
+//!     the file content. Used by the `probe` CLI subcommand.
+//!
+//! - **GPMF helpers**
+//!   - [`find_gpmf_stream_index`] — discover which stream of an MP4 has
+//!     `codec_tag = "gpmd"`.
+//!   - [`extract_gpmf_bytes`] — pipe that stream's raw bytes into a `Vec<u8>`
+//!     so [`crate::gopro_metadata`] can parse it.
+//!   - [`read_head_and_tail`] — cheap range read for scanning the MP4 `udta`
+//!     atom for the legacy HMMT HiLight table without loading multi-GB
+//!     files into RAM.
+//!
+//! ffprobe is optional at probe time: if it's not on PATH, probing reports
+//! the filesystem-level info only (size, hash) and surfaces the missing
+//! tool in the result.
+
+use anyhow::{Context, Result};
+use camino::{Utf8Path, Utf8PathBuf};
+use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::process::Command;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbedFile {
+    pub path: Utf8PathBuf,
+    pub size_bytes: u64,
+    /// `None` when probed in metadata-only mode (no content hash computed).
+    pub blake3: Option<String>,
+    pub media: Option<MediaInfo>,
+    pub probe_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaInfo {
+    pub container: String,
+    pub duration_secs: f64,
+    pub creation_time: Option<String>,
+    pub video: Option<VideoStream>,
+    pub audio: Option<AudioStream>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoStream {
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioStream {
+    pub codec: String,
+    pub sample_rate: u32,
+    pub channels: u32,
+}
+
+/// Return `true` when `path` has a still-image extension.
+///
+/// Used throughout the pipeline to route image inputs to the Ken Burns
+/// renderer instead of the video normalizer.
+pub fn is_image_path(path: &Utf8Path) -> bool {
+    matches!(
+        path.extension().map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "tif")
+    )
+}
+
+/// Walk `folder` and return paths whose filename matches any of the include
+/// patterns. Currently supports the common `**/*.EXT` form (case-insensitive
+/// extension match); a real glob engine isn't implemented yet.
+pub fn discover(folder: &Utf8Path, include: &[String]) -> Result<Vec<Utf8PathBuf>> {
+    let exts = extensions_from_patterns(include);
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(folder).follow_links(false) {
+        let entry = entry.with_context(|| format!("walking {folder}"))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = match Utf8PathBuf::from_path_buf(entry.path().to_path_buf()) {
+            Ok(p) => p,
+            Err(_) => continue, // skip non-UTF8 paths
+        };
+        let Some(ext) = p.extension() else {
+            continue;
+        };
+        if exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            out.push(p);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn extensions_from_patterns(patterns: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in patterns {
+        if let Some(dot) = p.rfind('.') {
+            let ext = &p[dot + 1..];
+            if !ext.is_empty() && !ext.contains('*') && !ext.contains('?') {
+                out.push(ext.to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        out.extend(["mp4", "MP4", "mov", "MOV"].into_iter().map(String::from));
+    }
+    out
+}
+
+/// Hash a file with blake3 in 256 KiB chunks. Returns the hex digest.
+pub fn hash_file(path: &Utf8Path) -> Result<(String, u64)> {
+    let mut hasher = blake3::Hasher::new();
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((hasher.finalize().to_hex().to_string(), total))
+}
+
+/// Probe one file: blake3 content hash + ffprobe metadata.
+/// Use this when reproducibility matters (e.g. building a cache key or a manifest).
+/// For large files, the hash dominates the cost.
+pub fn probe_one(path: &Utf8Path) -> Result<ProbedFile> {
+    let (digest, size) = hash_file(path)?;
+    let (media, probe_error) = match run_ffprobe(path) {
+        Ok(m) => (Some(m), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    Ok(ProbedFile {
+        path: path.to_path_buf(),
+        size_bytes: size,
+        blake3: Some(format!("blake3:{digest}")),
+        media,
+        probe_error,
+    })
+}
+
+/// Probe the duration of the video stream specifically (not the format
+/// duration, which is the longest of all streams). Returns 0.0 on error.
+/// Used to cap the muxed-output audio length to the actual video length —
+/// AAC frame quantisation in `acrossfade` chains can leave the audio stream
+/// longer than the video, which would otherwise cause the player to hold
+/// the last frame at the end while audio keeps playing.
+pub fn probe_video_duration(path: &Utf8Path) -> f64 {
+    let output = match Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=duration",
+            "-of", "csv=p=0",
+            path.as_str(),
+        ])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return 0.0,
+    };
+    if !output.status.success() {
+        return 0.0;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse::<f64>().unwrap_or(0.0)
+}
+
+/// Metadata-only probe: ffprobe + filesystem size, no content hash.
+/// Cheap (milliseconds even for multi-GB files); use this in the render pipeline
+/// where we only need durations and codecs. The cache will be the place
+/// where hashes get computed lazily.
+pub fn probe_metadata(path: &Utf8Path) -> Result<ProbedFile> {
+    let size = std::fs::metadata(path.as_std_path())
+        .with_context(|| format!("stat {path}"))?
+        .len();
+    let (media, probe_error) = match run_ffprobe(path) {
+        Ok(m) => (Some(m), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    Ok(ProbedFile {
+        path: path.to_path_buf(),
+        size_bytes: size,
+        blake3: None,
+        media,
+        probe_error,
+    })
+}
+
+fn run_ffprobe(path: &Utf8Path) -> Result<MediaInfo> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            path.as_str(),
+        ])
+        .output()
+        .with_context(|| "spawning ffprobe (is it on PATH?)")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout)
+        .context("parsing ffprobe JSON")?;
+    Ok(parsed.into_media_info())
+}
+
+#[derive(Deserialize)]
+struct FfprobeOutput {
+    format: FfprobeFormat,
+    #[serde(default)]
+    streams: Vec<FfprobeStream>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeFormat {
+    #[serde(default)]
+    format_name: String,
+    #[serde(default)]
+    duration: Option<String>,
+    #[serde(default)]
+    tags: Option<std::collections::BTreeMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeStream {
+    #[serde(default)]
+    codec_type: String,
+    #[serde(default)]
+    codec_name: String,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    r_frame_rate: Option<String>,
+    #[serde(default)]
+    sample_rate: Option<String>,
+    #[serde(default)]
+    channels: Option<u32>,
+}
+
+impl FfprobeOutput {
+    fn into_media_info(self) -> MediaInfo {
+        let duration_secs = self
+            .format
+            .duration
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let creation_time = self
+            .format
+            .tags
+            .as_ref()
+            .and_then(|t| t.get("creation_time").cloned());
+
+        let mut video = None;
+        let mut audio = None;
+        for s in self.streams {
+            match s.codec_type.as_str() {
+                "video" if video.is_none() => {
+                    video = Some(VideoStream {
+                        codec: s.codec_name,
+                        width: s.width.unwrap_or(0),
+                        height: s.height.unwrap_or(0),
+                        fps: parse_fraction(s.r_frame_rate.as_deref()),
+                    });
+                }
+                "audio" if audio.is_none() => {
+                    audio = Some(AudioStream {
+                        codec: s.codec_name,
+                        sample_rate: s
+                            .sample_rate
+                            .as_deref()
+                            .and_then(|x| x.parse().ok())
+                            .unwrap_or(0),
+                        channels: s.channels.unwrap_or(0),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        MediaInfo {
+            container: self.format.format_name,
+            duration_secs,
+            creation_time,
+            video,
+            audio,
+        }
+    }
+}
+
+// ---------- GPMF extraction ----------
+
+/// Find the index of the GoPro Metadata stream (codec_tag=`gpmd`), if present.
+pub fn find_gpmf_stream_index(path: &Utf8Path) -> Result<Option<u32>> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            path.as_str(),
+        ])
+        .output()
+        .with_context(|| "spawning ffprobe")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    #[derive(Deserialize)]
+    struct ProbeOut {
+        #[serde(default)]
+        streams: Vec<Stream>,
+    }
+    #[derive(Deserialize)]
+    struct Stream {
+        index: u32,
+        #[serde(default)]
+        codec_tag_string: String,
+    }
+    let parsed: ProbeOut = serde_json::from_slice(&output.stdout)?;
+    Ok(parsed
+        .streams
+        .into_iter()
+        .find(|s| s.codec_tag_string == "gpmd")
+        .map(|s| s.index))
+}
+
+/// Read up to `head_bytes` from the start and `tail_bytes` from the end of
+/// the file. Used to scan for MP4 atoms (moov can be at either end on GoPro
+/// files) without loading multi-gigabyte files into memory.
+pub fn read_head_and_tail(
+    path: &Utf8Path,
+    head_bytes: u64,
+    tail_bytes: u64,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path.as_std_path())
+        .with_context(|| format!("opening {path}"))?;
+    let len = f.metadata()?.len();
+    let take_head = head_bytes.min(len);
+    let mut head = vec![0u8; take_head as usize];
+    f.read_exact(&mut head)?;
+
+    let mut tail = Vec::new();
+    if len > take_head + tail_bytes {
+        f.seek(SeekFrom::End(-(tail_bytes as i64)))?;
+        tail.resize(tail_bytes as usize, 0);
+        f.read_exact(&mut tail)?;
+    } else if len > take_head {
+        // Read whatever's left.
+        let remaining = len - take_head;
+        tail.resize(remaining as usize, 0);
+        f.read_exact(&mut tail)?;
+    }
+    head.extend(tail);
+    Ok(head)
+}
+
+/// Extract the GPMF data track from `path` to a byte vector. Returns `None`
+/// if the file has no `gpmd` stream.
+pub fn extract_gpmf_bytes(path: &Utf8Path) -> Result<Option<Vec<u8>>> {
+    let Some(idx) = find_gpmf_stream_index(path)? else {
+        return Ok(None);
+    };
+    // We pipe via ffmpeg → stdout because gpmd payloads are concatenated raw.
+    let map_arg = format!("0:{idx}");
+    let output = Command::new("ffmpeg")
+        .args([
+            "-v", "error",
+            "-i", path.as_str(),
+            "-map", &map_arg,
+            "-codec", "copy",
+            "-f", "data",
+            "-",
+        ])
+        .output()
+        .with_context(|| "spawning ffmpeg for GPMF extraction")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffmpeg GPMF extract failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(Some(output.stdout))
+}
+
+fn parse_fraction(s: Option<&str>) -> f32 {
+    let Some(s) = s else {
+        return 0.0;
+    };
+    if let Some((num, den)) = s.split_once('/') {
+        let n: f32 = num.parse().unwrap_or(0.0);
+        let d: f32 = den.parse().unwrap_or(1.0);
+        if d == 0.0 { 0.0 } else { n / d }
+    } else {
+        s.parse().unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extensions_extracted() {
+        let exts = extensions_from_patterns(&[
+            "**/*.MP4".into(),
+            "**/*.mp4".into(),
+        ]);
+        assert!(exts.iter().any(|e| e == "MP4"));
+        assert!(exts.iter().any(|e| e == "mp4"));
+    }
+
+    #[test]
+    fn extensions_default_when_empty() {
+        let exts = extensions_from_patterns(&[]);
+        assert!(exts.iter().any(|e| e.eq_ignore_ascii_case("mp4")));
+    }
+
+    #[test]
+    fn fractions_parse() {
+        assert_eq!(parse_fraction(Some("30/1")), 30.0);
+        assert!((parse_fraction(Some("30000/1001")) - 29.97).abs() < 0.01);
+        assert_eq!(parse_fraction(Some("60")), 60.0);
+        assert_eq!(parse_fraction(None), 0.0);
+        assert_eq!(parse_fraction(Some("1/0")), 0.0);
+    }
+
+    #[test]
+    fn hashes_a_known_string() {
+        let dir = std::env::temp_dir().join("vibecut_test_hash");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.bin");
+        std::fs::write(&file, b"hello").unwrap();
+        let p = Utf8PathBuf::from_path_buf(file).unwrap();
+        let (digest, size) = hash_file(&p).unwrap();
+        assert_eq!(size, 5);
+        // blake3("hello") is well-known.
+        assert_eq!(
+            digest,
+            "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f"
+        );
+    }
+}

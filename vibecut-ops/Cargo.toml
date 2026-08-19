@@ -1,0 +1,47 @@
+[package]
+name = "vibecut-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "vibecut_ops"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace-shared.
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Direct library access to the pipeline. This is the whole point of
+# this crate: every op below calls vibecut in-process, no
+# subprocess, no transport assumptions.
+vibecut = { path = "../vibecut" }
+camino = "1"
+
+chrono = "0.4"
+regex = "1"
+toml = "0.8"
+
+# JSON Schema for FeedbackAction — plain `schemars`, not `rmcp::schemars`.
+# Keeping this crate off rmcp entirely is what lets a future REST/web
+# layer reuse the same typed contract for OpenAPI / TS codegen
+# without pulling in an MCP dependency.
+schemars = { version = "1.1" }
+
+# ffmpeg frame extraction for inspect_output / inspect_at.
+base64 = "0.22"
+futures-util = "0.3"
+
+# TS export for FeedbackAction (the web UI's quick-feedback
+# buttons need a typed request body), gated the same way vibecut's
+# Config/Manifest export is — optional, zero cost unless requested.
+ts-rs = { version = "9", optional = true }
+
+[features]
+ts-export = ["dep:ts-rs"]

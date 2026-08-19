@@ -1,0 +1,95 @@
+# Winter sports footage from Vârtop. 14 standalone GoPro clips (no chapter
+# chains here), so the picker has 14 distinct moments to draw from. ~2-minute
+# output is a good fit for that many sources — enough room for ~6 picks per
+# source × 4 s ≈ 84 picks, but we cap to ~5 per source for variety.
+#
+# Snow scenes have strong accel signal (skiing/sledding bumps), great
+# motion-peak signal, and tons of high-exposure-score (well-lit) frames —
+# the picker should produce confident selections without much tuning.
+
+schema_version = 1
+
+[project]
+name            = "Distracție cu zăpadă la Vârtop · 2025"
+target_duration = "3m"
+fps             = 30
+seed            = 42
+fade_in         = "2000ms"
+fade_out        = "5000ms"
+
+[[outputs]]
+path          = "out/vartop.mp4"
+resolution    = "1920x1080"
+encoder       = "auto"
+crf           = 20
+audio_bitrate = "192k"
+
+[input]
+folder  = "E:/DATA/GOPRO VIDEO/2025.01 - Distracție cu zăpadă la Vârtop"
+include = ["**/*.MP4"]
+
+[soundtrack]
+# Same soundtrack as examples/egypt.toml. Smart-loop + 2 s qsin crossfade
+# handles tracks shorter than the output duration.
+file              = "footage/alexzavesa-dance-playful-night-510786.mp3"
+beat_align        = true
+duck_count        = 3
+duck_min_spacing  = "25s"
+duck_min_dur      = "4s"
+duck_max_dur      = "8s"
+ducking_db        = -18
+fade_out          = "3000ms"
+beat_burst        = "auto"
+
+[selection]
+min_clip       = "2s"
+max_clip       = "7s"
+max_per_source = 5
+
+[transition]
+default  = "fade"
+duration = "400ms"
+
+[intro]
+duration = "8s"
+mode     = "card"
+bg_color = "#0a3d62"   # cold winter blue
+fade_in  = "700ms"
+fade_out = "2000ms"
+
+[[intro.layers]]
+kind     = "text"
+content  = "Vârtop · 2025"
+font     = "arialbd.ttf"
+size     = 110
+color    = "#E8F4FF"   # cool snow-white
+position = "center"
+
+[[intro.layers]]
+kind     = "text"
+content  = "Distracție cu zăpadă"
+font     = "arial.ttf"
+size     = 44
+color    = "#B8D4E8"
+position = "center"
+y_offset = 80
+
+[outro]
+duration = "6.0s"
+mode     = "overlay"
+fade_in  = "700ms"
+fade_out = "5500ms"
+
+[[outro.layers]]
+kind       = "text"
+content    = "ianuarie 2025"
+font       = "arialbd.ttf"
+size       = 64
+color      = "#FFFFFF"
+position   = "bottom-center"
+background = { color = "#000000AA", padding = "20px" }
+
+[grading]
+# HyperSmooth in-camera already stabilizes modern GoPro footage. Only turn
+# this on for HyperSmooth-Off recordings or other shaky non-GoPro sources.
+stabilize = false

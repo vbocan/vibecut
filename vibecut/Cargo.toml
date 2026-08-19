@@ -1,0 +1,46 @@
+[package]
+name = "vibecut"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version = "1.80"
+
+[lib]
+name = "vibecut"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vibecut"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace-shared.
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Crate-local (not used by the MCP server, no need to share).
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+humantime = "2"
+humantime-serde = "1"
+blake3 = "1"
+walkdir = "2"
+rayon = "1"
+camino = { version = "1", features = ["serde1"] }
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["download-binaries", "tls-rustls", "ndarray", "cuda"] }
+ndarray = { version = "0.17", default-features = false, features = ["std"] }
+
+# TypeScript type codegen for Config/Manifest, gated behind
+# the `ts-export` feature so it costs the production/Docker build
+# nothing — see the `#[cfg_attr(feature = "ts-export", ...)]` derives
+# in project_config.rs and selection_planner.rs.
+ts-rs = { version = "9", optional = true }
+
+[features]
+ts-export = ["dep:ts-rs"]

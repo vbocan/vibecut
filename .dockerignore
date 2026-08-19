@@ -1,0 +1,28 @@
+# Keep the build context small. Only what the Dockerfile actually copies
+# needs to be reachable; everything else is noise.
+target/
+out/
+.vibecut*/
+.vibecut-cache/
+*.mp4
+*.mov
+*.MP4
+*.MOV
+footage/
+models/
+*.md
+.git/
+.gitignore
+*.log
+.vscode/
+.idea/
+start.ps1
+
+# vibecut-ui is a real npm project — the Dockerfile's web-builder
+# stage runs `npm ci && npm run build` itself, so the host's own
+# node_modules/.svelte-kit/build (61 MB+ of exactly the kind of
+# thing that shouldn't round-trip through the build context) never
+# need to leave the host.
+vibecut-ui/node_modules/
+vibecut-ui/.svelte-kit/
+vibecut-ui/build/

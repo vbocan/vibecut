@@ -1,0 +1,55 @@
+[package]
+name = "vibecut-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vibecut-web"
+path = "src/main.rs"
+
+[lib]
+name = "vibecut_web"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# "ws" isn't in axum's default feature set — everything else this
+# crate needs (json, query, tokio) is.
+axum = { workspace = true, features = ["ws"] }
+
+# Every handler here is a thin HTTP/WS translation over
+# vibecut-ops — no pipeline logic lives in this crate, matching the
+# same "transport is a wrapper, not an owner" rule vibecut-mcp
+# follows.
+vibecut-ops = { path = "../vibecut-ops" }
+
+# Frame bytes -> data URIs for /api/frames/*, the REST equivalent of
+# how vibecut-mcp base64-encodes inline MCP image content.
+base64 = "0.22"
+
+# Direct Anthropic API calls for the free-text brief
+# feature. rustls (not native-tls) to avoid an OpenSSL link dependency
+# on top of everything else this image already builds.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serves the built SvelteKit static site (adapter-static
+# output) as the router's fallback, so the Docker image needs nothing
+# beyond this binary to host the whole web UI — no separate Node
+# process, no `vite dev`, in production.
+tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
+# `ServiceExt::oneshot` for router tests — the base `tower::Service`
+# trait vibecut-mcp's main.rs uses doesn't need this feature, but
+# the extension trait for one-shot test requests does.
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"

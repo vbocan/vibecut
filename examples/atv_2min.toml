@@ -1,0 +1,102 @@
+# Showcase: 2-minute video with intro = card, outro = overlay,
+# variable-length ducks, soundtrack fade-out, video fade-in/out, chronological
+# selection.
+
+schema_version = 1
+
+[project]
+name            = "Chișoda · 2-min ride"
+target_duration = "2m"
+fps             = 30
+seed            = 11
+fade_in         = "600ms"        # video fade-in from black
+fade_out        = "800ms"        # video fade-out to black
+
+[[outputs]]
+path          = "out/atv_2min.mp4"
+resolution    = "1920x1080"
+encoder       = "auto"
+crf           = 20
+audio_bitrate = "192k"
+
+[input]
+folder  = "E:/DATA/GOPRO VIDEO/2025.09 - La Chișoda cu ATV-ul"
+include = ["**/*.MP4"]
+
+[soundtrack]
+file              = "C:/Users/vboca/OneDrive/Desktop/Sfântă-i slana.mp3"
+beat_align        = true
+duck_count        = 3
+duck_min_spacing  = "25s"
+duck_min_dur      = "4s"
+duck_max_dur      = "7s"
+ducking_db        = -18
+# Long, gradual tail-fade so the listener's ear gets a smooth ramp into
+# silence rather than a sudden cut.
+fade_out          = "4000ms"
+# Rapid beat-aligned cut burst at the soundtrack's energy peak.
+# `auto` (default) enables it iff: tempo ∈ [80, 180] BPM, pulse_strength ≥ 1.8,
+# and loud-region length ≥ 6 s. `off` disables; `on` forces.
+beat_burst        = "auto"
+# beat_burst_min_beats = 8       # silent skip if fewer than this fit
+# beat_burst_max_beats = 12      # cap on burst length
+
+[selection]
+min_clip = "2s"
+max_clip = "5s"
+
+[transition]
+default  = "fade"
+duration = "400ms"
+
+# Intro = solid black card (classic title card with selectable bg color)
+[intro]
+duration = "5.5s"
+mode     = "card"
+bg_color = "#000000"
+fade_in  = "700ms"
+fade_out = "600ms"
+
+[[intro.layers]]
+kind     = "text"
+content  = "Chișoda · 2025"
+font     = "arialbd.ttf"
+size     = 110
+color    = "#FFFFFF"
+position = "center"
+
+# Optional logo layer (e.g. PNG with transparent background) — uncomment when ready:
+# [[intro.layers]]
+# kind     = "image"
+# path     = "footage/logo.png"
+# position = "bottom-right"
+# height   = 120
+# x_offset = -40
+# y_offset = -40
+# opacity  = 0.85
+# fade_in  = "500ms"
+# fade_out = "500ms"
+
+# Outro = overlay on the LAST segment's footage (no separate clip).
+# Long enough that the soundtrack's 4 s tail fade-out finishes BEFORE the
+# video ends — so the listener's ear gets a clear ramp into silence rather
+# than the music cutting off as the credits appear.
+[outro]
+duration = "7.0s"
+mode     = "overlay"
+fade_in  = "600ms"
+fade_out = "1200ms"
+
+[[outro.layers]]
+kind       = "text"
+content    = "@vbocan · cu ATV-ul"
+font       = "arialbd.ttf"
+size       = 72
+color      = "#FFFFFF"
+position   = "bottom-center"
+background = { color = "#000000AA", padding = "20px" }
+
+[grading]
+# HyperSmooth in-camera already stabilizes modern GoPro footage. Only turn
+# this on for HyperSmooth-Off recordings or other shaky non-GoPro sources.
+stabilize = false

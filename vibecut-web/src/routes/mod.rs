@@ -1,0 +1,48 @@
+//! Route table. One module per `vibecut-ops` module it wraps, same
+//! grouping the crate-level docs describe.
+
+pub mod brief;
+pub mod config;
+pub mod discover;
+pub mod feedback;
+pub mod frames;
+pub mod output;
+pub mod propose;
+pub mod render;
+pub mod sessions;
+pub mod vibes;
+
+use axum::routing::{get, post};
+use axum::{Json, Router};
+
+use crate::state::AppState;
+
+/// The `/api/*` route table, without the `/api` prefix itself — that's
+/// added once by [`crate::router`] so this stays mountable at any
+/// prefix a future caller (e.g. a merged vibecut-mcp container)
+/// wants.
+pub fn api_router() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health))
+        .route("/sources", get(discover::discover_sources))
+        .route("/vibes", get(vibes::list_vibes))
+        .route("/propose", post(propose::propose_vibe))
+        .route(
+            "/config",
+            get(config::read_config).put(config::write_config),
+        )
+        .route("/feedback", post(feedback::apply_feedback))
+        .route("/brief", post(brief::submit_brief))
+        .route("/render", post(render::render_sync))
+        .route("/render/async", post(render::render_async))
+        .route("/render/{job_id}", get(render::render_status))
+        .route("/frames/output", get(frames::inspect_output))
+        .route("/frames/at", get(frames::inspect_at))
+        .route("/output", get(output::serve_output))
+        .route("/sessions", get(sessions::list_sessions))
+        .route("/ws/render/{job_id}", get(crate::ws::render_progress_ws))
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true, "service": "vibecut-web" }))
+}

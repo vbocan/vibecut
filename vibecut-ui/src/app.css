@@ -1,0 +1,65 @@
+/* Design tokens shared with the Preview & Timeline wireframe (Phase
+   10 planning artifact) — same dark, video-editing-tool palette, same
+   font pairing (Manrope for UI, IBM Plex Mono for data/timecodes). */
+
+:root {
+	--ink: #14171c;
+	--panel: #1b1f27;
+	--panel-alt: #222833;
+	--line: #2b313d;
+	--text: #e7e9ee;
+	--text-dim: #8c93a3;
+	--text-faint: #5b6272;
+	--accent: #ff7a45;
+	--accent-dim: #7a4326;
+	--good: #5cc98a;
+	--warn: #e3b756;
+	--bad: #e2645c;
+	--mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Consolas, monospace;
+	--ui: 'Manrope', -apple-system, 'Segoe UI', sans-serif;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	min-height: 100%;
+}
+
+body {
+	background: var(--ink);
+	color: var(--text);
+	font-family: var(--ui);
+	font-size: 14px;
+	line-height: 1.5;
+}
+
+::selection {
+	background: var(--accent-dim);
+	color: #fff;
+}
+
+button,
+input,
+textarea,
+select {
+	font-family: inherit;
+	color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+a:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+code,
+pre {
+	font-family: var(--mono);
+}

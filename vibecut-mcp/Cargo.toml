@@ -1,0 +1,49 @@
+[package]
+name = "vibecut-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vibecut-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "vibecut_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace-shared.
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+
+# rmcp = the official Rust MCP SDK. Supports Streamable HTTP (2025-06-18
+# spec) plus the stdio and SSE transports.
+rmcp = { version = "0.10", features = [
+    "server",
+    "transport-streamable-http-server",
+    "macros",
+] }
+schemars = { version = "1.1", features = ["chrono04"] }
+
+# Every operation this server exposes lives in vibecut-ops as a
+# transport-free function. This crate is a thin MCP-shaped wrapper
+# around it — it no longer depends on `vibecut` (the pipeline
+# crate) directly.
+vibecut-ops = { path = "../vibecut-ops" }
+
+# `apply_feedback`'s FeedbackAction lives in vibecut-ops but is
+# re-exported through this crate's tool schema, so ApplyFeedbackArgs
+# picks it up transitively — no extra dep needed for that. base64
+# stays here because packaging extracted frames as inline MCP
+# `Content::image` (base64 JPEG) is transport-specific, not something
+# vibecut-ops has an opinion on.
+base64 = "0.22"

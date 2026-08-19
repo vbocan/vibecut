@@ -1,0 +1,56 @@
+# Two-camera shoot example. Drop both cameras' MP4s into one folder; the
+# planner auto-groups any sources whose recording windows overlap (using
+# creation_time + duration) and picks the best angle at each cut.
+
+schema_version = 1
+
+[project]
+name            = "Multicam · sample event"
+target_duration = "30s"
+fps             = 30
+seed            = 7
+
+[[outputs]]
+path          = "out/multicam.mp4"
+resolution    = "1920x1080"
+encoder       = "auto"
+crf           = 20
+audio_bitrate = "192k"
+
+[input]
+folder  = "footage/multicam"   # both cameras' files in one folder
+include = ["**/*.MP4"]
+
+[selection]
+min_clip = "1.5s"
+max_clip = "4s"
+
+[transition]
+default  = "fade"
+duration = "400ms"
+
+[multi_angle]
+enabled  = true
+# How offsets between members are computed:
+# - "auto"          → audio xcorr refine over creation_time delta (best default)
+# - "creation_time" → use MP4 creation_time delta verbatim (cheap, requires synced clocks)
+# - "audio"         → same as auto but without the creation_time fallback
+# - "manual"        → read offsets from each [[multi_angle.groups]].offsets table
+sync     = "auto"
+# Don't switch angles within this duration of the previous switch.
+# Avoids epileptic angle-cuts on noisy visual scores.
+min_hold = "1.5s"
+
+# Optional: override the auto-discovered groups. When `groups` is empty,
+# overlapping sources are grouped automatically by recording window.
+#
+# [[multi_angle.groups]]
+# master  = "GX0042"            # source id (the trailing 4 digits for GoPro chapters)
+# members = ["GX0099", "GX0123"]
+# # Manual offsets, only consulted when `sync = "manual"`. Sign convention:
+# # member_local_file_time = master_scene_time + offset.
+# # Negative if the member started LATER than the master.
+# offsets = { GX0099 = "+2.4s", GX0123 = "-1.20s" }
+
+[grading]
+stabilize = false

@@ -1,0 +1,30 @@
+# Dev overlay. Bind-mounts host-built binaries over the baked-in copies
+# so iterating on Rust code doesn't require rebuilding the image. Use as:
+#
+#     docker compose -f compose.yml -f compose.dev.yml up
+#
+# Requires a Linux build of all three binaries on the host first:
+#
+#     cargo build --release       # builds vibecut + vibecut-mcp + vibecut-web
+#
+# (Windows hosts need cross-compile or WSL — same caveat as before.)
+#
+# The web UI's static build is NOT overlaid here — rebuild the image
+# (or bind-mount ./vibecut-ui/build over /app/vibecut-ui yourself) if you're
+# iterating on frontend code; for that, `cd vibecut-ui && npm run dev`
+# against a container started via compose.yml alone is almost always
+# faster anyway (see DOCKER.md's dev loop section).
+
+services:
+  vibecut:
+    volumes:
+      # Override the binaries inside the image with the host build.
+      - type: bind
+        source: ./target/release/vibecut
+        target: /usr/local/bin/vibecut
+      - type: bind
+        source: ./target/release/vibecut-mcp
+        target: /usr/local/bin/vibecut-mcp
+      - type: bind
+        source: ./target/release/vibecut-web
+        target: /usr/local/bin/vibecut-web

@@ -1,0 +1,60 @@
+# Long-lived MCP server + web UI, both served from one container — the
+# MCP client (Claude Desktop / LM Studio) connects over HTTP; a browser
+# hits the web UI directly (see docker/entrypoint.sh).
+#
+#     docker compose up -d
+#     # MCP:    edit Claude Desktop config to point at http://localhost:8080
+#     # Web UI: open http://localhost:8090
+#     docker compose logs -f vibecut
+#     docker compose down
+#
+# Edit the bind-mount paths below (or set via the env vars listed) to
+# match your host.
+
+services:
+  vibecut:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vibecut:latest
+    container_name: vibecut
+    restart: unless-stopped
+    ports:
+      # Streamable HTTP MCP endpoint. Bind to 127.0.0.1 only by default;
+      # override VIBECUT_HTTP_BIND if you want to expose it on the LAN.
+      - "${VIBECUT_HTTP_BIND:-127.0.0.1:8080}:8080"
+      # Web UI + REST/WebSocket API. Same bind-to-localhost default and
+      # the same override knob, one level down.
+      - "${VIBECUT_WEB_BIND:-127.0.0.1:8090}:8090"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      # Source footage. Read-only so a buggy pipeline can't damage it.
+      - type: bind
+        source: ${VIBECUT_FOOTAGE:-./footage}
+        target: /footage
+        read_only: true
+      # TOMLs + rendered output + conversation/session logs.
+      - type: bind
+        source: ${VIBECUT_PROJECTS:-./projects}
+        target: /projects
+      # Persisted analysis cache. Named volume so it survives recreates.
+      - type: volume
+        source: vibecut-cache
+        target: /cache
+    environment:
+      RUST_LOG: ${RUST_LOG:-vibecut_mcp=info,vibecut_web=info,vibecut_ops=info,rmcp=info}
+      VIBECUT_LOG: ${VIBECUT_LOG:-info}
+      # Optional — only needed for the web UI's free-text brief
+      # ("Ask AI") feature. Unset by default; that feature returns a
+      # clear error rather than the server failing to start.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      VIBECUT_LLM_MODEL: ${VIBECUT_LLM_MODEL:-claude-sonnet-5}
+
+volumes:
+  vibecut-cache:

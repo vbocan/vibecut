@@ -1,0 +1,77 @@
+# Playful DJI drone edit — Chișoda, 29.05.2026.
+# Kinetic, beat-aligned, short clips with speed-ramps.
+
+schema_version = 1
+
+[project]
+name            = "Chișoda · drone · 2026"
+target_duration = "1m30s"
+fps             = 30
+seed            = 29
+fade_in         = "300ms"
+fade_out        = "2000ms"
+
+[[outputs]]
+path          = "out/chisoda_drona_2026.mp4"
+resolution    = "1920x1080"
+encoder       = "auto"
+crf           = 22   # CRF 22 keeps output under 180 MB (WhatsApp share)
+audio_bitrate = "192k"
+
+[input]
+folder  = "E:/TEMP/VideoDrona"
+include = ["**/*.MP4"]
+
+[soundtrack]
+file       = "E:/TEMP/VideoDrona/tunetank-beach-party-music-347295.mp3"
+beat_align = true
+duck_count = 0       # DJI = no source audio
+fade_out   = "2500ms"
+beat_burst = "auto"  # music-video burst at the energy peak
+
+[selection]
+min_clip       = "1.8s"
+max_clip       = "4.5s"
+max_per_source = 4
+order          = "energy_arc"
+variety        = 0.2
+
+[transition]
+default                = "fade"
+duration               = "350ms"
+# Quik-style whip-ups on ~40 % of seams: 1.5 s tail at 3× speed with a
+# warm-up + fade-to-white flash. Reads as kinetic.
+speed_ramp_probability = 0.4
+speed_ramp_duration    = "1500ms"
+speed_ramp_factor       = 3.0
+speed_ramp_flash        = true
+
+[intro]
+duration = "4.0s"
+mode     = "card"
+bg_color = "#0b1a2e"
+fade_in  = "500ms"
+fade_out = "500ms"
+
+[[intro.layers]]
+kind         = "text"
+content      = "Chișoda"
+font         = "arialbd.ttf"
+size         = 140
+color        = "#FFE8B0"
+position     = "center"
+appear_at    = "0s"
+disappear_at = "2.2s"
+
+[[intro.layers]]
+kind         = "text"
+content      = "29.05.2026"
+font         = "arial.ttf"
+size         = 60
+color        = "#FFFFFF"
+position     = "center"
+appear_at    = "2.4s"
+disappear_at = "4.0s"
+
+[grading]
+stabilize = false   # DJI gimbal handles this

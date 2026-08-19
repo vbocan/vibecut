@@ -1,0 +1,375 @@
+# Caravana medicală — Delta Dunării, 20–24 mai 2026.
+# 36 fotografii (dedup din ~145) + 31 clipuri GoPro,
+# ordonate strict cronologic peste piesa 'La Chilia-n port' de Ionel Tudorache.
+
+schema_version = 1
+
+[project]
+name            = "Caravana Delta Dunarii 2026"
+target_duration = "5m25s"
+fps             = 30
+seed            = 524
+fade_in         = "700ms"
+fade_out        = "1500ms"
+
+[input]
+folder  = 'E:/TEMP/Video Caravana Delta Dunării'
+include = ["GX*.MP4", "VID_*.mp4"]
+
+# Force-include two phone videos that the GoPro-tuned scorer would otherwise
+# skip — they hold key scenes the user wants in the reel.
+[[input.ranges]]
+file  = "VID_20260521_204418345.mp4"
+start = "20s"
+end   = "26s"
+
+[[input.ranges]]
+file  = "VID_20260521_210657739.mp4"
+start = "30s"
+end   = "36s"
+
+[soundtrack]
+file       = 'E:/TEMP/Video Caravana Delta Dunării/Audio/YTDown_YouTube_Ionel-Tudorache-La-Chilia-n-port_Media_dXfeU3k6FBs_007_128k.mp3'
+beat_align = true
+fade_out   = "2500ms"
+duck_count = 5          # more frequent reveals of the original audio
+duck_min_spacing = "20s"
+duck_min_dur = "3s"
+duck_max_dur = "6s"
+ducking_db = -22.0      # dip the music a bit deeper so dialog cuts through
+beat_burst   = "auto"   # dynamic montage rapid-cut around the loud bit
+
+[selection]
+order          = "strict_chronological"
+min_clip       = "3s"
+max_clip       = "7s"
+max_per_source = 5
+variety        = 0.20
+
+[transition]
+default                = "fade"
+duration               = "150ms"
+speed_ramp_probability = 0.15
+
+[intro]
+duration = "5.0s"
+mode     = "card"
+bg_color = "#0d1b2a"
+fade_in  = "600ms"
+fade_out = "500ms"
+
+[[intro.layers]]
+kind         = "text"
+content      = 'Caravana medicală'
+font         = "arialbd.ttf"
+size         = 72
+color        = "#FFFFFF"
+position     = "center"
+y_offset     = -150
+appear_at    = "0.2s"
+disappear_at = "4.5s"
+fade_in      = "500ms"
+fade_out     = "400ms"
+
+[[intro.layers]]
+kind         = "text"
+content      = 'Delta Dunării'
+font         = "arialbd.ttf"
+size         = 108
+color        = "#f5a623"
+position     = "center"
+y_offset     = -40
+appear_at    = "0.6s"
+disappear_at = "4.7s"
+fade_in      = "500ms"
+fade_out     = "500ms"
+
+[[intro.layers]]
+kind         = "text"
+content      = '20 – 24 mai 2026'
+font         = "arial.ttf"
+size         = 42
+color        = "#E8D8B5"
+position     = "center"
+y_offset     = 80
+appear_at    = "1.4s"
+disappear_at = "4.8s"
+fade_in      = "500ms"
+fade_out     = "500ms"
+
+[[intro.layers]]
+kind         = "text"
+content      = 'Chilia și Crișan'
+font         = "ariali.ttf"
+size         = 36
+color        = "#B8C8DA"
+position     = "center"
+y_offset     = 160
+appear_at    = "2.0s"
+disappear_at = "4.8s"
+fade_in      = "600ms"
+fade_out     = "500ms"
+
+[outro]
+duration = "7s"
+mode     = "card"
+bg_color = "#000000"
+fade_in  = "800ms"
+fade_out = "2500ms"
+
+[[outro.layers]]
+kind         = "text"
+content      = 'Mulțumim,'
+font         = "arial.ttf"
+size         = 56
+color        = "#E8D8B5"
+position     = "center"
+y_offset     = -80
+appear_at    = "0.6s"
+disappear_at = "5.5s"
+fade_in      = "700ms"
+fade_out     = "1500ms"
+
+[[outro.layers]]
+kind         = "text"
+content      = 'Delta Dunării'
+font         = "arialbd.ttf"
+size         = 96
+color        = "#f5a623"
+position     = "center"
+y_offset     = 30
+appear_at    = "1.0s"
+disappear_at = "5.5s"
+fade_in      = "800ms"
+fade_out     = "1500ms"
+
+[grading]
+stabilize = false
+
+[[outputs]]
+path          = 'E:/TEMP/Video Caravana Delta Dunării/Caravana_Delta_Dunarii_Reel.mp4'
+resolution    = "1920x1080"
+encoder       = "auto"
+crf           = 20
+audio_bitrate = "192k"
+
+# ----------------------------------------------------------------------
+# Imagini (cronologic, după timestamp parsat din numele fișierului).
+# Burst-urile WhatsApp au fost reduse la max 4 reprezentanți / cluster.
+# ----------------------------------------------------------------------
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260520_080846437_HDR.jpg'
+duration  = "2.8s"
+effect    = "zoom_in"
+timestamp = "2026-05-20T05:08:46Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260520_103510204_HDR.jpg'
+duration  = "2.8s"
+effect    = "pan_right"
+timestamp = "2026-05-20T07:35:10Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260520_124659543_HDR.jpg'
+duration  = "2.8s"
+effect    = "zoom_out"
+timestamp = "2026-05-20T09:46:59Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260520_152931493_HDR.jpg'
+duration  = "2.8s"
+effect    = "pan_left"
+timestamp = "2026-05-20T12:29:31Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260520_153542498_HDR.jpg'
+duration  = "2.8s"
+effect    = "diagonal"
+timestamp = "2026-05-20T12:35:42Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260520_174056403_HDR.jpg'
+duration  = "2.8s"
+effect    = "rotate_zoom"
+timestamp = "2026-05-20T14:40:56Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260520_195356055_HDR.jpg'
+duration  = "2.8s"
+effect    = "zoom_in"
+timestamp = "2026-05-20T16:53:56Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260520_200023613_HDR.jpg'
+duration  = "2.8s"
+effect    = "pan_right"
+timestamp = "2026-05-20T17:00:23Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-20 at 21.15.18.jpeg'
+duration  = "2.8s"
+effect    = "zoom_out"
+timestamp = "2026-05-20T18:15:18Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-20 at 22.56.30.jpeg'
+duration  = "2.8s"
+effect    = "pan_left"
+timestamp = "2026-05-20T19:56:30Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260521_084857638_HDR.jpg'
+duration  = "2.8s"
+effect    = "diagonal"
+timestamp = "2026-05-21T05:48:57Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260521_091621700_HDR.jpg'
+duration  = "2.8s"
+effect    = "rotate_zoom"
+timestamp = "2026-05-21T06:16:21Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260521_123221412_HDR.jpg'
+duration  = "2.8s"
+effect    = "zoom_in"
+timestamp = "2026-05-21T09:32:21Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-21 at 12.55.41.jpeg'
+duration  = "2.8s"
+effect    = "pan_right"
+timestamp = "2026-05-21T09:55:41Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-21 at 13.02.42.jpeg'
+duration  = "2.8s"
+effect    = "zoom_out"
+timestamp = "2026-05-21T10:02:42Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-21 at 20.25.17.jpeg'
+duration  = "2.8s"
+effect    = "pan_left"
+timestamp = "2026-05-21T17:25:17Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-21 at 20.38.45.jpeg'
+duration  = "2.8s"
+effect    = "diagonal"
+timestamp = "2026-05-21T17:38:45Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260521_205054931_HDR.jpg'
+duration  = "2.8s"
+effect    = "rotate_zoom"
+timestamp = "2026-05-21T17:50:54Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-21 at 23.00.08.jpeg'
+duration  = "2.8s"
+effect    = "zoom_in"
+timestamp = "2026-05-21T20:00:08Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260522_084522722_HDR.jpg'
+duration  = "2.8s"
+effect    = "pan_right"
+timestamp = "2026-05-22T05:45:22Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-22 at 14.16.07.jpeg'
+duration  = "2.8s"
+effect    = "zoom_out"
+timestamp = "2026-05-22T11:16:07Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-22 at 15.14.03.jpeg'
+duration  = "2.8s"
+effect    = "pan_left"
+timestamp = "2026-05-22T12:14:03Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260522_154927047_HDR.jpg'
+duration  = "2.8s"
+effect    = "diagonal"
+timestamp = "2026-05-22T12:49:27Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260522_173019296_HDR.jpg'
+duration  = "2.8s"
+effect    = "rotate_zoom"
+timestamp = "2026-05-22T14:30:19Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260522_174104843_HDR.jpg'
+duration  = "2.8s"
+effect    = "zoom_in"
+timestamp = "2026-05-22T14:41:04Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260523_072812423.jpg'
+duration  = "2.8s"
+effect    = "pan_right"
+timestamp = "2026-05-23T04:28:12Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260523_092716653_HDR.jpg'
+duration  = "2.8s"
+effect    = "zoom_out"
+timestamp = "2026-05-23T06:27:16Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-23 at 10.50.13.jpeg'
+duration  = "2.8s"
+effect    = "pan_left"
+timestamp = "2026-05-23T07:50:13Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-23 at 10.56.35.jpeg'
+duration  = "2.8s"
+effect    = "diagonal"
+timestamp = "2026-05-23T07:56:35Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260523_115251091_HDR.jpg'
+duration  = "2.8s"
+effect    = "rotate_zoom"
+timestamp = "2026-05-23T08:52:51Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-23 at 13.29.45.jpeg'
+duration  = "2.8s"
+effect    = "zoom_in"
+timestamp = "2026-05-23T10:29:45Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-23 at 14.01.53.jpeg'
+duration  = "2.8s"
+effect    = "pan_right"
+timestamp = "2026-05-23T11:01:53Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-23 at 16.35.28.jpeg'
+duration  = "2.8s"
+effect    = "zoom_out"
+timestamp = "2026-05-23T13:35:28Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/IMG_20260523_214318272_HDR.jpg'
+duration  = "2.8s"
+effect    = "pan_left"
+timestamp = "2026-05-23T18:43:18Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-23 at 22.07.52.jpeg'
+duration  = "2.8s"
+effect    = "diagonal"
+timestamp = "2026-05-23T19:07:52Z"
+
+[[input.images]]
+path      = 'E:/TEMP/Video Caravana Delta Dunării/WhatsApp Image 2026-05-24 at 05.32.45.jpeg'
+duration  = "2.8s"
+effect    = "rotate_zoom"
+timestamp = "2026-05-24T02:32:45Z"

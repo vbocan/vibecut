@@ -1,0 +1,117 @@
+# Kid-themed family edit: 12 short GoPro clips of an electric toy-car drive
+# from April 2020. Upbeat pop track drives a beat-aligned cut + a music-video
+# burst at the song's energy peak. Two-stage intro card; outro overlay on
+# the closing segment.
+
+schema_version = 1
+
+[project]
+name            = "Ne dăm cu mașinuța electrică"
+target_duration = "5m"
+fps             = 30
+seed            = 42
+fade_in         = "100ms"
+fade_out        = "2000ms"
+
+[[outputs]]
+path          = "out/masinuta.mp4"
+resolution    = "1920x1080"
+encoder       = "auto"
+crf           = 20
+audio_bitrate = "192k"
+
+[input]
+folder  = "E:/DATA/GOPRO VIDEO/2020.04 - Ne dăm cu mașinuța electrică"
+include = ["**/*.MP4"]
+
+[soundtrack]
+file              = "footage/fassounds-escape-your-love-upbeat-fashion-pop-dance-412230.mp3"
+beat_align        = true
+duck_count        = 3
+duck_min_spacing  = "20s"
+duck_min_dur      = "4s"
+duck_max_dur      = "6s"
+ducking_db        = -18
+fade_out          = "3000ms"
+beat_burst        = "auto"
+
+[selection]
+min_clip       = "2s"
+max_clip       = "5s"
+max_per_source = 4
+
+[transition]
+default                = "fade"
+duration               = "400ms"
+# Reels-style speed-ramp ("whip-up") on a deterministic ~40% subset of
+# transitions. The selected outgoing clip's last 1.5 s plays at 3.0×
+# speed (= 500 ms of output ramp ≈ 15 frames at 30 fps, with motion
+# moving 3× faster than baseline — clearly reads as an acceleration),
+# then a hard cut into the next clip. The ramp itself IS the transition
+# effect; the xfade collapses to a near-zero seam.
+#
+# Tuning notes for this knob:
+#   - factor 1.5–2.0 = subtle, more like rhythm
+#   - factor 2.5–3.0 = the typical reel "whip-up"
+#   - factor 4.0+    = aggressive; only on very dynamic content
+#   - duration must be long enough that `duration / factor ≥ 300 ms`
+#     of OUTPUT ramp, otherwise the eye misses it.
+#
+# Reproducible per [project].seed.
+speed_ramp_probability = 0.5
+speed_ramp_duration    = "2500ms"
+speed_ramp_factor      = 3.0
+# GoPro-Quik-style "punch" baked into the sped-up tail: a subtle brightness
+# warm-up across the whole ramp (~5 % over its full length) plus a brief
+# fade-to-white over the last ~3 frames. The white frame effectively becomes
+# the transition into the next clip, so the seam reads as a kinetic flash
+# rather than a hard cut. Set `false` for a clean, neutral speed-up.
+speed_ramp_flash       = true
+
+# --- Intro: solid card with two staged text lines ---
+[intro]
+duration = "5.0s"
+mode     = "card"
+bg_color = "#1c1c2e"
+fade_in  = "500ms"
+fade_out = "500ms"
+
+[[intro.layers]]
+kind         = "text"
+content      = "Ne dăm cu mașinuța"
+font         = "arialbd.ttf"
+size         = 100
+color        = "#FFE0A0"
+position     = "center"
+appear_at    = "0s"
+disappear_at = "2.3s"
+
+[[intro.layers]]
+kind         = "text"
+content      = "aprilie 2020"
+font         = "arial.ttf"
+size         = 60
+color        = "#FFFFFF"
+position     = "center"
+appear_at    = "2.6s"
+disappear_at = "5.0s"
+
+# --- Outro: overlay on the last segment's footage ---
+[outro]
+duration = "5.0s"
+mode     = "overlay"
+fade_in  = "600ms"
+fade_out = "1000ms"
+
+[[outro.layers]]
+kind       = "text"
+content    = "@vbocan · 2020"
+font       = "arialbd.ttf"
+size       = 64
+color      = "#FFFFFF"
+position   = "bottom-center"
+background = { color = "#000000AA", padding = "20px" }
+
+[grading]
+# HyperSmooth in-camera already stabilizes modern GoPro footage.
+stabilize = false
