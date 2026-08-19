@@ -71,10 +71,6 @@ COPY vibecut ./vibecut
 COPY vibecut-ops ./vibecut-ops
 COPY vibecut-mcp ./vibecut-mcp
 COPY vibecut-web ./vibecut-web
-# `examples/` is referenced by `include_str!()` in vibecut's tests;
-# we don't strictly need it for `cargo build`, but copying it keeps
-# `cargo test` runnable inside this stage if we ever want to.
-COPY examples ./examples
 
 RUN cargo build --release \
     && mkdir -p /out \

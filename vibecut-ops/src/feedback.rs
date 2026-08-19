@@ -680,11 +680,103 @@ mod tests {
     }
 
     fn base_config() -> Config {
-        // Round-trip a known-good example through Config::load
-        // semantics by parsing the kid_reel template (since we know
-        // it validates).
-        let toml_str = include_str!("../../examples/masinuta.toml");
-        toml::from_str(toml_str).expect("masinuta.toml must parse")
+        // A known-good config exercising the same shape as the kid_reel
+        // template (multi-layer intro/outro, speed-ramp transition,
+        // ducked soundtrack) — inlined rather than loaded from an
+        // examples/ file, since this crate ships with no example
+        // projects.
+        let toml_str = r##"
+schema_version = 1
+
+[project]
+name            = "Test Project"
+target_duration = "5m"
+fps             = 30
+seed            = 42
+fade_in         = "100ms"
+fade_out        = "2000ms"
+
+[[outputs]]
+path          = "out/test_project.mp4"
+resolution    = "1920x1080"
+encoder       = "auto"
+crf           = 20
+audio_bitrate = "192k"
+
+[input]
+folder  = "footage/"
+include = ["**/*.MP4"]
+
+[soundtrack]
+file              = "music/track.mp3"
+beat_align        = true
+duck_count        = 3
+duck_min_spacing  = "20s"
+duck_min_dur      = "4s"
+duck_max_dur      = "6s"
+ducking_db        = -18
+fade_out          = "3000ms"
+beat_burst        = "auto"
+
+[selection]
+min_clip       = "2s"
+max_clip       = "5s"
+max_per_source = 4
+
+[transition]
+default                = "fade"
+duration               = "400ms"
+speed_ramp_probability = 0.5
+speed_ramp_duration    = "2500ms"
+speed_ramp_factor      = 3.0
+speed_ramp_flash       = true
+
+[intro]
+duration = "5.0s"
+mode     = "card"
+bg_color = "#1c1c2e"
+fade_in  = "500ms"
+fade_out = "500ms"
+
+[[intro.layers]]
+kind         = "text"
+content      = "Test Title"
+font         = "arialbd.ttf"
+size         = 100
+color        = "#FFE0A0"
+position     = "center"
+appear_at    = "0s"
+disappear_at = "2.3s"
+
+[[intro.layers]]
+kind         = "text"
+content      = "subtitle"
+font         = "arial.ttf"
+size         = 60
+color        = "#FFFFFF"
+position     = "center"
+appear_at    = "2.6s"
+disappear_at = "5.0s"
+
+[outro]
+duration = "5.0s"
+mode     = "overlay"
+fade_in  = "600ms"
+fade_out = "1000ms"
+
+[[outro.layers]]
+kind       = "text"
+content    = "credit"
+font       = "arialbd.ttf"
+size       = 64
+color      = "#FFFFFF"
+position   = "bottom-center"
+background = { color = "#000000AA", padding = "20px" }
+
+[grading]
+stabilize = false
+"##;
+        toml::from_str(toml_str).expect("fixture must parse")
     }
 
     #[test]
@@ -789,7 +881,7 @@ mod tests {
     #[test]
     fn different_music_swaps_existing_soundtrack() {
         let mut cfg = base_config();
-        // masinuta.toml has a [soundtrack] section.
+        // base_config()'s fixture has a [soundtrack] section.
         assert!(cfg.soundtrack.is_some());
         let new_path = "/projects/music/new_track.mp3";
         let notes = apply(

@@ -16,7 +16,6 @@ models/
 *.log
 .vscode/
 .idea/
-start.ps1
 
 # vibecut-ui is a real npm project — the Dockerfile's web-builder
 # stage runs `npm ci && npm run build` itself, so the host's own

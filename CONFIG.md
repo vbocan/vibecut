@@ -374,7 +374,7 @@ sanity-check how many seams will get the effect.
 
 ## `[multi_angle]` (optional)
 
-Multi-camera angle planning. Off by default. See `examples/multicam.toml`.
+Multi-camera angle planning. Off by default.
 
 ```toml
 [multi_angle]
@@ -531,21 +531,6 @@ background = { color = "#000000AA", padding = "20px" }
 [grading]
 stabilize = true
 ```
-
----
-
-## See also
-
-- `examples/basic.toml` — simplest working config
-- `examples/atv.toml` — ATV ride, 25 s
-- `examples/atv_2min.toml` — full feature showcase (2-minute, beat-burst, ML, stabilize)
-- `examples/egypt.toml` — long-form vacation cut (5 min, 80 sources)
-- `examples/multicam.toml` — multi-camera example
-- `examples/sag_timiseni.toml` — two-stage growing-text intro + logo-on-footage outro (GoPro-Quik style)
-- `examples/masinuta.toml` — kid-themed family edit; aggressive speed-ramps + flash + beat-burst
-- `examples/tomesti_2026.toml` — DJI drone footage; speed-ramps deliberately OFF for contemplative pacing
-- `examples/smoke.toml` — minimal smoke-test
-- `examples/vartop.toml`, `examples/ziua_mariei.toml` — winter / family vacation projects
 
 ---
 

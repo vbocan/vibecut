@@ -1,9 +1,9 @@
 # Probe a video file or folder with `vibecut probe`.
 #
 # Usage:
-#   scripts\probe.ps1 E:\footage\masinuta
-#   scripts\probe.ps1 E:\footage\masinuta -Json
-#   scripts\probe.ps1 examples\smoke\test.mp4
+#   scripts\probe.ps1 E:\footage
+#   scripts\probe.ps1 E:\footage -Json
+#   scripts\probe.ps1 E:\footage\clip.mp4
 #
 # When -Json is passed, the output is machine-readable JSON suitable
 # for piping into jq, ConvertFrom-Json, or another tool.

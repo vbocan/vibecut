@@ -7,17 +7,16 @@
 //! - a **TOML template** with `{placeholder}` substitutions that bake in
 //!   sensible defaults for that aesthetic.
 //!
-//! Each of the six vibes here maps to one of the existing example TOMLs
-//! as a reference exemplar:
+//! Each of the six vibes targets a distinct aesthetic:
 //!
-//! | Vibe | Reference example | When to suggest |
-//! |---|---|---|
-//! | `kid_reel` | `examples/masinuta.toml` | Kinetic family / kid footage; music-driven |
-//! | `family_chronicle` | `examples/sag_timiseni.toml` | Multi-event family chronicles; chronological |
-//! | `drone_cinematic` | `examples/tomesti_2026.toml` | DJI / contemplative aerial footage |
-//! | `action_highlight` | `examples/atv_2min.toml` | Sports, ATV, fast motion; punchy |
-//! | `documentary` | (no exact match) | Voice-led, chronological, ducks on speech |
-//! | `memory_keeper` | `examples/egypt.toml` | Long-form vacation; gentle pacing |
+//! | Vibe | When to suggest |
+//! |---|---|
+//! | `kid_reel` | Kinetic family / kid footage; music-driven |
+//! | `family_chronicle` | Multi-event family chronicles; chronological |
+//! | `drone_cinematic` | DJI / contemplative aerial footage |
+//! | `action_highlight` | Sports, ATV, fast motion; punchy |
+//! | `documentary` | Voice-led, chronological, ducks on speech |
+//! | `memory_keeper` | Long-form vacation; gentle pacing |
 //!
 //! When the LLM asks "what kind of video do you want?", proposing two
 //! or three vibes (not all six) keeps the choice tractable. The

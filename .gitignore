@@ -18,4 +18,3 @@ Cargo.lock.bak
 *.MP4
 *.mov
 *.MOV
-!/examples/**

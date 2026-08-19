@@ -3,8 +3,8 @@
 # right?" sanity testing.
 #
 # Usage:
-#   scripts\validate.ps1 examples\masinuta.toml
-#   scripts\validate.ps1 examples\masinuta.toml -PrintEffectiveConfig
+#   scripts\validate.ps1 my-project.toml
+#   scripts\validate.ps1 my-project.toml -PrintEffectiveConfig
 
 [CmdletBinding()]
 param(

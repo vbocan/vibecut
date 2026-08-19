@@ -460,8 +460,7 @@ pub struct Scoring {
 impl Default for Scoring {
     fn default() -> Self {
         // Sensible out-of-the-box weights so a config without [scoring]
-        // produces a useful score curve. These match the suggested values
-        // in `examples/basic.toml`.
+        // produces a useful score curve.
         Self {
             hilight_tags: 1.0,
             accel_peaks: 0.6,
@@ -1145,7 +1144,87 @@ fn parse_res_pair(s: &str) -> Result<(u32, u32), String> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = include_str!("../../examples/basic.toml");
+    // Inlined rather than loaded from an examples/ file — this crate ships
+    // with no example projects, so the schema round-trip test carries its
+    // own fixture.
+    const SAMPLE: &str = r##"
+schema_version = 1
+
+[project]
+name = "Summer Surf"
+target_duration = "60s"
+fps = 30
+seed = 42
+
+[[outputs]]
+path          = "out/summer_surf.mp4"
+resolution    = "1920x1080"
+encoder       = "auto"
+crf           = 20
+audio_bitrate = "192k"
+
+[input]
+folder = "footage/"
+include = ["**/*.MP4", "**/*.mp4"]
+
+[soundtrack]
+file = "music/track.wav"
+beat_align = true
+energy_drives_pacing = true
+ducking_db = -18.0
+
+[scoring]
+hilight_tags          = 1.0
+accel_peaks           = 0.6
+gps_speed              = 0.4
+faces                 = 0.3
+motion_peaks          = 0.3
+sharpness_floor       = 0.2
+exposure_floor        = 0.15
+diversity_per_source  = 0.5
+
+[selection]
+min_clip = "1.5s"
+max_clip = "6s"
+order    = "energy_arc"
+
+[transition]
+default  = "fade"
+duration = "400ms"
+palette  = ["fade", "dissolve", "circleopen"]
+
+[intro]
+duration = "2.5s"
+fade_in  = "400ms"
+fade_out = "400ms"
+mode     = "card"
+bg_color = "#000000"
+
+[[intro.layers]]
+kind     = "text"
+content  = "Costa Rica · 2026"
+font     = "Inter-Bold.ttf"
+size     = 96
+color    = "#FFFFFF"
+position = "center"
+
+[outro]
+duration = "2s"
+mode     = "card"
+
+[[outro.layers]]
+kind     = "text"
+content  = "Example Project"
+position = "bottom-right"
+
+[multi_angle]
+enabled  = false
+sync     = "auto"
+min_hold = "1s"
+
+[grading]
+stabilize = false
+"##;
 
     #[test]
     fn round_trip_basic_example() {

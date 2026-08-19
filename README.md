@@ -13,10 +13,6 @@ A telemetry-driven procedural pipeline that turns a folder of GoPro / DJI footag
 
 The pipeline is wrapped in a Model Context Protocol (MCP) server so an LLM client (Claude Desktop, LM Studio, …) can drive the whole flow conversationally — *"discover the footage I dropped here, propose a vibe, render it, the bit at 0:42 is too dark, drop it, render again."* Same conversation, same output: the system is **deterministic by construction**, because the LLM lives in the *client* and the server is pure tools.
 
-![Vibecut sample output frame](docs/images/hero.jpg)
-
-*Frame from a kid_reel sweep — kids next to the toy car, real GoPro footage from a 12-source 40-minute folder rendered to a 95-second 1080p reel in ~30 s warm-cache time.*
-
 ## What it does
 
 The conversation loop, end-to-end:
@@ -115,12 +111,12 @@ Or use the host binary directly via [PowerShell helpers](scripts/):
 
 ```powershell
 scripts\build.ps1                                    # cargo build --release
-scripts\probe.ps1   E:\footage\masinuta              # tabular metadata report
-scripts\validate.ps1 examples\masinuta.toml          # dry-run schema check
-scripts\run-cli.ps1 examples\masinuta.toml -RandomSeed
+scripts\probe.ps1   E:\footage                       # tabular metadata report
+scripts\validate.ps1 my-project.toml                 # dry-run schema check
+scripts\run-cli.ps1 my-project.toml -RandomSeed
 ```
 
-See [examples/](examples/) for reference TOML projects covering family edits, drone cinematic, ATV action, multi-camera, and more.
+See [CONFIG.md](CONFIG.md) for the full TOML schema to hand-author `my-project.toml`.
 
 ## Key Features
 
@@ -148,20 +144,20 @@ See [examples/](examples/) for reference TOML projects covering family edits, dr
 | **Frame extraction** (`inspect_output`, 12 frames @ 480 px) | ~4 s parallel via tokio + ffmpeg |
 | **Test suite** | 153 unit tests, ~0.3 s |
 
-Measured on a single workstation with NVIDIA RTX-class GPU + WSL2; numbers scale roughly linearly with source duration. See [examples/](examples/) for the reference projects used to time these.
+Measured on a single workstation with NVIDIA RTX-class GPU + WSL2; numbers scale roughly linearly with source duration.
 
 ## Vibe library
 
-Six curated mappings from natural-language intent to a starting TOML. The LLM picks among them via `list_vibes` and `propose_vibe`; you can also use them directly as templates.
+Six curated mappings from natural-language intent to a starting TOML. The LLM picks among them via `list_vibes` and `propose_vibe`.
 
-| Key | Aesthetic | Reference example |
-|---|---|---|
-| `kid_reel` | Kinetic family edit, music-driven | [examples/masinuta.toml](examples/masinuta.toml) |
-| `family_chronicle` | Chronological, gentle pacing | [examples/sag_timiseni.toml](examples/sag_timiseni.toml) |
-| `drone_cinematic` | Long holds, energy-arc, no ramps | [examples/tomesti_2026.toml](examples/tomesti_2026.toml) |
-| `action_highlight` | Punchy, every-cut-on-beat | [examples/atv_2min.toml](examples/atv_2min.toml) |
-| `documentary` | Voice-led, ducks on speech | (no exact match) |
-| `memory_keeper` | Long-form, soundtrack-led | [examples/egypt.toml](examples/egypt.toml) |
+| Key | Aesthetic |
+|---|---|
+| `kid_reel` | Kinetic family edit, music-driven |
+| `family_chronicle` | Chronological, gentle pacing |
+| `drone_cinematic` | Long holds, energy-arc, no ramps |
+| `action_highlight` | Punchy, every-cut-on-beat |
+| `documentary` | Voice-led, ducks on speech |
+| `memory_keeper` | Long-form, soundtrack-led |
 
 A compile-time test re-parses every vibe template through `vibecut::project_config::Config` and runs `validate()`, so schema drift breaks the build instead of producing a config the pipeline would reject at runtime.
 
@@ -270,7 +266,6 @@ If you use Vibecut in your research, please cite:
 |---|---|
 | [CONFIG.md](CONFIG.md) | Complete TOML schema reference for hand-authored projects. |
 | [DOCKER.md](DOCKER.md) | Docker build / run / wire-up guide. Includes the CLI workflow. |
-| [examples/](examples/) | Reference TOML projects (kid reel, drone cinematic, ATV, multicam, vacation chronicle, …). |
 | [scripts/](scripts/) | PowerShell helpers for CLI, Docker, and web-layer dev workflows. |
 
 ## Limitations

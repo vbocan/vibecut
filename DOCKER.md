@@ -191,9 +191,9 @@ hand-author a TOML and render directly, that path is still supported.
 
 ```bash
 # On the host (requires Rust toolchain).
-cargo run --release -p vibecut -- run examples/masinuta.toml
+cargo run --release -p vibecut -- run my-project.toml
 cargo run --release -p vibecut -- probe E:/footage --json
-cargo run --release -p vibecut -- validate examples/atv_2min.toml
+cargo run --release -p vibecut -- validate my-project.toml
 
 # Inside the container (uses the same binary the MCP server calls).
 docker run --rm --gpus all \

@@ -1,9 +1,9 @@
 # Render a TOML config with the vibecut CLI — no MCP, no LLM.
 #
 # Usage:
-#   scripts\run-cli.ps1 examples\masinuta.toml
-#   scripts\run-cli.ps1 examples\masinuta.toml -RandomSeed
-#   scripts\run-cli.ps1 examples\masinuta.toml -Explain
+#   scripts\run-cli.ps1 my-project.toml
+#   scripts\run-cli.ps1 my-project.toml -RandomSeed
+#   scripts\run-cli.ps1 my-project.toml -Explain
 #
 # Auto-builds the binary if it's missing or the source has changed
 # since the last build. Pass -SkipBuild to use whatever's already at
