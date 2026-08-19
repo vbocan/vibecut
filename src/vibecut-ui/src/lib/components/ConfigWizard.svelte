@@ -6,27 +6,39 @@
 	// is exactly one schema, defined once in Rust; this component
 	// never invents its own shape for anything it edits.
 	//
-	// Scope: the fields a vibe's own template actually sets (basics,
-	// pacing, transitions, soundtrack, intro/outro) get dedicated,
-	// purpose-built controls, organized as wizard steps. The long tail
-	// of rarely-touched fields (scoring weights, LUT grading) lives in
-	// a single "Advanced" step with plainer generic inputs — every
-	// `Config` field is reachable from *some* step, but not every step
-	// deserves equal design effort. Array-of-object fields (outputs,
-	// selection excludes/weights, intro/outro layers, multi-angle
-	// groups and their per-source offsets) get list editors: add/
-	// remove rows rather than a single control, since there's no
-	// natural single-value widget for "an arbitrary number of X". Still
-	// Raw-TOML-only: explicit input.videos/images/ranges, multi-file
-	// soundtracks, top-level [[text]] lower-thirds, and per-output
-	// encoder presets.
+	// Scope: every field of `Config` is reachable from some step except
+	// `schema_version` (a constant, always 1 — no control needed) and
+	// `texts` (`[[text]]`, top-level lower-thirds) — the latter is
+	// deliberately NOT exposed here despite existing in the schema:
+	// it's dead in the pipeline. `run_pipeline.rs` parses it, counts
+	// it, and prints "(not yet rendered)" to the CLI before discarding
+	// it — nothing ever reads a `Text` entry's `kind`/`content`/timing,
+	// and no code path renders one. Building a control for it would be
+	// a working-looking UI for a field that silently does nothing;
+	// worse than not having the control at all. (Not to be confused
+	// with `[intro]`/`[outro]`'s `TextCard.layers` below, a completely
+	// separate, fully-wired mechanism this component does edit.)
+	//
+	// The fields a vibe's own template actually sets (basics, pacing,
+	// transitions, soundtrack, intro/outro) get dedicated, purpose-
+	// built controls. The long tail of rarely-touched fields (scoring
+	// weights, LUT grading) lives in a single "Advanced" step with
+	// plainer generic inputs — not every step deserves equal design
+	// effort. Array-of-object fields (outputs, explicit input videos/
+	// ranges/images, multi-file soundtracks, selection excludes/
+	// weights, intro/outro layers, multi-angle groups and their per-
+	// source offsets) get list editors: add/remove rows rather than a
+	// single control, since there's no natural single-value widget for
+	// "an arbitrary number of X".
 	import { appState as s } from '$lib/state.svelte';
 	import type { TextCard } from '$lib/types/generated/TextCard';
 	import type { CardLayer } from '$lib/types/generated/CardLayer';
 	import type { AngleGroupCfg } from '$lib/types/generated/AngleGroupCfg';
+	import type { Soundtrack } from '$lib/types/generated/Soundtrack';
 
 	const STEPS = [
 		{ label: 'Basics' },
+		{ label: 'Sources' },
 		{ label: 'Selection & pacing' },
 		{ label: 'Transitions' },
 		{ label: 'Soundtrack' },
@@ -100,6 +112,38 @@
 		cfg.project.seed = value === null ? null : (value as unknown as bigint);
 	}
 
+	/** Shared by every optional-string field below (image timestamp,
+	 *  output preset): empty input means "unset", not "set to empty
+	 *  string" — the two are different values to a Rust `Option<T>`. */
+	function optionalString(value: string): string | null {
+		return value.trim() === '' ? null : value;
+	}
+
+	// ---------- input: explicit videos, manual ranges, images ----------
+	function addVideo() {
+		s.configStructured?.input.videos.push({ path: '' });
+	}
+	function removeVideo(i: number) {
+		s.configStructured?.input.videos.splice(i, 1);
+	}
+	function addRange() {
+		s.configStructured?.input.ranges.push({ file: '', start: '0s', end: '1s' });
+	}
+	function removeRange(i: number) {
+		s.configStructured?.input.ranges.splice(i, 1);
+	}
+	function addImage() {
+		s.configStructured?.input.images.push({
+			path: '',
+			duration: '4s',
+			effect: 'auto',
+			timestamp: null
+		});
+	}
+	function removeImage(i: number) {
+		s.configStructured?.input.images.splice(i, 1);
+	}
+
 	// ---------- outputs ----------
 	//
 	// The body renders once at the highest resolution among all
@@ -157,12 +201,14 @@
 		if (!s.configStructured) return;
 		s.configStructured.soundtrack = null;
 	}
-	function soundtrackFile(): string {
-		return s.configStructured?.soundtrack?.files[0] ?? '';
+	/** Multiple files concatenate in declaration order into one virtual
+	 *  track before beat-detection and looping — order matters, so
+	 *  this is add-at-end / remove-by-index, not an unordered set. */
+	function addSoundtrackFile(st: Soundtrack) {
+		st.files.push('');
 	}
-	function setSoundtrackFile(value: string) {
-		if (!s.configStructured?.soundtrack) return;
-		s.configStructured.soundtrack.files = value ? [value] : [];
+	function removeSoundtrackFile(st: Soundtrack, i: number) {
+		st.files.splice(i, 1);
 	}
 
 	// ---------- intro / outro cards ----------
@@ -385,11 +431,91 @@
 								<span>Audio bitrate</span>
 								<input class="text-input mono" placeholder="e.g. 192k" bind:value={out.audio_bitrate} />
 							</label>
+							<label class="field narrow">
+								<span>Encoder preset</span>
+								<input
+									class="text-input mono"
+									placeholder="auto"
+									value={out.preset ?? ''}
+									oninput={(e) => (out.preset = optionalString((e.target as HTMLInputElement).value))}
+								/>
+							</label>
 						</div>
 					</div>
 				{/each}
 				<button type="button" class="chip" onclick={addOutput}>+ Add output</button>
 			{:else if step === 1}
+				<h3>Explicit video files</h3>
+				<p class="dim">
+					Extra files to include as sources alongside (or instead of) the discovered footage folder — each is
+					probed and scored the same way.
+				</p>
+				{#each cfg.input.videos as v, i (i)}
+					<div class="list-row">
+						<input class="text-input mono" placeholder="/footage/extra_clip.mp4" bind:value={v.path} />
+						<button type="button" class="icon-btn" onclick={() => removeVideo(i)} aria-label="Remove">✕</button>
+					</div>
+				{/each}
+				<button type="button" class="chip" onclick={addVideo}>+ Add video file</button>
+
+				<h3>Manual time ranges</h3>
+				<p class="dim">
+					Override automatic selection with an exact in/out range for a specific file — the picker uses this
+					instead of scoring that file itself.
+				</p>
+				{#each cfg.input.ranges as r, i (i)}
+					<div class="list-row">
+						<input class="text-input mono" placeholder="filename, e.g. GH010320.MP4" bind:value={r.file} />
+						<input class="text-input mono narrow-num" placeholder="start, e.g. 10s" bind:value={r.start} />
+						<input class="text-input mono narrow-num" placeholder="end, e.g. 25s" bind:value={r.end} />
+						<button type="button" class="icon-btn" onclick={() => removeRange(i)} aria-label="Remove">✕</button>
+					</div>
+				{/each}
+				<button type="button" class="chip" onclick={addRange}>+ Add time range</button>
+
+				<h3>Still images</h3>
+				<p class="dim">
+					Photos animated into clips and mixed into the output — treated as mandatory segments, always included
+					alongside the auto-selected video.
+				</p>
+				{#each cfg.input.images as img, i (i)}
+					<div class="image-input-card">
+						<div class="row wrap">
+							<input class="text-input mono" placeholder="/footage/photo.jpg" bind:value={img.path} />
+							<button type="button" class="icon-btn" onclick={() => removeImage(i)} aria-label="Remove">✕</button>
+						</div>
+						<div class="field-grid">
+							<label class="field narrow">
+								<span>Hold duration</span>
+								<input class="text-input mono" placeholder="e.g. 4s" bind:value={img.duration} />
+							</label>
+							<label class="field narrow">
+								<span>Effect</span>
+								<select class="text-input" bind:value={img.effect}>
+									<option value="auto">Auto (from seed)</option>
+									<option value="zoom_in">Zoom in</option>
+									<option value="zoom_out">Zoom out</option>
+									<option value="pan_left">Pan left</option>
+									<option value="pan_right">Pan right</option>
+									<option value="diagonal">Diagonal</option>
+									<option value="rotate_zoom">Rotate + zoom</option>
+									<option value="static">Static</option>
+								</select>
+							</label>
+							<label class="field narrow">
+								<span>Recorded at</span>
+								<input
+									class="text-input mono"
+									placeholder="only used by strict_chronological"
+									value={img.timestamp ?? ''}
+									oninput={(e) => (img.timestamp = optionalString((e.target as HTMLInputElement).value))}
+								/>
+							</label>
+						</div>
+					</div>
+				{/each}
+				<button type="button" class="chip" onclick={addImage}>+ Add image</button>
+			{:else if step === 2}
 				<div class="field-grid">
 					<label class="field narrow">
 						<span>Min clip length</span>
@@ -462,7 +588,7 @@
 					</div>
 				{/each}
 				<button type="button" class="chip" onclick={addExclude}>+ Add exclude</button>
-			{:else if step === 2}
+			{:else if step === 3}
 				{#if profile?.transitionNote}
 					<p class="vibe-note">{profile.transitionNote}</p>
 				{/if}
@@ -506,7 +632,7 @@
 						<span>Quik-style flash on the ramp</span>
 					</label>
 				</div>
-			{:else if step === 3}
+			{:else if step === 4}
 				{#if profile?.soundtrackNote}
 					<p class="vibe-note">{profile.soundtrackNote}</p>
 				{/if}
@@ -516,15 +642,22 @@
 						<span class="badge good">Soundtrack on</span>
 						<button type="button" class="chip" onclick={removeSoundtrack}>Remove soundtrack</button>
 					</div>
-					<label class="field">
-						<span>Audio file (server path)</span>
-						<input
-							class="text-input mono"
-							placeholder="/projects/music/track.mp3"
-							value={soundtrackFile()}
-							oninput={(e) => setSoundtrackFile((e.target as HTMLInputElement).value)}
-						/>
-					</label>
+					<h4>Audio file{st.files.length > 1 ? 's' : ''} (server path)</h4>
+					{#if st.files.length > 1}
+						<p class="hint">Concatenated in this order into one virtual track before beat-detection.</p>
+					{/if}
+					{#each st.files as _, i (i)}
+						<div class="list-row">
+							<input class="text-input mono" placeholder="/projects/music/track.mp3" bind:value={st.files[i]} />
+							<button
+								type="button"
+								class="icon-btn"
+								onclick={() => removeSoundtrackFile(st, i)}
+								aria-label="Remove">✕</button
+							>
+						</div>
+					{/each}
+					<button type="button" class="chip" onclick={() => addSoundtrackFile(st)}>+ Add file</button>
 					<div class="field-grid">
 						<label class="field checkbox">
 							<input type="checkbox" bind:checked={st.beat_align} />
@@ -567,7 +700,7 @@
 					<p class="dim">No soundtrack configured — the picker still produces a watchable cut, just with no music-driven pacing.</p>
 					<button type="button" class="btn primary" onclick={addSoundtrack}>Add soundtrack</button>
 				{/if}
-			{:else if step === 4}
+			{:else if step === 5}
 				{#snippet cardEditor(card: TextCard)}
 					<div class="field-grid">
 						<label class="field narrow">
@@ -708,7 +841,7 @@
 				{:else}
 					<button type="button" class="btn primary" onclick={addOutro}>Add outro card</button>
 				{/if}
-			{:else if step === 5}
+			{:else if step === 6}
 				<label class="field checkbox">
 					<input type="checkbox" bind:checked={cfg.multi_angle.enabled} />
 					<span>Enable multi-camera grouping</span>
@@ -779,7 +912,7 @@
 					{/each}
 					<button type="button" class="chip" onclick={addAngleGroup}>+ Add angle group</button>
 				{/if}
-			{:else if step === 6}
+			{:else if step === 7}
 				<h3>Scoring weights</h3>
 				<p class="dim">How much each signal contributes to a moment's score. Higher = more influence on what gets picked.</p>
 				<div class="field-grid">
@@ -1071,7 +1204,8 @@
 
 	.angle-group,
 	.output-card,
-	.layer-card {
+	.layer-card,
+	.image-input-card {
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
