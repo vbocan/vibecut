@@ -5,6 +5,7 @@
 	import PreviewTimeline from '$lib/components/PreviewTimeline.svelte';
 	import BriefInput from '$lib/components/BriefInput.svelte';
 	import CompareHistory from '$lib/components/CompareHistory.svelte';
+	import ConfigWizard from '$lib/components/ConfigWizard.svelte';
 
 	onMount(() => {
 		void s.loadVibes();
@@ -130,20 +131,49 @@
 		<section class="card" class:disabled={!s.proposeResult}>
 			<h2><span class="step">3</span> Config</h2>
 			{#if s.proposeResult}
-				<textarea
-					class="config-editor mono"
-					value={s.configToml}
-					oninput={(e) => s.setConfigToml((e.target as HTMLTextAreaElement).value)}
-					spellcheck="false"
-				></textarea>
-				<div class="row wrap">
+				<div class="mode-tabs">
 					<button
-						class="btn primary"
-						disabled={!s.configDirty || s.savingConfig}
-						onclick={() => s.saveConfig()}
+						type="button"
+						class="mode-tab"
+						class:active={s.configMode === 'guided'}
+						onclick={() => (s.configMode = 'guided')}
 					>
-						{s.savingConfig ? 'Saving…' : s.configDirty ? 'Save edits' : 'Saved'}
+						Guided
 					</button>
+					<button
+						type="button"
+						class="mode-tab"
+						class:active={s.configMode === 'raw'}
+						onclick={() => (s.configMode = 'raw')}
+					>
+						Raw TOML
+					</button>
+				</div>
+
+				{#if s.configMode === 'guided'}
+					<ConfigWizard />
+				{:else}
+					<textarea
+						class="config-editor mono"
+						value={s.configToml}
+						oninput={(e) => s.setConfigToml((e.target as HTMLTextAreaElement).value)}
+						spellcheck="false"
+					></textarea>
+					<div class="row wrap">
+						<button
+							class="btn primary"
+							disabled={!s.configDirty || s.savingConfig}
+							onclick={() => s.saveConfig()}
+						>
+							{s.savingConfig ? 'Saving…' : s.configDirty ? 'Save edits' : 'Saved'}
+						</button>
+					</div>
+					{#if s.configError}
+						<p class="error">{s.configError}</p>
+					{/if}
+				{/if}
+
+				<div class="row wrap quick-feedback-row">
 					<span class="label">Quick feedback</span>
 					{#each quickActions as qa (qa.label)}
 						<button
@@ -155,9 +185,6 @@
 						</button>
 					{/each}
 				</div>
-				{#if s.configError}
-					<p class="error">{s.configError}</p>
-				{/if}
 				{#if s.lastChanges.length > 0}
 					<ul class="changes">
 						{#each s.lastChanges as c, i (i)}
@@ -464,6 +491,39 @@
 		font-size: 12px;
 		color: var(--text-dim);
 		line-height: 1.4;
+	}
+
+	.mode-tabs {
+		display: flex;
+		gap: 4px;
+		margin-bottom: 14px;
+		background: var(--ink);
+		border: 1px solid var(--line);
+		border-radius: 8px;
+		padding: 4px;
+		width: fit-content;
+	}
+
+	.mode-tab {
+		background: transparent;
+		border: none;
+		color: var(--text-dim);
+		padding: 6px 14px;
+		border-radius: 6px;
+		font-size: 12.5px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.mode-tab.active {
+		background: var(--panel-alt);
+		color: var(--accent);
+	}
+
+	.quick-feedback-row {
+		margin-top: 16px;
+		padding-top: 14px;
+		border-top: 1px dashed var(--line);
 	}
 
 	.config-editor {

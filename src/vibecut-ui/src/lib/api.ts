@@ -5,6 +5,7 @@
 
 import type { FeedbackAction } from './types/generated/FeedbackAction';
 import type { ChangeNote } from './types/generated/ChangeNote';
+import type { Config } from './types/generated/Config';
 
 const BASE = '/api';
 
@@ -132,6 +133,23 @@ export function readConfig(configPath: string): Promise<ConfigText> {
 
 export function writeConfig(configPath: string, configToml: string): Promise<ConfigText> {
 	return sendJson('/config', { config_path: configPath, config_toml: configToml }, 'PUT');
+}
+
+// ---------- config (structured) ----------
+//
+// Same file as above, typed instead of text — what the guided
+// (wizard) editor reads and writes. No TOML crosses this boundary in
+// either direction; `Config` is generated from the exact Rust struct
+// `vibecut::project_config::Config` deserializes, via ts-rs.
+
+export type { Config };
+
+export function readConfigStructured(configPath: string): Promise<Config> {
+	return getJson(`/config/structured?config_path=${encodeURIComponent(configPath)}`);
+}
+
+export function writeConfigStructured(configPath: string, config: Config): Promise<Config> {
+	return sendJson('/config/structured', { config_path: configPath, config }, 'PUT');
 }
 
 // ---------- feedback ----------

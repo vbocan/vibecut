@@ -161,6 +161,85 @@ mod tests {
         assert!(res.status() == StatusCode::NOT_FOUND || res.status() == StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn config_structured_read_missing_is_404() {
+        let app = router(AppState::default());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/structured?config_path=/nonexistent/cfg.toml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// PUT a config as JSON (no TOML anywhere in this test), then GET it
+    /// back — the guided editor's whole read/write path, exercised
+    /// through the actual router rather than the ops-layer functions
+    /// directly.
+    #[tokio::test]
+    async fn config_structured_write_then_read_round_trips() {
+        let dir = std::env::temp_dir().join(format!("sv_web_config_struct_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+
+        let cfg = serde_json::json!({
+            "schema_version": 1,
+            "project": { "name": "structured edit", "target_duration": "10s", "fps": 30 },
+            "input": { "folder": "." },
+            "outputs": [{ "path": "out.mp4", "resolution": "1920x1080" }]
+        });
+
+        let app = router(AppState::default());
+        let put_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config/structured")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "config_path": path.to_string_lossy(), "config": cfg })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put_res.status(), StatusCode::OK);
+        let written = body_json(put_res).await;
+        assert_eq!(written["project"]["name"], "structured edit");
+
+        let get_res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/config/structured?config_path={}",
+                        urlencoding_lite(&path.to_string_lossy())
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+        let read = body_json(get_res).await;
+        assert_eq!(read["project"]["name"], "structured edit");
+        assert_eq!(read["project"]["fps"], 30);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Minimal query-string escaping for the one character (`\`) a
+    /// Windows temp path can contain that isn't already URL-safe —
+    /// avoids pulling in a whole crate for one test's sake.
+    fn urlencoding_lite(s: &str) -> String {
+        s.replace('\\', "%5C")
+    }
+
     #[test]
     fn resolve_static_dir_none_when_unset() {
         assert!(resolve_static_dir(None).is_none());

@@ -1,6 +1,5 @@
-/* Design tokens shared with the Preview & Timeline wireframe (Phase
-   10 planning artifact) — same dark, video-editing-tool palette, same
-   font pairing (Manrope for UI, IBM Plex Mono for data/timecodes). */
+/* Design tokens for the app: a dark, video-editing-tool palette, with
+   Manrope for UI text and IBM Plex Mono for data/timecodes. */
 
 :root {
 	--ink: #14171c;

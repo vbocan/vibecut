@@ -7,6 +7,7 @@ import * as api from './api';
 import type { FeedbackAction } from './api';
 import type { Manifest } from './types/generated/Manifest';
 import type { Segment } from './types/generated/Segment';
+import type { Config } from './types/generated/Config';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
 
@@ -83,6 +84,7 @@ class AppState {
 			this.configDirty = false;
 			// A fresh proposal invalidates whatever the previous one rendered.
 			this.resetRender();
+			await this.loadStructuredConfig();
 		} catch (e) {
 			this.proposeError = e instanceof api.ApiError ? e.describe() : String(e);
 		} finally {
@@ -91,8 +93,19 @@ class AppState {
 	}
 
 	// ---------- Config editor ----------
+	//
+	// Two views of the same file: `configToml` (raw text, the original
+	// hand-edit path) and `configStructured` (typed, what the Guided
+	// tab binds its form controls to directly). `configMode` picks
+	// which one is visible; both stay live underneath regardless, so
+	// switching tabs never loses whichever one was edited last —
+	// `saveConfig`/`saveStructuredConfig` each refresh the *other*
+	// view after a successful write.
 	configToml = $state('');
 	configDirty = $state(false);
+	configStructured = $state<Config | null>(null);
+	configStructuredError = $state<string | null>(null);
+	configMode = $state<'guided' | 'raw'>('guided');
 	savingConfig = $state(false);
 	configError = $state<string | null>(null);
 	lastChanges = $state<api.ChangeNote[]>([]);
@@ -118,8 +131,54 @@ class AppState {
 			this.configToml = r.config_toml;
 			this.configDirty = false;
 			this.configChangedSinceRender = true;
+			// A hand-edit may have touched fields the Guided tab shows —
+			// keep it from displaying a stale copy if the user tabs back.
+			await this.loadStructuredConfig();
 		} catch (e) {
 			this.configError = e instanceof api.ApiError ? e.describe() : String(e);
+		} finally {
+			this.savingConfig = false;
+		}
+	}
+
+	/** JSON snapshot taken right after every successful load/save —
+	 *  `structuredConfigDirty` diffs the live (two-way-bound) object
+	 *  against this rather than instrumenting every individual form
+	 *  control with its own change handler. */
+	private configStructuredSnapshot: string | null = null;
+
+	structuredConfigDirty = $derived.by((): boolean => {
+		if (!this.configStructured || this.configStructuredSnapshot === null) return false;
+		return JSON.stringify(this.configStructured) !== this.configStructuredSnapshot;
+	});
+
+	async loadStructuredConfig() {
+		if (!this.proposeResult) return;
+		this.configStructuredError = null;
+		try {
+			this.configStructured = await api.readConfigStructured(this.proposeResult.config_path);
+			this.configStructuredSnapshot = JSON.stringify(this.configStructured);
+		} catch (e) {
+			this.configStructuredError = e instanceof api.ApiError ? e.describe() : String(e);
+		}
+	}
+
+	async saveStructuredConfig() {
+		if (!this.proposeResult || !this.configStructured) return;
+		this.savingConfig = true;
+		this.configStructuredError = null;
+		try {
+			const r = await api.writeConfigStructured(this.proposeResult.config_path, this.configStructured);
+			this.configStructured = r;
+			this.configStructuredSnapshot = JSON.stringify(r);
+			this.configChangedSinceRender = true;
+			// Keep the Raw tab's textarea in sync too, same reasoning in
+			// the other direction as saveConfig()'s reload above.
+			const refreshed = await api.readConfig(this.proposeResult.config_path);
+			this.configToml = refreshed.config_toml;
+			this.configDirty = false;
+		} catch (e) {
+			this.configStructuredError = e instanceof api.ApiError ? e.describe() : String(e);
 		} finally {
 			this.savingConfig = false;
 		}
@@ -138,6 +197,7 @@ class AppState {
 			this.configToml = refreshed.config_toml;
 			this.configDirty = false;
 			this.configChangedSinceRender = true;
+			await this.loadStructuredConfig();
 		} catch (e) {
 			this.configError = e instanceof api.ApiError ? e.describe() : String(e);
 		} finally {

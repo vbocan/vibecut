@@ -1,10 +1,18 @@
-//! Read/write raw TOML config text — the file-level counterpart of
-//! [`crate::feedback::apply_feedback_to_file`], for callers (the web
-//! Config editor) that want to hand-edit the TOML directly instead of
-//! going through a structured [`crate::feedback::FeedbackAction`].
+//! Read/write config files — both as raw TOML text (the file-level
+//! counterpart of [`crate::feedback::apply_feedback_to_file`], for
+//! callers that want to hand-edit the TOML directly) and as a
+//! structured [`Config`] (for a guided/wizard editor that never shows
+//! TOML syntax to the user at all). Both paths share the same
+//! guarantee: the pipeline never sees a config it would reject,
+//! whether the edit came from a feedback action, a human typing into a
+//! textarea, or a human filling in form fields.
 
 use serde::Serialize;
-use vibecut::project_config::Config;
+// Re-exported so downstream transports (vibecut-web's structured config
+// routes) can name the type without taking a direct dependency on
+// `vibecut` themselves — this crate stays the one place that owns the
+// pipeline dependency.
+pub use vibecut::project_config::Config;
 
 use crate::error::OpsError;
 use crate::paths::resolve_projects;
@@ -57,6 +65,44 @@ pub async fn write_config_toml(config_path: &str, toml_text: &str) -> Result<Con
         config_path: path.to_string_lossy().into_owned(),
         config_toml: toml_text.to_string(),
     })
+}
+
+/// Read a config file and parse it into a structured [`Config`] — the
+/// guided editor's counterpart of [`read_config_toml`]. No TOML ever
+/// reaches the frontend on this path.
+pub async fn read_config_structured(config_path: &str) -> Result<Config, OpsError> {
+    let path = resolve_projects(config_path);
+    if !path.exists() {
+        return Err(OpsError::not_found_with(
+            "config",
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| OpsError::internal(format!("could not read {}: {e}", path.display())))?;
+    toml::from_str(&text).map_err(|e| OpsError::invalid(format!("invalid config: {e}")))
+}
+
+/// Validate `cfg`, serialize it back to TOML, and write it to
+/// `config_path` — the same load-shape guarantee every other write
+/// path gives, extended to a fully structured input. Returns the
+/// config as actually persisted (post-validation, post-round-trip
+/// through the serializer) so a caller can trust it as the new
+/// canonical state without a separate re-read.
+pub async fn write_config_structured(config_path: &str, cfg: &Config) -> Result<Config, OpsError> {
+    cfg.validate()
+        .map_err(|e| OpsError::invalid(format!("config does not validate: {e:#}")))?;
+    let toml_text = toml::to_string_pretty(cfg)
+        .map_err(|e| OpsError::internal(format!("could not serialize config: {e}")))?;
+
+    let path = resolve_projects(config_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, &toml_text)
+        .map_err(|e| OpsError::internal(format!("could not write {}: {e}", path.display())))?;
+
+    Ok(cfg.clone())
 }
 
 #[cfg(test)]
@@ -141,5 +187,74 @@ folder = "."
     async fn read_missing_config_is_not_found() {
         let err = read_config_toml("/nonexistent/path/cfg.toml").await.unwrap_err();
         assert!(matches!(err, OpsError::NotFound { .. }));
+    }
+
+    fn minimal_config() -> Config {
+        toml::from_str(&valid_toml()).expect("valid_toml() must parse")
+    }
+
+    #[tokio::test]
+    async fn structured_write_then_read_round_trips() {
+        let dir = std::env::temp_dir().join(format!("sv_config_io_struct_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+        let mut cfg = minimal_config();
+        cfg.project.name = "structured edit".into();
+
+        let written = write_config_structured(&path.to_string_lossy(), &cfg)
+            .await
+            .expect("valid config should write");
+        assert_eq!(written.project.name, "structured edit");
+
+        let read = read_config_structured(&path.to_string_lossy())
+            .await
+            .expect("just-written config should read back");
+        assert_eq!(read.project.name, "structured edit");
+        assert_eq!(read.project.fps, cfg.project.fps);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn structured_write_rejects_invalid_config() {
+        let dir =
+            std::env::temp_dir().join(format!("sv_config_io_struct_invalid_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+
+        let mut cfg = minimal_config();
+        cfg.outputs.clear(); // Config::validate rejects an empty outputs list.
+
+        let err = write_config_structured(&path.to_string_lossy(), &cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpsError::InvalidInput { .. }));
+        assert!(!path.exists(), "config that fails validate() must not be written");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn structured_read_missing_config_is_not_found() {
+        let err = read_config_structured("/nonexistent/path/cfg.toml")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpsError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn structured_read_rejects_unparseable_toml() {
+        let dir = std::env::temp_dir()
+            .join(format!("sv_config_io_struct_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+        std::fs::write(&path, "this is not [ toml").unwrap();
+
+        let err = read_config_structured(&path.to_string_lossy())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpsError::InvalidInput { .. }));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

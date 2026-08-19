@@ -13,6 +13,7 @@ __pycache__/
 /cache
 /out
 /footage
+/projects
 /models
 *.onnx
 *.mp4
