@@ -10,15 +10,17 @@
 	// pacing, transitions, soundtrack, one intro/outro text layer) get
 	// dedicated, purpose-built controls, organized as wizard steps.
 	// The long tail of rarely-touched fields (scoring weights, LUT
-	// grading, multi-camera sync) lives in a single "Advanced" step
-	// with plainer generic inputs — every `Config` field is reachable
-	// from *some* step, but not every step deserves equal design
-	// effort. Multi-angle groups and manual selection excludes/weights
-	// stay Raw-TOML-only for now; they're array-of-object editing with
-	// no natural single-value control, a bigger job than this pass.
+	// grading) lives in a single "Advanced" step with plainer generic
+	// inputs — every `Config` field is reachable from *some* step, but
+	// not every step deserves equal design effort. Array-of-object
+	// fields (selection excludes/weights, multi-angle groups and their
+	// per-source offsets) get list editors: add/remove rows rather
+	// than a single control, since there's no natural single-value
+	// widget for "an arbitrary number of X".
 	import { appState as s } from '$lib/state.svelte';
 	import type { TextCard } from '$lib/types/generated/TextCard';
 	import type { CardLayer } from '$lib/types/generated/CardLayer';
+	import type { AngleGroupCfg } from '$lib/types/generated/AngleGroupCfg';
 
 	type TextCardLayer = Extract<CardLayer, { kind: 'text' }>;
 
@@ -28,6 +30,7 @@
 		{ label: 'Transitions' },
 		{ label: 'Soundtrack' },
 		{ label: 'Intro / outro' },
+		{ label: 'Multi-camera' },
 		{ label: 'Advanced' }
 	];
 	let step = $state(0);
@@ -170,6 +173,74 @@
 			background: null
 		});
 	}
+
+	// ---------- selection: source weights & excludes ----------
+	function addSourceWeight() {
+		s.configStructured?.selection.source_weights.push({ source_id: '', weight: 1.0 });
+	}
+	function removeSourceWeight(i: number) {
+		s.configStructured?.selection.source_weights.splice(i, 1);
+	}
+	function addExclude() {
+		s.configStructured?.selection.exclude.push({ file: '', start: '0s', end: '1s' });
+	}
+	function removeExclude(i: number) {
+		s.configStructured?.selection.exclude.splice(i, 1);
+	}
+
+	// ---------- multi-angle groups ----------
+	function addAngleGroup() {
+		s.configStructured?.multi_angle.groups.push({ master: '', members: [], offsets: {} });
+	}
+	function removeAngleGroup(i: number) {
+		s.configStructured?.multi_angle.groups.splice(i, 1);
+	}
+	function membersText(grp: AngleGroupCfg): string {
+		return grp.members.join(', ');
+	}
+	function setMembersText(grp: AngleGroupCfg, text: string) {
+		grp.members = text
+			.split(',')
+			.map((m) => m.trim())
+			.filter(Boolean);
+	}
+	/** Manual offsets are a `source_id -> duration` map, only consulted
+	 *  when `sync = "manual"`. A new row gets a random placeholder key
+	 *  (object keys must be unique and non-empty) that the user renames
+	 *  to a real source id via the same input.
+	 *
+	 *  Every mutator below takes the row's *position* in
+	 *  `Object.entries(grp.offsets)`, not the key string itself.
+	 *  Renaming a key can't happen in place — it's delete-old +
+	 *  insert-new, which reassigns `grp.offsets` to a fresh object —
+	 *  so a handler closure that captured the OLD key string goes
+	 *  stale the instant a rename commits. Re-deriving "whichever key
+	 *  is currently at index j" at call time sidesteps that: the row's
+	 *  position is what's actually stable across a rename, not its key. */
+	function addOffset(grp: AngleGroupCfg) {
+		grp.offsets[crypto.randomUUID()] = '0s';
+	}
+	function renameOffsetKeyAt(grp: AngleGroupCfg, index: number, newKey: string) {
+		const entries = Object.entries(grp.offsets);
+		if (index >= entries.length || !newKey) return;
+		const [oldKey] = entries[index];
+		if (oldKey === newKey) return;
+		const rebuilt: Record<string, string> = {};
+		entries.forEach(([k, v], i) => {
+			rebuilt[i === index ? newKey : k] = v;
+		});
+		grp.offsets = rebuilt;
+	}
+	function setOffsetValueAt(grp: AngleGroupCfg, index: number, value: string) {
+		const entries = Object.entries(grp.offsets);
+		if (index >= entries.length) return;
+		grp.offsets[entries[index][0]] = value;
+	}
+	function removeOffsetAt(grp: AngleGroupCfg, index: number) {
+		const entries = Object.entries(grp.offsets);
+		if (index >= entries.length) return;
+		delete grp.offsets[entries[index][0]];
+	}
 </script>
 
 {#if s.configStructured}
@@ -292,6 +363,43 @@
 					<input type="range" min="0" max="1" step="0.01" bind:value={cfg.selection.variety} />
 					<span class="hint">0 = same seed always picks the same clips. Higher = more shake-up between renders.</span>
 				</label>
+
+				<h3>Source weights</h3>
+				<p class="dim">
+					Boost or reduce how often a source's clips get picked. 1.0 = no change, 0 = never picked — same effect as
+					the MoreOf/LessOf feedback actions, editable directly.
+				</p>
+				{#each cfg.selection.source_weights as sw, i (i)}
+					<div class="list-row">
+						<input class="text-input mono" placeholder="source id, e.g. 0320" bind:value={sw.source_id} />
+						<input
+							class="text-input mono narrow-num"
+							type="number"
+							step="0.1"
+							min="0"
+							max="10"
+							bind:value={sw.weight}
+						/>
+						<button type="button" class="icon-btn" onclick={() => removeSourceWeight(i)} aria-label="Remove">✕</button
+						>
+					</div>
+				{/each}
+				<button type="button" class="chip" onclick={addSourceWeight}>+ Add source weight</button>
+
+				<h3>Excluded ranges</h3>
+				<p class="dim">
+					Windows the picker must avoid, by source filename (or filename suffix) and chapter-local time range —
+					same effect as "drop the bit at M:SS" feedback, editable directly.
+				</p>
+				{#each cfg.selection.exclude as ex, i (i)}
+					<div class="list-row">
+						<input class="text-input mono" placeholder="filename, e.g. GH010320.MP4" bind:value={ex.file} />
+						<input class="text-input mono narrow-num" placeholder="start, e.g. 30s" bind:value={ex.start} />
+						<input class="text-input mono narrow-num" placeholder="end, e.g. 45s" bind:value={ex.end} />
+						<button type="button" class="icon-btn" onclick={() => removeExclude(i)} aria-label="Remove">✕</button>
+					</div>
+				{/each}
+				<button type="button" class="chip" onclick={addExclude}>+ Add exclude</button>
 			{:else if step === 2}
 				{#if profile?.transitionNote}
 					<p class="vibe-note">{profile.transitionNote}</p>
@@ -481,6 +589,77 @@
 					<button type="button" class="btn primary" onclick={addOutro}>Add outro card</button>
 				{/if}
 			{:else if step === 5}
+				<label class="field checkbox">
+					<input type="checkbox" bind:checked={cfg.multi_angle.enabled} />
+					<span>Enable multi-camera grouping</span>
+				</label>
+				{#if cfg.multi_angle.enabled}
+					<div class="field-grid">
+						<label class="field narrow">
+							<span>Sync method</span>
+							<select class="text-input" bind:value={cfg.multi_angle.sync}>
+								<option value="auto">Auto</option>
+								<option value="creation_time">Creation time</option>
+								<option value="audio">Audio cross-correlate</option>
+								<option value="manual">Manual offsets</option>
+							</select>
+						</label>
+						<label class="field narrow">
+							<span>Min hold</span>
+							<input class="text-input mono" placeholder="e.g. 1.5s" bind:value={cfg.multi_angle.min_hold} />
+						</label>
+					</div>
+					<p class="dim">
+						Leave groups empty to auto-discover from overlapping recording windows, or define them explicitly
+						below. Each group's master camera is implicit — list only the other members.
+					</p>
+					{#each cfg.multi_angle.groups as grp, i (i)}
+						<div class="angle-group">
+							<div class="row wrap">
+								<input class="text-input mono narrow-num" placeholder="master source id" bind:value={grp.master} />
+								<input
+									class="text-input mono"
+									placeholder="member ids, comma-separated"
+									value={membersText(grp)}
+									oninput={(e) => setMembersText(grp, (e.target as HTMLInputElement).value)}
+								/>
+								<button type="button" class="icon-btn" onclick={() => removeAngleGroup(i)} aria-label="Remove group"
+									>✕</button
+								>
+							</div>
+							{#if cfg.multi_angle.sync === 'manual'}
+								<p class="hint">
+									Manual offsets (source id → duration, sign optional): member_file_time = master_scene_time +
+									offset.
+								</p>
+								{#each Object.entries(grp.offsets) as [key, value], j (j)}
+									<div class="list-row">
+										<input
+											class="text-input mono"
+											value={key}
+											oninput={(e) => renameOffsetKeyAt(grp, j, (e.target as HTMLInputElement).value)}
+										/>
+										<input
+											class="text-input mono narrow-num"
+											placeholder="e.g. +2.4s"
+											value={value}
+											oninput={(e) => setOffsetValueAt(grp, j, (e.target as HTMLInputElement).value)}
+										/>
+										<button
+											type="button"
+											class="icon-btn"
+											onclick={() => removeOffsetAt(grp, j)}
+											aria-label="Remove offset">✕</button
+										>
+									</div>
+								{/each}
+								<button type="button" class="chip" onclick={() => addOffset(grp)}>+ Add offset</button>
+							{/if}
+						</div>
+					{/each}
+					<button type="button" class="chip" onclick={addAngleGroup}>+ Add angle group</button>
+				{/if}
+			{:else if step === 6}
 				<h3>Scoring weights</h3>
 				<p class="dim">How much each signal contributes to a moment's score. Higher = more influence on what gets picked.</p>
 				<div class="field-grid">
@@ -543,11 +722,6 @@
 					<input type="checkbox" bind:checked={cfg.grading.stabilize} />
 					<span>Stabilize (only for non-HyperSmooth / shaky sources)</span>
 				</label>
-
-				<p class="dim advanced-note">
-					Multi-camera angle groups, per-segment excludes, and per-source weight overrides aren't in the guided
-					editor yet — use the Raw TOML tab for those.
-				</p>
 			{/if}
 		</div>
 
@@ -726,15 +900,56 @@
 		font-size: 12.5px;
 	}
 
-	.advanced-note {
-		border-top: 1px dashed var(--line);
-		padding-top: 12px;
-	}
-
 	.row {
 		display: flex;
 		align-items: center;
 		gap: 10px;
+	}
+
+	.list-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.list-row .text-input {
+		width: auto;
+		flex: 1;
+	}
+
+	.narrow-num {
+		width: 130px;
+		flex: 0 0 130px;
+	}
+
+	.icon-btn {
+		flex: 0 0 auto;
+		width: 28px;
+		height: 28px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: var(--panel-alt);
+		border: 1px solid var(--line);
+		border-radius: 6px;
+		color: var(--text-faint);
+		font-size: 12px;
+		cursor: pointer;
+	}
+
+	.icon-btn:hover {
+		border-color: var(--bad);
+		color: var(--bad);
+	}
+
+	.angle-group {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		background: var(--panel-alt);
+		border: 1px solid var(--line);
+		border-radius: 8px;
+		padding: 12px;
 	}
 
 	.row.wrap {
