@@ -32,6 +32,55 @@
 	];
 	let step = $state(0);
 
+	// ---------- per-vibe guidance ----------
+	//
+	// The schema is identical for every vibe — same Config, same
+	// fields, same steps. What differs is which fields actually matter
+	// for a given aesthetic, straight from each vibe's own rationale in
+	// vibecut-ops/src/vibes.rs (kid_reel/action_highlight ramp and
+	// beat-burst; family_chronicle/documentary duck for voices;
+	// drone_cinematic has no source audio to duck; memory_keeper leans
+	// on the soundtrack with few ducks). These notes surface that
+	// context in place rather than making every vibe's wizard look
+	// identical regardless of what was actually proposed.
+	interface VibeProfile {
+		transitionNote?: string;
+		soundtrackNote?: string;
+		emphasizeVad?: boolean;
+	}
+	const VIBE_PROFILES: Record<string, VibeProfile> = {
+		kid_reel: {
+			soundtrackNote:
+				'This vibe leans on the soundtrack for pacing — beat-burst and speed-ramps read best with music underneath.'
+		},
+		family_chronicle: {
+			transitionNote: 'Family chronicle keeps a steady pace by default — speed-ramps are off here.',
+			soundtrackNote:
+				'Ducking is tuned to let voices and laughter through. Turn up "speech duck weight" below if dialogue keeps getting buried.',
+			emphasizeVad: true
+		},
+		drone_cinematic: {
+			transitionNote: 'Drone cinematic holds its shots and never ramps — the calm pace is the point.',
+			soundtrackNote: 'DJI footage usually has no source audio, so there is nothing to duck for — 0 duck windows is typical here.'
+		},
+		action_highlight: {
+			soundtrackNote:
+				'Soundtrack strongly recommended for this vibe — beat-burst and speed-ramps read best with a driving track underneath.'
+		},
+		documentary: {
+			transitionNote: 'Documentary stays plain — no speed-ramps or kinetic effects, so the story stays the focus.',
+			soundtrackNote:
+				'Ducks hard on every detected speech moment so narration comes through clearly — "speech duck weight" is the key knob for this vibe.',
+			emphasizeVad: true
+		},
+		memory_keeper: {
+			transitionNote: 'Memory keeper holds a gentle, steady pace — speed-ramps are off by default.',
+			soundtrackNote:
+				'Soundtrack-led with few duck windows, so the music carries the mood instead of ducking around dialogue.'
+		}
+	};
+	const profile = $derived(s.proposeResult ? VIBE_PROFILES[s.proposeResult.vibe] : undefined);
+
 	// ---------- project.seed ----------
 	//
 	// `Project.seed` is a Rust `u64`, which ts-rs types as `bigint` —
@@ -244,6 +293,9 @@
 					<span class="hint">0 = same seed always picks the same clips. Higher = more shake-up between renders.</span>
 				</label>
 			{:else if step === 2}
+				{#if profile?.transitionNote}
+					<p class="vibe-note">{profile.transitionNote}</p>
+				{/if}
 				<div class="field-grid">
 					<label class="field narrow">
 						<span>Transition</span>
@@ -285,6 +337,9 @@
 					</label>
 				</div>
 			{:else if step === 3}
+				{#if profile?.soundtrackNote}
+					<p class="vibe-note">{profile.soundtrackNote}</p>
+				{/if}
 				{#if cfg.soundtrack}
 					{@const st = cfg.soundtrack}
 					<div class="row wrap">
@@ -322,6 +377,22 @@
 							<input class="text-input mono" type="number" max="0" bind:value={st.ducking_db} />
 						</label>
 					</div>
+					{#if profile?.emphasizeVad}
+						<label class="field slider">
+							<span>Speech duck weight <span class="mono dim">{st.vad_speech_weight.toFixed(1)}</span></span>
+							<input type="range" min="0" max="3" step="0.1" bind:value={st.vad_speech_weight} />
+							<span class="hint">
+								How strongly detected speech boosts a moment's duck priority. Higher = the soundtrack ducks more
+								readily whenever someone's talking. Only has an effect if a voice-activity model is present on the
+								server.
+							</span>
+						</label>
+					{:else}
+						<label class="field narrow">
+							<span>Speech duck weight</span>
+							<input class="text-input mono" type="number" min="0" step="0.1" bind:value={st.vad_speech_weight} />
+						</label>
+					{/if}
 				{:else}
 					<p class="dim">No soundtrack configured — the picker still produces a watchable cut, just with no music-driven pacing.</p>
 					<button type="button" class="btn primary" onclick={addSoundtrack}>Add soundtrack</button>
@@ -606,6 +677,16 @@
 	.hint {
 		color: var(--text-faint);
 		font-size: 11px;
+	}
+
+	.vibe-note {
+		background: var(--panel-alt);
+		border-left: 2px solid var(--accent);
+		border-radius: 0 6px 6px 0;
+		padding: 8px 12px;
+		font-size: 12.5px;
+		color: var(--text-dim);
+		margin: 0;
 	}
 
 	.color-field {
