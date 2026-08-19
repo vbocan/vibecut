@@ -7,22 +7,23 @@
 	// never invents its own shape for anything it edits.
 	//
 	// Scope: the fields a vibe's own template actually sets (basics,
-	// pacing, transitions, soundtrack, one intro/outro text layer) get
-	// dedicated, purpose-built controls, organized as wizard steps.
-	// The long tail of rarely-touched fields (scoring weights, LUT
-	// grading) lives in a single "Advanced" step with plainer generic
-	// inputs — every `Config` field is reachable from *some* step, but
-	// not every step deserves equal design effort. Array-of-object
-	// fields (selection excludes/weights, multi-angle groups and their
-	// per-source offsets) get list editors: add/remove rows rather
-	// than a single control, since there's no natural single-value
-	// widget for "an arbitrary number of X".
+	// pacing, transitions, soundtrack, intro/outro) get dedicated,
+	// purpose-built controls, organized as wizard steps. The long tail
+	// of rarely-touched fields (scoring weights, LUT grading) lives in
+	// a single "Advanced" step with plainer generic inputs — every
+	// `Config` field is reachable from *some* step, but not every step
+	// deserves equal design effort. Array-of-object fields (outputs,
+	// selection excludes/weights, intro/outro layers, multi-angle
+	// groups and their per-source offsets) get list editors: add/
+	// remove rows rather than a single control, since there's no
+	// natural single-value widget for "an arbitrary number of X". Still
+	// Raw-TOML-only: explicit input.videos/images/ranges, multi-file
+	// soundtracks, top-level [[text]] lower-thirds, and per-output
+	// encoder presets.
 	import { appState as s } from '$lib/state.svelte';
 	import type { TextCard } from '$lib/types/generated/TextCard';
 	import type { CardLayer } from '$lib/types/generated/CardLayer';
 	import type { AngleGroupCfg } from '$lib/types/generated/AngleGroupCfg';
-
-	type TextCardLayer = Extract<CardLayer, { kind: 'text' }>;
 
 	const STEPS = [
 		{ label: 'Basics' },
@@ -99,6 +100,39 @@
 		cfg.project.seed = value === null ? null : (value as unknown as bigint);
 	}
 
+	// ---------- outputs ----------
+	//
+	// The body renders once at the highest resolution among all
+	// outputs, then transcodes to each output's own resolution/encoder
+	// — so a second output is typically "same cut, different delivery
+	// size" (e.g. a 4K master plus a 1080p upload copy), not a
+	// different edit. New rows clone the last output's settings for
+	// that reason, with a distinguishing path so the two don't collide
+	// on disk.
+	function addOutput() {
+		const outs = s.configStructured?.outputs;
+		if (!outs) return;
+		const last = outs[outs.length - 1];
+		const path = last ? last.path.replace(/(\.[a-zA-Z0-9]+)?$/, `_${outs.length + 1}$1`) : `out/output_${outs.length + 1}.mp4`;
+		outs.push({
+			path,
+			resolution: last?.resolution ?? '1920x1080',
+			encoder: last?.encoder ?? 'auto',
+			crf: last?.crf ?? 20,
+			preset: null,
+			audio_bitrate: last?.audio_bitrate ?? '192k'
+		});
+	}
+	function removeOutput(i: number) {
+		const outs = s.configStructured?.outputs;
+		// Config::validate() rejects an empty outputs list — the UI
+		// just never offers the button that would get you there (see
+		// the {#if cfg.outputs.length > 1} guard around the remove
+		// button below) rather than surfacing a save-time error for it.
+		if (!outs || outs.length <= 1) return;
+		outs.splice(i, 1);
+	}
+
 	// ---------- soundtrack ----------
 	function addSoundtrack() {
 		if (!s.configStructured) return;
@@ -148,15 +182,10 @@
 		if (s.configStructured) s.configStructured.outro = null;
 	}
 
-	/** The card's first text layer, if it has one — every vibe
-	 *  template's intro/outro is exactly this shape (one title line),
-	 *  so editing "the" text layer covers the common case without a
-	 *  full layer-list editor. */
-	function titleLayer(card: TextCard): TextCardLayer | null {
-		const l = card.layers.find((l): l is TextCardLayer => l.kind === 'text');
-		return l ?? null;
-	}
-	function addTitleLayer(card: TextCard) {
+	/** Layers draw in array order — later entries paint on top of
+	 *  earlier ones — so add-at-end is the correct default position,
+	 *  not just the simplest one. */
+	function addTextLayer(card: TextCard) {
 		card.layers.push({
 			kind: 'text',
 			content: '',
@@ -172,6 +201,30 @@
 			disappear_at: null,
 			background: null
 		});
+	}
+	function addImageLayer(card: TextCard) {
+		card.layers.push({
+			kind: 'image',
+			path: '',
+			position: 'center',
+			height: 200,
+			x_offset: 0,
+			y_offset: 0,
+			opacity: 1.0,
+			fade_in: null,
+			fade_out: null,
+			appear_at: null,
+			disappear_at: null
+		});
+	}
+	function removeLayer(card: TextCard, index: number) {
+		card.layers.splice(index, 1);
+	}
+	/** `appear_at`/`disappear_at`/per-layer fades are optional Durations
+	 *  (`string | null`) — empty text input means "inherit the card's
+	 *  own timing", which the pipeline already treats `null` as. */
+	function optionalDuration(value: string): string | null {
+		return value.trim() === '' ? null : value;
 	}
 
 	// ---------- selection: source weights & excludes ----------
@@ -289,44 +342,53 @@
 					</label>
 				</div>
 
-				{#if cfg.outputs.length > 0}
-					{@const out = cfg.outputs[0]}
-					<h3>Output</h3>
-					<div class="field-grid">
-						<label class="field narrow">
-							<span>Resolution</span>
-							<select class="text-input" bind:value={out.resolution}>
-								<option value="1920x1080">1920×1080</option>
-								<option value="3840x2160">3840×2160 (4K)</option>
-								<option value="1280x720">1280×720</option>
-							</select>
-						</label>
-						<label class="field narrow">
-							<span>Encoder</span>
-							<select class="text-input" bind:value={out.encoder}>
-								<option value="auto">auto</option>
-								<option value="libx264">libx264</option>
-								<option value="libx265">libx265</option>
-								<option value="nvenc">nvenc</option>
-								<option value="amf">amf</option>
-								<option value="qsv">qsv</option>
-							</select>
-						</label>
-						<label class="field narrow">
-							<span>Quality (CRF)</span>
-							<input class="text-input mono" type="number" min="0" max="51" bind:value={out.crf} />
-						</label>
-						<label class="field narrow">
-							<span>Audio bitrate</span>
-							<input class="text-input mono" placeholder="e.g. 192k" bind:value={out.audio_bitrate} />
-						</label>
+				<h3>Outputs</h3>
+				<p class="dim">
+					The body renders once at the highest resolution among these, then transcodes to each one's own
+					resolution/encoder — a second output is typically the same cut at a different delivery size.
+				</p>
+				{#each cfg.outputs as out, i (i)}
+					<div class="output-card">
+						<div class="row wrap">
+							<input class="text-input mono" placeholder="e.g. out/final.mp4" bind:value={out.path} />
+							{#if cfg.outputs.length > 1}
+								<button type="button" class="icon-btn" onclick={() => removeOutput(i)} aria-label="Remove output"
+									>✕</button
+								>
+							{/if}
+						</div>
+						<div class="field-grid">
+							<label class="field narrow">
+								<span>Resolution</span>
+								<select class="text-input" bind:value={out.resolution}>
+									<option value="1920x1080">1920×1080</option>
+									<option value="3840x2160">3840×2160 (4K)</option>
+									<option value="1280x720">1280×720</option>
+								</select>
+							</label>
+							<label class="field narrow">
+								<span>Encoder</span>
+								<select class="text-input" bind:value={out.encoder}>
+									<option value="auto">auto</option>
+									<option value="libx264">libx264</option>
+									<option value="libx265">libx265</option>
+									<option value="nvenc">nvenc</option>
+									<option value="amf">amf</option>
+									<option value="qsv">qsv</option>
+								</select>
+							</label>
+							<label class="field narrow">
+								<span>Quality (CRF)</span>
+								<input class="text-input mono" type="number" min="0" max="51" bind:value={out.crf} />
+							</label>
+							<label class="field narrow">
+								<span>Audio bitrate</span>
+								<input class="text-input mono" placeholder="e.g. 192k" bind:value={out.audio_bitrate} />
+							</label>
+						</div>
 					</div>
-					{#if cfg.outputs.length > 1}
-						<p class="dim">
-							{cfg.outputs.length - 1} more output{cfg.outputs.length > 2 ? 's' : ''} configured — edit via Raw TOML.
-						</p>
-					{/if}
-				{/if}
+				{/each}
+				<button type="button" class="chip" onclick={addOutput}>+ Add output</button>
 			{:else if step === 1}
 				<div class="field-grid">
 					<label class="field narrow">
@@ -506,85 +568,143 @@
 					<button type="button" class="btn primary" onclick={addSoundtrack}>Add soundtrack</button>
 				{/if}
 			{:else if step === 4}
-				<h3>Intro</h3>
-				{#if cfg.intro}
-					{@const layer = titleLayer(cfg.intro)}
-					<div class="row wrap">
-						<button type="button" class="chip" onclick={removeIntro}>Remove intro</button>
-					</div>
+				{#snippet cardEditor(card: TextCard)}
 					<div class="field-grid">
 						<label class="field narrow">
 							<span>Duration</span>
-							<input class="text-input mono" bind:value={cfg.intro.duration} />
+							<input class="text-input mono" bind:value={card.duration} />
 						</label>
 						<label class="field narrow">
 							<span>Mode</span>
-							<select class="text-input" bind:value={cfg.intro.mode}>
+							<select class="text-input" bind:value={card.mode}>
 								<option value="card">Card</option>
 								<option value="overlay">Overlay on footage</option>
 							</select>
 						</label>
 						<label class="field narrow color-field">
 							<span>Background</span>
-							<span class="swatch" style="background:{cfg.intro.bg_color}"></span>
-							<input class="text-input mono" bind:value={cfg.intro.bg_color} />
+							<span class="swatch" style="background:{card.bg_color}"></span>
+							<input class="text-input mono" bind:value={card.bg_color} />
 						</label>
 					</div>
-					{#if layer}
-						<label class="field">
-							<span>Title text</span>
-							<input class="text-input" bind:value={layer.content} />
-						</label>
-						<div class="field-grid">
-							<label class="field narrow">
-								<span>Size</span>
-								<input class="text-input mono" type="number" min="8" bind:value={layer.size} />
-							</label>
-							<label class="field narrow color-field">
-								<span>Color</span>
-								<span class="swatch" style="background:{layer.color}"></span>
-								<input class="text-input mono" bind:value={layer.color} />
-							</label>
+
+					<h4>Layers <span class="dim mono">({card.layers.length})</span></h4>
+					<p class="hint">Drawn in order below — later layers paint on top of earlier ones.</p>
+					{#each card.layers as layer, li (li)}
+						<div class="layer-card">
+							<div class="row wrap">
+								<span class="badge">{layer.kind}</span>
+								<button
+									type="button"
+									class="icon-btn"
+									onclick={() => removeLayer(card, li)}
+									aria-label="Remove layer">✕</button
+								>
+							</div>
+							{#if layer.kind === 'text'}
+								<label class="field">
+									<span>Text</span>
+									<input class="text-input" bind:value={layer.content} />
+								</label>
+								<div class="field-grid">
+									<label class="field narrow">
+										<span>Size</span>
+										<input class="text-input mono" type="number" min="8" bind:value={layer.size} />
+									</label>
+									<label class="field narrow color-field">
+										<span>Color</span>
+										<span class="swatch" style="background:{layer.color}"></span>
+										<input class="text-input mono" bind:value={layer.color} />
+									</label>
+									<label class="field narrow">
+										<span>Position</span>
+										<select class="text-input" bind:value={layer.position}>
+											<option value="center">Center</option>
+											<option value="top-left">Top left</option>
+											<option value="top-center">Top center</option>
+											<option value="top-right">Top right</option>
+											<option value="bottom-left">Bottom left</option>
+											<option value="bottom-center">Bottom center</option>
+											<option value="bottom-right">Bottom right</option>
+										</select>
+									</label>
+								</div>
+							{:else}
+								<label class="field">
+									<span>Image path (server path)</span>
+									<input class="text-input mono" placeholder="/projects/logos/brand.png" bind:value={layer.path} />
+								</label>
+								<div class="field-grid">
+									<label class="field narrow">
+										<span>Height (px)</span>
+										<input class="text-input mono" type="number" min="1" bind:value={layer.height} />
+									</label>
+									<label class="field narrow">
+										<span>Opacity</span>
+										<input class="text-input mono" type="number" min="0" max="1" step="0.05" bind:value={layer.opacity} />
+									</label>
+									<label class="field narrow">
+										<span>Position</span>
+										<select class="text-input" bind:value={layer.position}>
+											<option value="center">Center</option>
+											<option value="top-left">Top left</option>
+											<option value="top-center">Top center</option>
+											<option value="top-right">Top right</option>
+											<option value="bottom-left">Bottom left</option>
+											<option value="bottom-center">Bottom center</option>
+											<option value="bottom-right">Bottom right</option>
+										</select>
+									</label>
+								</div>
+							{/if}
+							<div class="field-grid">
+								<label class="field narrow">
+									<span>X offset (px)</span>
+									<input class="text-input mono" type="number" bind:value={layer.x_offset} />
+								</label>
+								<label class="field narrow">
+									<span>Y offset (px)</span>
+									<input class="text-input mono" type="number" bind:value={layer.y_offset} />
+								</label>
+								<label class="field narrow">
+									<span>Appears at</span>
+									<input
+										class="text-input mono"
+										placeholder="card start"
+										value={layer.appear_at ?? ''}
+										oninput={(e) => (layer.appear_at = optionalDuration((e.target as HTMLInputElement).value))}
+									/>
+								</label>
+								<label class="field narrow">
+									<span>Disappears at</span>
+									<input
+										class="text-input mono"
+										placeholder="card end"
+										value={layer.disappear_at ?? ''}
+										oninput={(e) => (layer.disappear_at = optionalDuration((e.target as HTMLInputElement).value))}
+									/>
+								</label>
+							</div>
 						</div>
-					{:else}
-						<button type="button" class="chip" onclick={() => addTitleLayer(cfg.intro!)}>Add title text</button>
-					{/if}
+					{/each}
+					<div class="row wrap">
+						<button type="button" class="chip" onclick={() => addTextLayer(card)}>+ Add text layer</button>
+						<button type="button" class="chip" onclick={() => addImageLayer(card)}>+ Add image layer</button>
+					</div>
+				{/snippet}
+
+				<h3>Intro</h3>
+				{#if cfg.intro}
+					<button type="button" class="chip" onclick={removeIntro}>Remove intro</button>
+					{@render cardEditor(cfg.intro)}
 				{:else}
 					<button type="button" class="btn primary" onclick={addIntro}>Add intro card</button>
 				{/if}
 
 				<h3>Outro</h3>
 				{#if cfg.outro}
-					{@const layer = titleLayer(cfg.outro)}
-					<div class="row wrap">
-						<button type="button" class="chip" onclick={removeOutro}>Remove outro</button>
-					</div>
-					<div class="field-grid">
-						<label class="field narrow">
-							<span>Duration</span>
-							<input class="text-input mono" bind:value={cfg.outro.duration} />
-						</label>
-						<label class="field narrow">
-							<span>Mode</span>
-							<select class="text-input" bind:value={cfg.outro.mode}>
-								<option value="card">Card</option>
-								<option value="overlay">Overlay on footage</option>
-							</select>
-						</label>
-						<label class="field narrow color-field">
-							<span>Background</span>
-							<span class="swatch" style="background:{cfg.outro.bg_color}"></span>
-							<input class="text-input mono" bind:value={cfg.outro.bg_color} />
-						</label>
-					</div>
-					{#if layer}
-						<label class="field">
-							<span>Text</span>
-							<input class="text-input" bind:value={layer.content} />
-						</label>
-					{:else}
-						<button type="button" class="chip" onclick={() => addTitleLayer(cfg.outro!)}>Add text</button>
-					{/if}
+					<button type="button" class="chip" onclick={removeOutro}>Remove outro</button>
+					{@render cardEditor(cfg.outro)}
 				{:else}
 					<button type="button" class="btn primary" onclick={addOutro}>Add outro card</button>
 				{/if}
@@ -814,6 +934,13 @@
 		margin: 6px 0 -4px;
 	}
 
+	h4 {
+		font-size: 11.5px;
+		font-weight: 700;
+		color: var(--text-dim);
+		margin: 4px 0 -6px;
+	}
+
 	.field-grid {
 		display: flex;
 		flex-wrap: wrap;
@@ -942,7 +1069,9 @@
 		color: var(--bad);
 	}
 
-	.angle-group {
+	.angle-group,
+	.output-card,
+	.layer-card {
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
@@ -950,6 +1079,10 @@
 		border: 1px solid var(--line);
 		border-radius: 8px;
 		padding: 12px;
+	}
+
+	.layer-card {
+		border-left: 2px solid var(--accent-dim);
 	}
 
 	.row.wrap {
@@ -1006,6 +1139,9 @@
 		letter-spacing: 0.04em;
 		padding: 2px 6px;
 		border-radius: 4px;
+		background: var(--panel);
+		color: var(--text-dim);
+		border: 1px solid var(--line);
 	}
 
 	.badge.good {
