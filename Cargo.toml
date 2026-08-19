@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "vibecut",
-    "vibecut-ops",
-    "vibecut-mcp",
-    "vibecut-web",
+    "src/vibecut",
+    "src/vibecut-ops",
+    "src/vibecut-mcp",
+    "src/vibecut-web",
 ]
 
 [workspace.package]

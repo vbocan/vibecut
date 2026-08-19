@@ -40,7 +40,7 @@ pub fn router(state: AppState) -> Router {
 
     if let Some(dir) = static_dir() {
         // `adapter-static`'s SPA fallback (`fallback: 'index.html'`,
-        // see `vibecut-ui/svelte.config.js`) needs the same shape here:
+        // see `src/vibecut-ui/svelte.config.js`) needs the same shape here:
         // serve a real file when the path matches one, else
         // `index.html` so the client-side router handles it. Anything
         // under `/api` never reaches this — `.nest` above already

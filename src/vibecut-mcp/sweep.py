@@ -7,8 +7,8 @@ against the same source in one pass — same seed, so it's reproducible.
 
 Usage:
 
-    python vibecut-mcp/sweep.py --footage "E:/footage" --gpus
-    python vibecut-mcp/sweep.py --footage "E:/footage" --vibes kid_reel,drone_cinematic --gpus
+    python src/vibecut-mcp/sweep.py --footage "E:/footage" --gpus
+    python src/vibecut-mcp/sweep.py --footage "E:/footage" --vibes kid_reel,drone_cinematic --gpus
 
 The summary lands at `/projects/sweep/sweep_summary.json` (mounted
 back to the host's `out/mcp/sweep/`).

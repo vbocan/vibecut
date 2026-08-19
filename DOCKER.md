@@ -79,14 +79,14 @@ response on an empty mount:
 
 ```bash
 docker run -d --rm --name vibecut-smoke -p 18080:8080 vibecut:latest
-python vibecut-mcp/http_smoke.py --call-discover
+python src/vibecut-mcp/http_smoke.py --call-discover
 docker stop vibecut-smoke
 ```
 
 **Real edit on real footage:**
 
 ```bash
-python vibecut-mcp/run_edit.py --gpus --vibe action_highlight --footage "E:/footage"
+python src/vibecut-mcp/run_edit.py --gpus --vibe action_highlight --footage "E:/footage"
 ```
 
 Drives `discover_sources` → `propose_vibe` → `render` end-to-end.
@@ -150,13 +150,13 @@ cargo build --release
 docker compose -f compose.yml -f compose.dev.yml up
 ```
 
-For frontend iteration, rebuilding the image on every `vibecut-ui/` change
-is even slower — `npm run dev` against a running container is the
-faster loop:
+For frontend iteration, rebuilding the image on every `src/vibecut-ui/`
+change is even slower — `npm run dev` against a running container is
+the faster loop:
 
 ```bash
 docker compose up -d          # vibecut-web now reachable on :8090
-cd vibecut-ui
+cd src/vibecut-ui
 npm install                   # first time only
 npm run dev                   # proxies /api to localhost:8090; see vite.config.ts
 ```

@@ -22,6 +22,6 @@ models/
 # node_modules/.svelte-kit/build (61 MB+ of exactly the kind of
 # thing that shouldn't round-trip through the build context) never
 # need to leave the host.
-vibecut-ui/node_modules/
-vibecut-ui/.svelte-kit/
-vibecut-ui/build/
+src/vibecut-ui/node_modules/
+src/vibecut-ui/.svelte-kit/
+src/vibecut-ui/build/

@@ -29,11 +29,11 @@ ARG NODE_VERSION=22
 # for a reproducible build straight from the committed lockfile.
 FROM node:${NODE_VERSION}-slim AS web-builder
 WORKDIR /src/vibecut-ui
-COPY vibecut-ui/package.json vibecut-ui/package-lock.json ./
+COPY src/vibecut-ui/package.json src/vibecut-ui/package-lock.json ./
 RUN npm ci
-COPY vibecut-ui/ ./
+COPY src/vibecut-ui/ ./
 RUN npm run build
-# adapter-static (fallback: 'index.html', see vibecut-ui/svelte.config.js)
+# adapter-static (fallback: 'index.html', see src/vibecut-ui/svelte.config.js)
 # writes the whole static site to ./build.
 
 # ---------- Stage 2: Rust workspace build ----------
@@ -59,18 +59,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain stable --profile minimal
 
-WORKDIR /src
+WORKDIR /build
 # Copy the whole workspace. The dep graph is small enough that splitting
 # into a "deps-only" pre-build layer isn't worth the maintenance cost.
 # Every workspace member needs a COPY line here regardless of whether
 # its binary ships in the runtime stage below — on a virtual-manifest
 # workspace root, `cargo build --release` builds every member, so a
-# missing COPY fails the build the moment the crate exists.
+# missing COPY fails the build the moment the crate exists. Destination
+# paths mirror the host layout (src/<crate>) since the workspace
+# Cargo.toml's member paths are relative to it.
 COPY Cargo.toml Cargo.lock ./
-COPY vibecut ./vibecut
-COPY vibecut-ops ./vibecut-ops
-COPY vibecut-mcp ./vibecut-mcp
-COPY vibecut-web ./vibecut-web
+COPY src/vibecut ./src/vibecut
+COPY src/vibecut-ops ./src/vibecut-ops
+COPY src/vibecut-mcp ./src/vibecut-mcp
+COPY src/vibecut-web ./src/vibecut-web
 
 RUN cargo build --release \
     && mkdir -p /out \
@@ -126,7 +128,7 @@ RUN find /tmp/ortlibs -name "*.so*" -exec cp -L {} /usr/local/lib/ \; \
     && ldconfig
 
 # The built web UI — vibecut-web serves this directly as a static
-# fallback (see vibecut-web/src/lib.rs's `router`).
+# fallback (see src/vibecut-web/src/lib.rs's `router`).
 COPY --from=web-builder /src/vibecut-ui/build /app/vibecut-ui
 
 # Mount points the MCP client must bind. We create them so an absent

@@ -13,11 +13,11 @@ LLM is in the *client* and our server is pure tools.
 Usage:
 
     # Replay against a fresh container (script spins one up):
-    python vibecut-mcp/replay.py --log out/mcp/sessions/<file>.jsonl \\
+    python src/vibecut-mcp/replay.py --log out/mcp/sessions/<file>.jsonl \\
         --footage "E:/footage" --gpus
 
     # Replay against an existing running server:
-    python vibecut-mcp/replay.py --log <file>.jsonl \\
+    python src/vibecut-mcp/replay.py --log <file>.jsonl \\
         --base-url http://localhost:8080/
 
 Determinism is checked PER TOOL on the fields that should be

@@ -4,7 +4,7 @@ and surface the final mp4 path. Equivalent to what the Python-era
 `mcp_server.python/run_edit.py` did, retargeted to the all-Rust server's
 Streamable HTTP transport.
 
-    python vibecut-mcp/run_edit.py --gpus --target 1m30s --footage "E:/footage"
+    python src/vibecut-mcp/run_edit.py --gpus --target 1m30s --footage "E:/footage"
 """
 from __future__ import annotations
 

@@ -11,7 +11,7 @@ client had decided to iterate. Validates that:
 
 Usage:
 
-    python vibecut-mcp/run_iteration.py --footage "E:/footage" --gpus
+    python src/vibecut-mcp/run_iteration.py --footage "E:/footage" --gpus
 
 By default exercises the `Calmer` action against an `action_highlight`
 proposal. Pass --action calmer | punchier | scale_shorter | scale_longer

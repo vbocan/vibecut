@@ -1,6 +1,6 @@
 // Thin typed client for vibecut-web's REST + WS API. Every export
 // here is a 1:1 mirror of a route in
-// vibecut-web/src/routes/mod.rs — no logic lives here beyond
+// src/vibecut-web/src/routes/mod.rs — no logic lives here beyond
 // request shaping and error unwrapping.
 
 import type { FeedbackAction } from './types/generated/FeedbackAction';

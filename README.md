@@ -201,15 +201,15 @@ Each action round-trips through `Config::load → mutate → validate → write`
                                          └───────────────┘
 ```
 
-One container, two processes under one `tini` (see [docker/entrypoint.sh](docker/entrypoint.sh)) — not a merged single-port router. MCP and the web UI reach the same pipeline through the same [vibecut-ops/](vibecut-ops/) operations layer either way.
+One container, two processes under one `tini` (see [docker/entrypoint.sh](docker/entrypoint.sh)) — not a merged single-port router. MCP and the web UI reach the same pipeline through the same [src/vibecut-ops/](src/vibecut-ops/) operations layer either way.
 
-Five crates plus one frontend, all in this repo, all shipped in the Docker image:
+Five crates plus one frontend, all under [src/](src/) in this repo, all shipped in the Docker image:
 
-1. **Pipeline** ([vibecut/](vibecut/)) — Rust crate. Telemetry → scoring → selection → render → mux → transcode. Library + binary, 89 tests.
-2. **Operations layer** ([vibecut-ops/](vibecut-ops/)) — Rust crate. Transport-free async functions (discover, propose, apply_feedback, render, inspect, config read/write, session log/list) that call the pipeline directly — no MCP, no HTTP, no opinion on transport. Every transport below is a thin wrapper around one of these, including the per-call JSONL `SessionLogger` both transports share. 49 tests.
-3. **MCP server** ([vibecut-mcp/](vibecut-mcp/)) — Rust crate using `rmcp` 0.10 + axum. 9 tools, Streamable HTTP transport. Ships in the Docker image.
-4. **Web server** ([vibecut-web/](vibecut-web/)) — Rust crate using `axum` 0.8. REST + WebSocket over the same operations layer, for direct browser control instead of an LLM conversation — plus a free-text brief endpoint (`POST /api/brief`) that calls the Anthropic API directly, since a browser has no LLM built in the way Claude Desktop does, and it serves the built web UI itself as a static-file fallback. 15 tests. Runs alongside `vibecut-mcp` in the same Docker image and container, on its own port (`WEB_BIND_ADDR`, default `:8090`) — two processes under one `tini`, not a merged single-port router.
-5. **Web UI** ([vibecut-ui/](vibecut-ui/)) — SvelteKit 2 + Svelte 5 + TypeScript. Sources → Vibe → Config → Render → Preview → History in one flow, talking to #4 over `fetch`/`WebSocket`. Preview includes a segment-colored, click-to-seek timeline with a per-segment inspector (source, score, reason) and one-click `More of` / `Less of` / `Drop this segment` feedback actions; a free-text brief box (`Ask AI`) stands in for manual vibe-picking or quick-feedback buttons wherever it appears; History has an A/B before/after slider across the session's renders plus a browsable session log. Ships pre-built into the Docker image — open `http://localhost:8090/`, nothing else to run. For frontend iteration, `npm install && npm run dev` against a running container still proxies `/api` to `:8090` (see [DOCKER.md](DOCKER.md)'s dev loop) — set `ANTHROPIC_API_KEY` on the container for the brief box to work.
+1. **Pipeline** ([src/vibecut/](src/vibecut/)) — Rust crate. Telemetry → scoring → selection → render → mux → transcode. Library + binary, 89 tests.
+2. **Operations layer** ([src/vibecut-ops/](src/vibecut-ops/)) — Rust crate. Transport-free async functions (discover, propose, apply_feedback, render, inspect, config read/write, session log/list) that call the pipeline directly — no MCP, no HTTP, no opinion on transport. Every transport below is a thin wrapper around one of these, including the per-call JSONL `SessionLogger` both transports share. 49 tests.
+3. **MCP server** ([src/vibecut-mcp/](src/vibecut-mcp/)) — Rust crate using `rmcp` 0.10 + axum. 9 tools, Streamable HTTP transport. Ships in the Docker image.
+4. **Web server** ([src/vibecut-web/](src/vibecut-web/)) — Rust crate using `axum` 0.8. REST + WebSocket over the same operations layer, for direct browser control instead of an LLM conversation — plus a free-text brief endpoint (`POST /api/brief`) that calls the Anthropic API directly, since a browser has no LLM built in the way Claude Desktop does, and it serves the built web UI itself as a static-file fallback. 15 tests. Runs alongside `vibecut-mcp` in the same Docker image and container, on its own port (`WEB_BIND_ADDR`, default `:8090`) — two processes under one `tini`, not a merged single-port router.
+5. **Web UI** ([src/vibecut-ui/](src/vibecut-ui/)) — SvelteKit 2 + Svelte 5 + TypeScript. Sources → Vibe → Config → Render → Preview → History in one flow, talking to #4 over `fetch`/`WebSocket`. Preview includes a segment-colored, click-to-seek timeline with a per-segment inspector (source, score, reason) and one-click `More of` / `Less of` / `Drop this segment` feedback actions; a free-text brief box (`Ask AI`) stands in for manual vibe-picking or quick-feedback buttons wherever it appears; History has an A/B before/after slider across the session's renders plus a browsable session log. Ships pre-built into the Docker image — open `http://localhost:8090/`, nothing else to run. For frontend iteration, `npm install && npm run dev` against a running container still proxies `/api` to `:8090` (see [DOCKER.md](DOCKER.md)'s dev loop) — set `ANTHROPIC_API_KEY` on the container for the brief box to work.
 6. **Client** — outside this repo. Any standard-MCP client (Claude Desktop, LM Studio) for the conversational flow; the web UI for direct browser control.
 
 ## Technology Stack
@@ -233,17 +233,17 @@ cargo test --release -p vibecut-mcp
 cargo test --release -p vibecut-web
 ```
 
-The web UI has no automated tests yet — `npm run check` (TypeScript + Svelte type-checking via `svelte-check`) inside [vibecut-ui/](vibecut-ui/) is the closest thing today.
+The web UI has no automated tests yet — `npm run check` (TypeScript + Svelte type-checking via `svelte-check`) inside [src/vibecut-ui/](src/vibecut-ui/) is the closest thing today.
 
 End-to-end smokes (require Docker):
 
 ```bash
-python vibecut-mcp/http_smoke.py --call-discover                       # MCP protocol handshake
-python vibecut-mcp/run_iteration.py --footage <folder> --gpus          # propose → render → feedback → render
-python vibecut-mcp/sweep.py --footage <folder> --gpus                  # all six vibes against one source
-python vibecut-mcp/replay.py --log <session.jsonl> --footage <folder>  # determinism replay
-python vibecut-mcp/inspect_smoke.py --footage <folder>                 # multimodal frame extraction
-python vibecut-mcp/async_smoke.py --footage <folder> --gpus            # render_async / render_status
+python src/vibecut-mcp/http_smoke.py --call-discover                       # MCP protocol handshake
+python src/vibecut-mcp/run_iteration.py --footage <folder> --gpus          # propose → render → feedback → render
+python src/vibecut-mcp/sweep.py --footage <folder> --gpus                  # all six vibes against one source
+python src/vibecut-mcp/replay.py --log <session.jsonl> --footage <folder>  # determinism replay
+python src/vibecut-mcp/inspect_smoke.py --footage <folder>                 # multimodal frame extraction
+python src/vibecut-mcp/async_smoke.py --footage <folder> --gpus            # render_async / render_status
 ```
 
 `<folder>` is a path to your own GoPro/DJI footage — none of these scripts ship with a default.
