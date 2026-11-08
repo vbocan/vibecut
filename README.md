@@ -3,7 +3,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT_or_Apache--2.0-yellow.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Supported-blue?logo=docker)](https://docker.com)
-[![Tests](https://img.shields.io/badge/tests-153_passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-185_passing-brightgreen)](#testing)
 [![MCP](https://img.shields.io/badge/MCP-Protocol-purple)](https://modelcontextprotocol.io)
 [![NVENC](https://img.shields.io/badge/NVENC-Supported-76b900?logo=nvidia)](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new)
 
@@ -122,7 +122,8 @@ See [CONFIG.md](CONFIG.md) for the full TOML schema to hand-author `my-project.t
 
 - **Two ways in, one pipeline.** Hand-author a TOML and run `vibecut run`, **or** drop a folder in front of Claude Desktop and have a conversation. Both paths drive the same Rust pipeline.
 - **Telemetry-driven scoring.** GoPro HiLight tags, accelerometer peaks, GPS speed, motion energy, sharpness, exposure, optional Silero VAD. Per-source score curves combine into a multi-source pick set with diversity, energy-arc placement, and seeded variety.
-- **Audio-aware composition.** Beat-aligned cuts, smart-loop with natural-intro preservation, VAD-guided ducking around speech, optional rapid-cut beat-burst at the soundtrack's energy peak.
+- **Audio-aware composition.** Beat-locked cuts on a fitted beat grid (exact tempo and phase, hits timed to ~1 ms, half/double-tempo correction): every cut — crossfades, intro card, beat-burst and loop seams included — lands within half a frame of a beat. Smart-loop with natural-intro preservation and whole-beat loop crossfades, VAD-guided ducking around speech, optional rapid-cut beat-burst at the soundtrack's energy peak.
+- **Beat-sync report.** Every render with a soundtrack checks where the cuts actually landed against the beats — real crossfade widths, loop seams, and the encoded audio offset (measured by cross-correlation) included — and writes the per-cut errors to the manifest. See [CONFIG.md](CONFIG.md#beat-sync-report).
 - **GoPro-Quik-style transitions.** Per-pair speed-ramp ("whip-up") effect with brightness warm-up and 67 ms fade-to-white at the seam — visually a kinetic flash.
 - **MCP server with 9 tools** (`discover_sources`, `list_vibes`, `propose_vibe`, `render`, `render_async`, `render_status`, `apply_feedback`, `inspect_output`, `inspect_at`). Streamable HTTP transport on port 8080.
 - **Six curated vibes.** `kid_reel`, `family_chronicle`, `drone_cinematic`, `action_highlight`, `documentary`, `memory_keeper` — each a hand-tuned TOML template the LLM picks from.
@@ -142,7 +143,7 @@ See [CONFIG.md](CONFIG.md) for the full TOML schema to hand-author `my-project.t
 | **Submit-to-job-ID latency** (`render_async`) | ~0 ms |
 | **MCP tool startup** | ~1.5 s (Streamable HTTP, container already up) |
 | **Frame extraction** (`inspect_output`, 12 frames @ 480 px) | ~4 s parallel via tokio + ffmpeg |
-| **Test suite** | 153 unit tests, ~0.3 s |
+| **Test suite** | 185 unit tests, ~0.3 s |
 
 Measured on a single workstation with NVIDIA RTX-class GPU + WSL2; numbers scale roughly linearly with source duration.
 
@@ -205,10 +206,10 @@ One container, two processes under one `tini` (see [docker/entrypoint.sh](docker
 
 Five crates plus one frontend, all under [src/](src/) in this repo, all shipped in the Docker image:
 
-1. **Pipeline** ([src/vibecut/](src/vibecut/)) — Rust crate. Telemetry → scoring → selection → render → mux → transcode. Library + binary, 89 tests.
-2. **Operations layer** ([src/vibecut-ops/](src/vibecut-ops/)) — Rust crate. Transport-free async functions (discover, propose, apply_feedback, render, inspect, config read/write, session log/list) that call the pipeline directly — no MCP, no HTTP, no opinion on transport. Every transport below is a thin wrapper around one of these, including the per-call JSONL `SessionLogger` both transports share. 49 tests.
+1. **Pipeline** ([src/vibecut/](src/vibecut/)) — Rust crate. Telemetry → scoring → selection → render → mux → transcode. Library + binary, 115 tests.
+2. **Operations layer** ([src/vibecut-ops/](src/vibecut-ops/)) — Rust crate. Transport-free async functions (discover, propose, apply_feedback, render, inspect, config read/write, session log/list) that call the pipeline directly — no MCP, no HTTP, no opinion on transport. Every transport below is a thin wrapper around one of these, including the per-call JSONL `SessionLogger` both transports share. 53 tests.
 3. **MCP server** ([src/vibecut-mcp/](src/vibecut-mcp/)) — Rust crate using `rmcp` 0.10 + axum. 9 tools, Streamable HTTP transport. Ships in the Docker image.
-4. **Web server** ([src/vibecut-web/](src/vibecut-web/)) — Rust crate using `axum` 0.8. REST + WebSocket over the same operations layer, for direct browser control instead of an LLM conversation — plus a free-text brief endpoint (`POST /api/brief`) that calls the Anthropic API directly, since a browser has no LLM built in the way Claude Desktop does, and it serves the built web UI itself as a static-file fallback. 15 tests. Runs alongside `vibecut-mcp` in the same Docker image and container, on its own port (`WEB_BIND_ADDR`, default `:8090`) — two processes under one `tini`, not a merged single-port router.
+4. **Web server** ([src/vibecut-web/](src/vibecut-web/)) — Rust crate using `axum` 0.8. REST + WebSocket over the same operations layer, for direct browser control instead of an LLM conversation — plus a free-text brief endpoint (`POST /api/brief`) that calls the Anthropic API directly, since a browser has no LLM built in the way Claude Desktop does, and it serves the built web UI itself as a static-file fallback. 17 tests. Runs alongside `vibecut-mcp` in the same Docker image and container, on its own port (`WEB_BIND_ADDR`, default `:8090`) — two processes under one `tini`, not a merged single-port router.
 5. **Web UI** ([src/vibecut-ui/](src/vibecut-ui/)) — SvelteKit 2 + Svelte 5 + TypeScript. Sources → Vibe → Config → Render → Preview → History in one flow, talking to #4 over `fetch`/`WebSocket`. Preview includes a segment-colored, click-to-seek timeline with a per-segment inspector (source, score, reason) and one-click `More of` / `Less of` / `Drop this segment` feedback actions; a free-text brief box (`Ask AI`) stands in for manual vibe-picking or quick-feedback buttons wherever it appears; History has an A/B before/after slider across the session's renders plus a browsable session log. Ships pre-built into the Docker image — open `http://localhost:8090/`, nothing else to run. For frontend iteration, `npm install && npm run dev` against a running container still proxies `/api` to `:8090` (see [DOCKER.md](DOCKER.md)'s dev loop) — set `ANTHROPIC_API_KEY` on the container for the brief box to work.
 6. **Client** — outside this repo. Any standard-MCP client (Claude Desktop, LM Studio) for the conversational flow; the web UI for direct browser control.
 
@@ -221,7 +222,7 @@ Five crates plus one frontend, all under [src/](src/) in this repo, all shipped 
 - **Video / audio**: ffmpeg 6.x (NVENC, libx264, libx265, vidstab)
 - **ML inference**: ONNX Runtime 2.x with CUDA EP (Silero VAD)
 - **Container base**: `nvidia/cuda:12.6.0-runtime-ubuntu24.04`
-- **Tests**: 153 (89 pipeline + 49 operations layer + 0 MCP layer + 15 web layer)
+- **Tests**: 185 (115 pipeline + 53 operations layer + 0 MCP layer + 17 web layer)
 
 ## Testing
 
@@ -275,7 +276,7 @@ If you use Vibecut in your research, please cite:
 
 - **No user study.** This is a systems contribution; user vocabulary corpus is future work.
 - **Vibe library is curated, not learned** — six hand-built entries.
-- **Preview's click-to-seek timeline is an approximation** — the manifest doesn't yet record exact per-segment output timing (intro duration, per-seam transition width), so seeking can land a beat off around heavily-transitioned cuts.
+- **Preview's click-to-seek timeline is an approximation** — the manifest doesn't yet record exact per-segment output timing (intro duration, per-seam transition width), so seeking can land a beat off around heavily-transitioned cuts. (The beat-sync report's per-cut times are exact; Preview doesn't use them yet.)
 - **NVENC determinism is bit-identical within one driver version** — we make no claim across NVIDIA driver upgrades. CPU fallback (libx264) is fully deterministic.
 
 ## Roadmap

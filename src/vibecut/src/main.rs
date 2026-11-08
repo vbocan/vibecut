@@ -246,9 +246,21 @@ fn beats_cmd(file: &Utf8Path, max_print: usize) -> Result<()> {
     println!("{file}");
     println!("  duration:    {:.2}s", analyzed.duration_secs);
     println!("  sample rate: {} Hz (analyzer)", analyzed.sample_rate);
-    println!("  tempo:       {:.1} BPM (beat interval {:.3}s)",
+    println!("  tempo:       {:.2} BPM (beat interval {:.4}s)",
         analyzed.tempo_bpm, analyzed.beat_interval_secs());
     println!("  beats:       {} detected", analyzed.beats.len());
+    match &analyzed.beat_grid {
+        Some(g) => println!(
+            "  beat grid:   {} — {:.0}% matched, residual mean {:.1} ms / max {:.1} ms, raw {:.2} BPM, octave {:?}",
+            if g.is_tight() { "tight" } else { "loose" },
+            g.matched_fraction * 100.0,
+            g.mean_abs_residual_ms,
+            g.max_abs_residual_ms,
+            g.raw_bpm,
+            g.octave,
+        ),
+        None => println!("  beat grid:   not fitted (too few clear onsets); raw tempo used"),
+    }
 
     let (raw_s, raw_e) = analyzed.detect_loud_region(0.80);
     let snap_s = analyzed.beat_at_or_after(raw_s);

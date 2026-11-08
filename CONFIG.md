@@ -129,7 +129,7 @@ file = "music/track.wav"
 # ... or several, concatenated in order into one virtual track:
 # files = ["intro.mp3", "main.mp3", "outro.mp3"]
 
-beat_align            = true             # snap clip lengths to beat-multiples (default: true)
+beat_align            = true             # cut on the beat: whole-beat clips, every cut on a beat (default: true)
 energy_drives_pacing  = true             # let soundtrack energy modulate pacing (default: true)
 fade_out              = "1500ms"         # tail fade-out at end of output (default: 1500ms)
 
@@ -152,6 +152,87 @@ beat_burst_max_beats  = 12               # cap on burst length (default: 12)
 `beat_burst = "auto"` enables the burst iff: tempo ∈ [80, 180] BPM,
 pulse strength ≥ 1.8, and the loud region is ≥ 6 s long. Cuts every beat
 ≤ 140 BPM, every-other above. Placed in the middle 25–70% of the output.
+
+### Beat grid
+
+The soundtrack's beats come from a fitted grid, not just a tempo estimate.
+The raw autocorrelation tempo is quantised to the analyser's ~23 ms frames
+and can be a few percent off (e.g. 117.5 BPM for a 120 BPM track) — enough
+to drift a whole beat every 10–15 s. Vibecut refines it to the exact
+interval and phase, times every matched hit to ~1 ms in the raw audio, and
+halves or doubles the tempo when the onset pattern shows it was
+double-time or half-time. The run log reports the fit:
+
+```text
+tempo: 120.00 BPM (beat interval 0.5000s)  beats: 120  (0.1s)
+beat grid: tight — 100% of beats matched, residual mean 0.0 ms / max 0.0 ms (raw autocorrelation 117.5 BPM)
+```
+
+**tight** means ≥ 80 % of beats had a clear hit and those hits sit within
+15 ms of the grid on average (machine-timed music). **loose** grids (live
+drummers, tempo changes, ambient tracks) still drive the cut, but trust
+beat alignment less. `vibecut beats <file>` prints the same numbers for a
+track before you use it.
+
+### Beat-locked cuts
+
+With `beat_align = true`, every cut lands on a beat of the soundtrack *as
+it plays in the output* — not just "clips are a whole number of beats".
+Those aren't the same thing: a crossfade overlaps its two clips, so 4 s
+clips with 0.4 s fades cut every 3.6 s and drift through the beat. Vibecut
+instead gives each clip the exact length that puts the cut after it on the
+nearest beat to where the planner meant it:
+
+- **Clip lengths** grow by about half of each adjacent crossfade (a clip
+  runs on through half of its outgoing fade) and move by at most half a
+  beat to reach the beat, rounded to whole frames. Every cut targets an
+  absolute beat, so rounding never adds up: each cut is within half a frame
+  of its beat (the most whole-frame cuts can do when beats fall between
+  frames). Clip count is sized so the total still matches
+  `target_duration`.
+- **The intro card** lengthens or shortens by at most half a beat so the
+  footage comes in on a beat.
+- **Footage limits.** A clip that would read past the end of its source
+  file slides its window earlier; if it can't, a speed-ramped clip drops
+  its ramp (the ramp reads extra footage), and failing that the clip takes
+  a nearer beat.
+- **Beat-burst** cuts and cuts after a soundtrack loop seam are locked the
+  same way.
+
+The run log says what moved:
+
+```text
+beat-lock: 25 of 25 cuts placed on the beat (clip lengths -0.00…+0.36s; 1 window slid earlier, 0 speed-ramps dropped)
+  intro card 2.50s → 2.633s so the footage comes in on a beat
+```
+
+When the soundtrack is shorter than the video it loops: the track plays
+once through its natural intro, then its loudest section repeats, each copy
+crossfaded into the next over ~2 s. That crossfade is rounded to a whole
+number of beats, so the beats of both copies coincide through it (no
+flamming kicks) and the grid runs on unbroken.
+
+### Beat-sync report
+
+After every render with a soundtrack, Vibecut checks where the cuts
+actually landed against the beats and prints a summary:
+
+```text
+beat sync: 26 cuts vs the 128.00 BPM grid — on the beat
+  mean |error| 10 ms (0.3 frames), worst 16 ms; 26/26 within ±3 frames (random placement would average 117 ms)
+  audio offset in the render: +0.0 ms (correlation 1.00)
+```
+
+It accounts for everything between the plan and the file: each seam's real
+crossfade width (cuts are measured at the crossfade midpoint), the intro
+card, the beat-burst's internal cuts, the smart loop's crossfades, and the
+audio track's offset in the encoded file, measured by cross-correlating the
+rendered audio against the soundtrack. ±3 frames is the tolerance; the
+"random placement" figure (a quarter beat) is what unaligned cuts would
+average, so a mean error near it means the cuts aren't following the beat
+at all — what you'd see with `beat_align = false`. `--explain` adds a
+per-cut table, and the full report is written to the manifest as
+`beat_sync`.
 
 ---
 
@@ -562,5 +643,6 @@ or building tooling on top of it:
   shape. A single-line note prints during the run when this kicks in.
 - **Manifest output.** Each render writes `<output>.manifest.json`
   alongside the mp4 with the resolved segment list, sources, and
-  effective settings. Useful for postprocessing, audits, or driving
-  external tooling.
+  effective settings — plus, with a soundtrack, the `beat_sync` report
+  (see [Beat-sync report](#beat-sync-report)). Useful for postprocessing,
+  audits, or driving external tooling.

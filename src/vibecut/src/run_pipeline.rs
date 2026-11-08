@@ -308,12 +308,19 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             .with_context(|| format!("analyzing soundtrack {resolved}"))?;
         soundtrack_resolved = Some(resolved);
         println!(
-            "  tempo: {:.1} BPM (beat interval {:.3}s)  beats: {}  ({:.1}s)",
+            "  tempo: {:.2} BPM (beat interval {:.4}s)  beats: {}  ({:.1}s)",
             a.tempo_bpm,
             a.beat_interval_secs(),
             a.beats.len(),
             started.elapsed().as_secs_f32()
         );
+        match &a.beat_grid {
+            Some(g) => println!("  beat grid: {}", describe_beat_grid(g)),
+            None if a.tempo_bpm > 0.0 => {
+                println!("  beat grid: too few clear onsets to fit; using the raw tempo")
+            }
+            None => {}
+        }
 
         if s.beat_align && a.tempo_bpm > 0.0 {
             let bi = a.beat_interval_secs() as f64;
@@ -563,7 +570,18 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // Subtract image segment durations from the picker's budget so the total
     // output length stays close to `target_duration` even with images added.
     let video_target = (target - image_total_dur).max(clip_len);
-    let inflated_target = if (clip_len - xfade) > 1e-3 {
+    // With beat-locked cuts (see the beat-lock pass below), each clip runs on
+    // through half of each crossfade so the span between its cuts is its
+    // full planned length; the crossfades no longer eat into the cut, so:
+    //   Output ≈ intro + K × clip_len + outro
+    let beat_locked = cfg.soundtrack.as_ref().is_some_and(|s| s.beat_align)
+        && audio.as_ref().is_some_and(|a| a.tempo_bpm > 0.0 && !a.beats.is_empty());
+    let inflated_target = if beat_locked {
+        ((video_target - intro_dur as f64 - outro_dur as f64) / clip_len)
+            .round()
+            .max(1.0)
+            * clip_len
+    } else if (clip_len - xfade) > 1e-3 {
         let k_for_output = ((video_target - intro_dur as f64 - outro_dur as f64
             + (n_endcaps - 1.0).max(0.0) * xfade)
             / (clip_len - xfade))
@@ -1015,7 +1033,12 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         .iter()
         .flat_map(|src| src.chapters.iter().map(|c| (c.path.as_path(), c.duration_secs)))
         .collect();
-    let seg_ramps: Vec<Option<crate::video_renderer::SpeedRamp>> = segments
+    // Burst sub-clips (not yet folded here, so identified by index — the
+    // "burst:" id only appears once they're folded) and the clip leading
+    // into the burst never ramp.
+    let burst_span = burst_range;
+    let in_burst = move |i: usize| burst_span.is_some_and(|(bs, be, _)| i >= bs && i < be);
+    let mut seg_ramps: Vec<Option<crate::video_renderer::SpeedRamp>> = segments
         .iter()
         .enumerate()
         .map(|(i, s)| {
@@ -1027,10 +1050,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 return None;
             }
             // Burst itself, or segment right before a burst.
-            if s.source_id.starts_with("burst:") {
-                return None;
-            }
-            if segments[i + 1].source_id.starts_with("burst:") {
+            if in_burst(i) || in_burst(i + 1) {
                 return None;
             }
             // Images have no outgoing footage for a speed ramp.
@@ -1067,6 +1087,133 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             ramp_dur_secs * 1000.0,
             ramp_factor,
         );
+    }
+
+    // Beat lock: give every clip the exact length that puts the cut after
+    // it on a beat of the soundtrack as it plays in the output (see
+    // `beat_lock`). Runs after the ramp decisions (a ramped seam collapses to
+    // a near-cut, which moves the cut) and before the per-segment cache keys.
+    // `intro_card_len` is the intro card's beat-locked length, when it moved.
+    let mut intro_card_len: Option<f64> = None;
+    if let (Some(a), Some(snd)) = (audio.as_ref(), cfg.soundtrack.as_ref()) {
+        if snd.beat_align && a.tempo_bpm > 0.0 && !a.beats.is_empty() && !segments.is_empty() {
+            use crate::beat_lock::{lock_cuts, LockClip, LockStart};
+            use crate::project_config::CardMode;
+            let fps = cfg.project.fps;
+            let xfade_path = use_transitions && trans_dur > 0.0;
+            let seam = |w: f32| w.max(crate::video_renderer::MIN_XFADE_SECS) as f64;
+            let default_seam = if xfade_path { seam(trans_dur) } else { 0.0 };
+            let intro_card = cfg
+                .intro
+                .as_ref()
+                .filter(|c| matches!(c.mode, CardMode::Card))
+                .map(|c| c.duration.as_secs_f64());
+            let outro_card = cfg.outro.as_ref().is_some_and(|c| matches!(c.mode, CardMode::Card));
+            // Beats as they play in the output. The loop layout's prefix
+            // doesn't depend on the body length, so any horizon past the end
+            // of the cut gives the same beats.
+            let planned_total: f64 = segments.iter().map(|s| s.duration_secs).sum();
+            let horizon = (intro_card.unwrap_or(0.0) + planned_total * 1.6 + 60.0) as f32;
+            let spans = soundtrack_loop_plan(a).spans(horizon, a.duration_secs);
+            let beats = crate::beat_sync::beats_in_output(&a.beats, &spans);
+            // Cards only join the chain on the crossfade path. The intro
+            // card's length moves by at most half a beat so the footage comes
+            // in on a beat.
+            let start = match intro_card.filter(|_| xfade_path) {
+                Some(d) => {
+                    let len = crate::beat_lock::lock_card_end(
+                        d,
+                        default_seam,
+                        &beats,
+                        a.beat_interval_secs() as f64,
+                        fps,
+                    );
+                    if (len - d).abs() > 1e-6 {
+                        intro_card_len = Some(len);
+                    }
+                    LockStart { output_secs: len - default_seam, seam_in_secs: default_seam }
+                }
+                None => LockStart { output_secs: 0.0, seam_in_secs: 0.0 },
+            };
+            let n = segments.len();
+            let clips: Vec<LockClip> = segments
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let ramped = seg_ramps[i].is_some();
+                    // Must match the concat stage's per-seam widths.
+                    let seam_out = if i + 1 < n {
+                        Some(if !xfade_path || (in_burst(i) && in_burst(i + 1)) {
+                            0.0
+                        } else if ramped {
+                            seam(HARD_CUT_XFADE_SECS)
+                        } else {
+                            default_seam
+                        })
+                    } else if xfade_path && outro_card {
+                        Some(default_seam)
+                    } else {
+                        None
+                    };
+                    let source_end = if crate::media_probe::is_image_path(&s.chapter_path) {
+                        None
+                    } else {
+                        Some(
+                            chapter_dur
+                                .get(s.chapter_path.as_path())
+                                .copied()
+                                .unwrap_or(s.in_chapter_start_secs + s.duration_secs),
+                        )
+                    };
+                    LockClip {
+                        planned_secs: s.duration_secs,
+                        in_start_secs: s.in_chapter_start_secs,
+                        source_end_secs: source_end,
+                        tail_extra_secs: if ramped { ramp_extra_input as f64 } else { 0.0 },
+                        seam_out_secs: seam_out,
+                        seam_out_without_ramp: (ramped && xfade_path).then_some(default_seam),
+                    }
+                })
+                .collect();
+            let locked = lock_cuts(&clips, start, &beats, fps);
+
+            let (mut lockable, mut on_beat, mut slid, mut dropped) = (0usize, 0usize, 0usize, 0usize);
+            let (mut min_delta, mut max_delta) = (f64::INFINITY, f64::NEG_INFINITY);
+            for (i, (s, l)) in segments.iter_mut().zip(&locked).enumerate() {
+                if clips[i].seam_out_secs.is_some() {
+                    lockable += 1;
+                    on_beat += l.on_beat as usize;
+                }
+                let delta = l.duration_secs - s.duration_secs;
+                min_delta = min_delta.min(delta);
+                max_delta = max_delta.max(delta);
+                let shift = l.in_start_secs - s.in_chapter_start_secs;
+                if shift.abs() > 1e-9 {
+                    slid += 1;
+                    s.in_chapter_start_secs = l.in_start_secs;
+                    s.virtual_start_secs += shift;
+                }
+                s.duration_secs = l.duration_secs;
+                if l.drop_ramp {
+                    seg_ramps[i] = None;
+                    dropped += 1;
+                }
+            }
+            if let Some((bs, be, total)) = burst_range.as_mut() {
+                *total = segments[*bs..*be].iter().map(|s| s.duration_secs as f32).sum();
+            }
+            println!(
+                "\nbeat-lock: {on_beat} of {lockable} cut{} placed on the beat (clip lengths {:+.2}…{:+.2}s; {slid} window{} slid earlier, {dropped} speed-ramp{} dropped)",
+                plural(lockable),
+                min_delta,
+                max_delta,
+                plural(slid),
+                plural(dropped),
+            );
+            if let (Some(len), Some(d)) = (intro_card_len, intro_card) {
+                println!("  intro card {d:.2}s → {len:.3}s so the footage comes in on a beat");
+            }
+        }
     }
 
     // Per-segment fingerprint (covers source path + start + duration + render
@@ -1150,7 +1297,14 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     let mut outro_overlays: Vec<TextOverlay> = Vec::new();
     let mut outro_image_overlays: Vec<ImageOverlay> = Vec::new();
     let mut outro_overlay_dur: f32 = 0.0;
-    if let Some(intro) = &cfg.intro {
+    // The intro card at its beat-locked length, if the beat lock moved it.
+    let intro_cfg: Option<crate::project_config::TextCard> = cfg.intro.clone().map(|mut c| {
+        if let Some(len) = intro_card_len {
+            c.duration = std::time::Duration::from_secs_f64(len);
+        }
+        c
+    });
+    if let Some(intro) = &intro_cfg {
         let dur = intro.duration.as_secs_f32();
         let (texts, images) = card_to_layers(intro);
         match intro.mode {
@@ -1346,10 +1500,22 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // main concat-with-xfade pass sees them as a single segment. Internal
     // cuts inside the burst become hard cuts (zero crossfade), while the
     // burst as a whole still xfades into and out of its neighbors.
+    // `burst_sub_durs` keeps (segment index, on-disk sub-clip durations) so
+    // the beat-sync check can place the burst's internal cuts.
+    let mut burst_sub_durs: Option<(usize, Vec<f32>)> = None;
     if let Some((bs, be, total_secs)) = burst_range {
         if be > bs && bs < normalized.len() {
             let burst_intermediate = workspace.join("beat_burst.mp4");
             let burst_inputs: Vec<Utf8PathBuf> = normalized[bs..be].to_vec();
+            let sub_durs: Vec<f32> = burst_inputs
+                .iter()
+                .zip(&segments[bs..be])
+                .map(|(p, s)| {
+                    let d = crate::media_probe::probe_video_duration(p) as f32;
+                    if d > 0.0 { d } else { s.duration_secs as f32 }
+                })
+                .collect();
+            burst_sub_durs = Some((bs, sub_durs));
             println!(
                 "\nfolding {} beat-burst clips → {burst_intermediate}",
                 burst_inputs.len()
@@ -1398,6 +1564,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             };
             normalized.splice(bs..be, std::iter::once(burst_intermediate));
             segments.splice(bs..be, std::iter::once(synth));
+            // Keep the per-seam ramp lookup in step with the folded list
+            // (the concat stage indexes it by post-fold position).
+            seg_ramps.splice(bs..be, std::iter::once(None));
         }
     }
 
@@ -1406,6 +1575,8 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // 7. Concat (with or without xfade transitions). use_transitions and
     // trans_dur were hoisted earlier so the K computation could see them.
     let body = workspace.join("body.mp4");
+    // How the body was assembled, for the beat-sync check after the mux.
+    let concat_layout: ConcatLayout;
 
     if use_transitions && trans_dur > 0.0 {
         // Assemble the input list: [intro], normalized..., [outro].
@@ -1476,6 +1647,16 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             trans_dur,
             hard_cuts,
         );
+        concat_layout = ConcatLayout {
+            input_durs: inputs.iter().map(|(_, d)| *d).collect(),
+            seam_durs: trans_pairs
+                .iter()
+                .map(|(_, d)| d.max(crate::video_renderer::MIN_XFADE_SECS))
+                .collect(),
+            has_intro: intro_path.is_some(),
+            has_outro: outro_path.is_some(),
+            burst: burst_sub_durs.map(|(bs, d)| (intro_count + bs, d)),
+        };
         crate::video_renderer::concat_with_xfade(
             &runner,
             &inputs,
@@ -1494,6 +1675,21 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         println!("\nconcatenating (hard cuts) → {body}");
         crate::video_renderer::concat_segments(&runner, &normalized, &workspace, &body)
             .context("concat stage")?;
+        let input_durs: Vec<f32> = normalized
+            .iter()
+            .zip(&segments)
+            .map(|(p, s)| {
+                let d = crate::media_probe::probe_video_duration(p) as f32;
+                if d > 0.0 { d } else { s.duration_secs as f32 }
+            })
+            .collect();
+        concat_layout = ConcatLayout {
+            seam_durs: vec![0.0; input_durs.len().saturating_sub(1)],
+            input_durs,
+            has_intro: false,
+            has_outro: false,
+            burst: burst_sub_durs,
+        };
     }
 
     // 7. Mux soundtrack into a body+audio file. Per-output transcoding to
@@ -1510,6 +1706,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         workspace.join("body_with_audio.mp4")
     };
     let mut duck_windows: Vec<DuckWindow> = Vec::new();
+    // (loop plan, body duration) the mux used — the beat-sync check maps the
+    // soundtrack's beats into output time through the same layout.
+    let mut soundtrack_layout: Option<(crate::video_renderer::SoundtrackLoopPlan, f32)> = None;
     if let Some(snd) = &cfg.soundtrack {
         let snd_path = soundtrack_resolved
             .as_ref()
@@ -1646,30 +1845,13 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             // Only activated when the loud region differs meaningfully from
             // the full track. For tracks that are already loud throughout,
             // we fall back to a simple full-track loop (loud_start = 0).
-            let (first_play_end_secs, loop_start_secs, loop_secs) = audio
-                .as_ref()
-                .map(|a| {
-                    let (raw_start, raw_end) = a.detect_loud_region(0.80);
-                    let loud_start = a.beat_at_or_after(raw_start);
-                    let loud_end = a.beat_at_or_before(raw_end);
-                    let total = a.duration_secs;
-                    let smart = loud_start > 0.5 || loud_end < total - 0.5;
-                    if smart && loud_end > loud_start {
-                        // First play through the natural intro+body up to loud_end,
-                        // then loop the loud region.
-                        (loud_end, loud_start, loud_end - loud_start)
-                    } else {
-                        // Track is loud throughout — simple loop from t=0.
-                        let bi = a.beat_interval_secs();
-                        let trim = if bi > 0.0 {
-                            (total / bi).floor() * bi
-                        } else {
-                            total
-                        };
-                        (0.0, 0.0, trim)
-                    }
-                })
-                .unwrap_or((0.0, 0.0, 0.0));
+            let loop_plan = audio.as_ref().map(soundtrack_loop_plan).unwrap_or_default();
+            let crate::video_renderer::SoundtrackLoopPlan {
+                first_play_end_secs,
+                loop_start_secs,
+                loop_secs,
+                ..
+            } = loop_plan;
             if loop_secs > 0.0 {
                 tracing::info!(
                     first_play_end = first_play_end_secs,
@@ -1688,14 +1870,11 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 snd.ducking_db,
                 body_total,
                 snd.fade_out.as_secs_f32(),
-                crate::video_renderer::SoundtrackLoopPlan {
-                    first_play_end_secs,
-                    loop_start_secs,
-                    loop_secs,
-                },
+                loop_plan,
                 &muxed_body,
             )
             .context("mux+duck stage")?;
+            soundtrack_layout = Some((loop_plan, body_total));
         }
     } else {
         println!("\nno soundtrack configured; copying body → {muxed_body}");
@@ -1741,6 +1920,25 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     };
     let primary_output = &cfg.outputs[0].path;
 
+    // 7c. Beat-sync check: where did the cuts land against the music?
+    // Informational only — never fails the render.
+    let beat_sync = match (&audio, &cfg.soundtrack, soundtrack_layout, &soundtrack_resolved) {
+        (Some(a), Some(snd), Some((plan, body_secs)), Some(snd_path)) if a.tempo_bpm > 0.0 => {
+            check_beat_sync(BeatSyncInputs {
+                audio: a,
+                concat: &concat_layout,
+                loop_plan: plan,
+                body_secs,
+                fade_out_secs: snd.fade_out.as_secs_f32(),
+                duck_windows: &duck_windows,
+                soundtrack: snd_path,
+                rendered: primary_output,
+                fps: cfg.project.fps,
+            })
+        }
+        _ => None,
+    };
+
     // 8. Manifest.
     let manifest_path = manifest_path_for(primary_output);
     let manifest = Manifest {
@@ -1772,6 +1970,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                     .collect(),
             })
             .collect(),
+        beat_sync,
         generator: format!("vibecut {}", env!("CARGO_PKG_VERSION")),
     };
     manifest
@@ -1811,6 +2010,16 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 w.duration_secs,
                 w.reason
             );
+        }
+        if let Some(r) = &manifest.beat_sync {
+            println!("  beat sync per cut (error = cut − nearest beat; + = late):");
+            for (i, c) in r.cuts.iter().enumerate() {
+                let flag = if c.error_frames.abs() <= r.tolerance_frames { "" } else { "  ← off" };
+                println!(
+                    "    [{:02}] {:>7.3}s  beat {:>7.3}s  {:>+7.1} ms ({:>+5.1} f)  {:?}{flag}",
+                    i + 1, c.output_secs, c.beat_secs, c.error_ms, c.error_frames, c.kind
+                );
+            }
         }
         if !manifest.duck_windows.is_empty() {
             println!("  duck windows:");
@@ -1903,6 +2112,10 @@ fn segment_fingerprint(
     image_effect: Option<crate::project_config::ImageEffect>,
 ) -> String {
     let mut h = blake3::Hasher::new();
+    // Bump when normalize's output changes for the same inputs, so cached
+    // clips from an older renderer aren't reused. v2: frame-exact length
+    // (v1 clips came out one frame short).
+    h.update(b"normalize-v2");
     h.update(s.chapter_path.as_str().as_bytes());
     h.update(&((s.in_chapter_start_secs * 1000.0).round() as i64).to_le_bytes());
     h.update(&((s.duration_secs * 1000.0).round() as i64).to_le_bytes());
@@ -2192,6 +2405,153 @@ fn resolve_font(name: Option<&str>) -> Option<camino::Utf8PathBuf> {
     None
 }
 
+
+/// How the body video was concatenated: what the beat-sync check needs to
+/// place every cut exactly where the concat stage put it.
+struct ConcatLayout {
+    /// On-disk duration of each concat input (intro, clips, outro).
+    input_durs: Vec<f32>,
+    /// Effective crossfade per seam (0 for hard concat).
+    seam_durs: Vec<f32>,
+    has_intro: bool,
+    has_outro: bool,
+    /// (concat input index, sub-clip durations) of a folded beat-burst.
+    burst: Option<(usize, Vec<f32>)>,
+}
+
+struct BeatSyncInputs<'a> {
+    audio: &'a crate::audio_analysis::AnalyzedAudio,
+    concat: &'a ConcatLayout,
+    loop_plan: crate::video_renderer::SoundtrackLoopPlan,
+    body_secs: f32,
+    fade_out_secs: f32,
+    duck_windows: &'a [DuckWindow],
+    soundtrack: &'a Utf8Path,
+    rendered: &'a Utf8Path,
+    fps: u32,
+}
+
+/// How the soundtrack is laid under the body (see `mux_with_ducking`).
+/// Smart loop (default): play the natural intro once up to the end of the
+/// loud region, then loop the loud region only, so no quiet seam appears.
+/// Tracks that are loud throughout loop whole from t = 0, trimmed to a
+/// whole number of beats. Both the mux stage and the beat-lock planner use
+/// this, so they agree on where every beat plays.
+fn soundtrack_loop_plan(a: &crate::audio_analysis::AnalyzedAudio) -> crate::video_renderer::SoundtrackLoopPlan {
+    let (raw_start, raw_end) = a.detect_loud_region(0.80);
+    let loud_start = a.beat_at_or_after(raw_start);
+    let loud_end = a.beat_at_or_before(raw_end);
+    let total = a.duration_secs;
+    let smart = loud_start > 0.5 || loud_end < total - 0.5;
+    let (first_play_end_secs, loop_start_secs, loop_secs) = if smart && loud_end > loud_start {
+        (loud_end, loud_start, loud_end - loud_start)
+    } else {
+        let bi = a.beat_interval_secs();
+        let trim = if bi > 0.0 { (total / bi).floor() * bi } else { total };
+        (0.0, 0.0, trim)
+    };
+    crate::video_renderer::SoundtrackLoopPlan {
+        first_play_end_secs,
+        loop_start_secs,
+        loop_secs,
+        beat_interval_secs: a.beat_interval_secs(),
+    }
+}
+
+/// One-line description of a fitted beat grid for the run log.
+fn describe_beat_grid(g: &crate::audio_analysis::BeatGridFit) -> String {
+    use crate::audio_analysis::GridOctave;
+    let octave = match g.octave {
+        GridOctave::Kept => String::new(),
+        GridOctave::Halved => format!(", halved from {:.1} BPM double-time", g.raw_bpm),
+        GridOctave::Doubled => format!(", doubled from {:.1} BPM half-time", g.raw_bpm),
+    };
+    format!(
+        "{} — {:.0}% of beats matched, residual mean {:.1} ms / max {:.1} ms (raw autocorrelation {:.1} BPM{octave})",
+        if g.is_tight() { "tight" } else { "loose" },
+        g.matched_fraction * 100.0,
+        g.mean_abs_residual_ms,
+        g.max_abs_residual_ms,
+        g.raw_bpm,
+    )
+}
+
+/// Post-render beat-sync check (see `beat_sync`). Prints a summary and
+/// returns the report for the manifest; `None` when there is nothing to
+/// check. Measurement failures are logged, never fatal.
+fn check_beat_sync(i: BeatSyncInputs<'_>) -> Option<crate::beat_sync::BeatSyncReport> {
+    use crate::beat_sync::{
+        beats_in_output, measure_audio_offset, pick_reference_window, planned_cuts, score_cuts,
+        OFFSET_MIN_CONFIDENCE,
+    };
+    let cuts = planned_cuts(
+        &i.concat.input_durs,
+        &i.concat.seam_durs,
+        i.concat.has_intro,
+        i.concat.has_outro,
+        i.concat.burst.as_ref().map(|(idx, d)| (*idx, d.as_slice())),
+    );
+    if cuts.is_empty() {
+        return None;
+    }
+    let spans = i.loop_plan.spans(i.body_secs, i.audio.duration_secs);
+    let beats = beats_in_output(&i.audio.beats, &spans);
+
+    let ducks: Vec<(f32, f32, f32)> =
+        i.duck_windows.iter().map(|w| (w.start_secs, w.end_secs, w.ramp_secs)).collect();
+    let measured = pick_reference_window(&spans, &ducks, i.body_secs - i.fade_out_secs).and_then(
+        |(out_start, src_start, len)| {
+            match measure_audio_offset(i.rendered, i.soundtrack, out_start, src_start, len) {
+                Ok(x) => Some(x),
+                Err(e) => {
+                    tracing::warn!(error = %e, "beat-sync: measuring the audio offset failed");
+                    None
+                }
+            }
+        },
+    );
+    let applied = measured
+        .as_ref()
+        .filter(|x| x.confidence >= OFFSET_MIN_CONFIDENCE)
+        .map(|x| x.offset_secs)
+        .unwrap_or(0.0);
+
+    let mut report = score_cuts(&cuts, &beats, applied, i.audio.beat_interval_secs(), i.fps)?;
+    report.audio_offset_secs = measured.as_ref().map(|x| x.offset_secs);
+    report.audio_offset_confidence = measured.as_ref().map(|x| x.confidence);
+
+    let frame_ms = 1000.0 / i.fps.max(1) as f32;
+    println!(
+        "\nbeat sync: {} cut{} vs the {:.2} BPM grid — {}",
+        report.n_cuts,
+        plural(report.n_cuts as usize),
+        report.tempo_bpm,
+        report.verdict()
+    );
+    println!(
+        "  mean |error| {:.0} ms ({:.1} frames), worst {:.0} ms; {}/{} within ±{:.0} frames (random placement would average {:.0} ms)",
+        report.mean_abs_error_ms,
+        report.mean_abs_error_ms / frame_ms,
+        report.max_abs_error_ms,
+        report.within_tolerance,
+        report.n_cuts,
+        report.tolerance_frames,
+        report.chance_mean_abs_error_ms,
+    );
+    match &measured {
+        Some(x) if x.confidence >= OFFSET_MIN_CONFIDENCE => println!(
+            "  audio offset in the render: {:+.1} ms (correlation {:.2})",
+            x.offset_secs * 1000.0,
+            x.confidence
+        ),
+        Some(x) => println!(
+            "  audio offset: unclear (correlation {:.2}); assumed 0",
+            x.confidence
+        ),
+        None => println!("  audio offset: not measured; assumed 0"),
+    }
+    Some(report)
+}
 
 /// Compute the total output duration after intro/outro and xfade overlaps.
 fn compute_total_output(

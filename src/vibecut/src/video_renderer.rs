@@ -811,12 +811,14 @@ fn normalize_image_segment(
     // Trim the infinite anullsrc to match the exact video duration.
     fc.push_str(&format!(";[1:a]atrim=0:{dur:.4},asetpts=PTS-STARTPTS[a]", dur = dur));
 
+    // Hard cap at an exact frame count (see `output_frame_count`).
+    let frames = output_frame_count(dur, args.fps);
     cmd.extend([
         arg("-filter_complex"), fc,
         arg("-map"), arg("[v]"),
         arg("-map"), arg("[a]"),
-        // Hard cap: ensures the output never exceeds the configured hold duration.
-        arg("-t"), format!("{dur:.3}"),
+        arg("-frames:v"), frames.to_string(),
+        arg("-t"), format!("{:.6}", frames as f64 / args.fps.max(1) as f64),
         arg("-pix_fmt"), arg("yuv420p"),
     ]);
     cmd.extend(hw.encode_args(args.crf));
@@ -879,7 +881,11 @@ pub fn normalize_segment(
             chain.push_str(&dt);
         }
     }
-    chain.push_str(&format!(",setsar=1,fps={fps}", fps = args.fps));
+    // `start_time=0`: after an `-ss` seek the first source frame usually sits
+    // a fraction of a frame in, and plain `fps` rounds it into slot 1 —
+    // every clip started one frame late. Pin the first output frame to 0
+    // (duplicating the first frame into slot 0 when needed).
+    chain.push_str(&format!(",setsar=1,fps=fps={fps}:start_time=0", fps = args.fps));
 
     // Speed-ramp arithmetic. We extend the input window by `extra` seconds so
     // the OUTPUT length stays exactly `duration_secs` even after compressing
@@ -893,8 +899,18 @@ pub fn normalize_segment(
         .max(0.0);
     let input_t_secs = args.duration_secs as f32 + ramp_extra;
 
+    // Frame-exact output: `-ss`/`-t` plus the `fps` filter round the last
+    // frame away (a 4.000 s request used to come out as 119 frames), and the
+    // beat-locked layout places every cut by absolute frame counts. Read two
+    // frames past the window, pad by cloning if the source ends early, then
+    // cap video at exactly `frames` and audio at the same length.
+    let frames = output_frame_count(args.duration_secs, args.fps);
+    let out_t = frames as f64 / args.fps.max(1) as f64;
+    let read_pad = 2.0 / args.fps.max(1) as f32;
+    chain.push_str(",tpad=stop_mode=clone:stop=2");
+
     let ss = format!("{:.3}", args.start_secs);
-    let t = format!("{:.3}", input_t_secs);
+    let t = format!("{:.3}", input_t_secs + read_pad);
 
     let mut cmd: Vec<String> = vec![
         arg("-y"),
@@ -994,7 +1010,7 @@ pub fn normalize_segment(
                 ",split[vf1][vf2];\
                  [vf1]trim=0:{ne:.4},setpts=PTS-STARTPTS,fps={fps}[vn];\
                  [vf2]trim={ne:.4}:{tot:.4},setpts=(PTS-STARTPTS)/{f:.4},fps={fps}{flash}[vfast];\
-                 [vn][vfast]concat=n=2:v=1:a=0[base]",
+                 [vn][vfast]concat=n=2:v=1:a=0,tpad=stop_mode=clone:stop=2[base]",
                 ne = normal_end,
                 tot = input_t_secs,
                 f = ramp.factor,
@@ -1069,7 +1085,11 @@ pub fn normalize_segment(
         cmd.push(arg("-shortest"));
     }
 
-    cmd.extend([arg("-pix_fmt"), arg("yuv420p")]);
+    cmd.extend([
+        arg("-frames:v"), frames.to_string(),
+        arg("-t"), format!("{out_t:.6}"),
+        arg("-pix_fmt"), arg("yuv420p"),
+    ]);
     cmd.extend(hw.encode_args(args.crf));
     cmd.extend([
         arg("-c:a"), arg("aac"),
@@ -1229,6 +1249,108 @@ pub struct SoundtrackLoopPlan {
     pub loop_start_secs: f32,
     /// Length of the repeated section. `0.0` = no looping.
     pub loop_secs: f32,
+    /// The soundtrack's beat interval, `0.0` if unknown. When set, the
+    /// smart-loop crossfade is a whole number of beats, so the two copies'
+    /// beats coincide through every loop seam (no flamming kicks) and the
+    /// beat grid runs on unbroken.
+    pub beat_interval_secs: f32,
+}
+
+/// Frames a normalized clip of `duration_secs` has: the nearest whole
+/// number, at least one. Every normalized clip is exactly this long, so the
+/// beat-locked layout can place cuts by frame arithmetic.
+pub fn output_frame_count(duration_secs: f64, fps: u32) -> u64 {
+    ((duration_secs * fps as f64).round() as u64).max(1)
+}
+
+/// Shortest crossfade [`concat_with_xfade`] will build; shorter requests are
+/// raised to this (one AAC frame is ~21 ms; chained acrossfades below that
+/// silently truncate the audio).
+pub const MIN_XFADE_SECS: f32 = 0.10;
+
+/// Most smart-loop copies `mux_with_ducking` chains (natural intro + loops).
+const MAX_SOUNDTRACK_COPIES: usize = 64;
+
+/// One stretch of the output during which a single copy of the soundtrack
+/// is the one you hear: output time `t` in `[output_start, output_end)`
+/// plays soundtrack time `source_start + (t − output_start)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoundtrackSpan {
+    pub output_start: f32,
+    pub output_end: f32,
+    pub source_start: f32,
+}
+
+impl SoundtrackLoopPlan {
+    fn is_smart(&self) -> bool {
+        self.loop_secs > 0.0 && self.first_play_end_secs > 0.0
+    }
+
+    /// Crossfade between consecutive smart-loop copies: ~2 s (a phrase at
+    /// 120 BPM), at most 20 % of the loop so short loops keep real content
+    /// between seams. With a known beat interval it is rounded to whole
+    /// beats: the loop's start and end sit on beats, so a whole-beat
+    /// crossfade overlays beat on beat.
+    pub fn crossfade_secs(&self) -> f32 {
+        let raw = 2.0_f32.min(self.loop_secs * 0.2).max(0.25);
+        let beat = self.beat_interval_secs;
+        if beat <= 0.0 {
+            return raw;
+        }
+        let max_beats = ((self.loop_secs * 0.2) / beat).floor().max(1.0);
+        (raw / beat).round().clamp(1.0, max_beats) * beat
+    }
+
+    /// Soundtrack copies the smart loop chains to cover `body_secs`:
+    /// the natural intro plus enough loop cycles, capped.
+    fn smart_copies(&self, body_secs: f32) -> usize {
+        let needed_after_intro = (body_secs - self.first_play_end_secs).max(0.0);
+        let cycle_advance = (self.loop_secs - self.crossfade_secs()).max(0.1);
+        let n_cycles = ((needed_after_intro / cycle_advance).ceil() as usize).max(1);
+        (1 + n_cycles).min(MAX_SOUNDTRACK_COPIES)
+    }
+
+    /// Where each soundtrack copy plays in the output, exactly as
+    /// [`mux_with_ducking`] lays them out. Inside a smart-loop crossfade the
+    /// span boundary is the crossfade's midpoint, where the incoming copy
+    /// takes over. `track_secs` is the soundtrack's own length; spans stop at
+    /// `body_secs`.
+    pub fn spans(&self, body_secs: f32, track_secs: f32) -> Vec<SoundtrackSpan> {
+        let mut spans = Vec::new();
+        let mut push = |output_start: f32, output_end: f32, source_start: f32| {
+            let output_end = output_end.min(body_secs);
+            if output_end > output_start {
+                spans.push(SoundtrackSpan { output_start, output_end, source_start });
+            }
+        };
+        if self.is_smart() {
+            let x = self.crossfade_secs();
+            let copies = self.smart_copies(body_secs);
+            // Copy i ≥ 1 starts at fpe + (i − 1)·L − i·X: each acrossfade
+            // overlaps the incoming copy with the last X seconds of the chain.
+            let start_of = |i: usize| {
+                self.first_play_end_secs + (i as f32 - 1.0) * self.loop_secs - i as f32 * x
+            };
+            let first_end = if copies > 1 { start_of(1) + x * 0.5 } else { self.first_play_end_secs };
+            push(0.0, first_end, 0.0);
+            for i in 1..copies {
+                let s = start_of(i);
+                let begin = s + x * 0.5;
+                let end = if i + 1 < copies { start_of(i + 1) + x * 0.5 } else { s + self.loop_secs };
+                push(begin, end, self.loop_start_secs + (begin - s));
+            }
+        } else if self.loop_secs > 0.0 {
+            let mut i = 0usize;
+            while (i as f32) * self.loop_secs < body_secs {
+                let s = i as f32 * self.loop_secs;
+                push(s, s + self.loop_secs, self.loop_start_secs);
+                i += 1;
+            }
+        } else {
+            push(0.0, track_secs, 0.0);
+        }
+        spans
+    }
 }
 
 /// Mux the soundtrack with a list of "duck windows" where the soundtrack
@@ -1322,6 +1444,8 @@ pub fn mux_with_ducking(
     // body audio is continuous regardless of body length. The loop seam is
     // musical because the trim ends on a beat.
     let mut filtergraph = String::new();
+    // How many times the soundtrack file is opened as an input (inputs 1..).
+    let mut soundtrack_inputs = 1usize;
     let bg_label = if soundtrack_loop_secs > 0.0 && soundtrack_first_play_end_secs > 0.0 {
         // Smart loop: natural intro + N crossfaded loop cycles.
         //
@@ -1339,24 +1463,19 @@ pub fn mux_with_ducking(
         // fade. Tri (linear) curves dip ~3 dB in the middle, which is
         // audible and is the "I can still hear the loop point" complaint.
         let loop_end = soundtrack_loop_start_secs + soundtrack_loop_secs;
-        let xfade_secs: f32 = 2.0_f32.min(soundtrack_loop_secs * 0.2).max(0.25);
-        // How many full loop cycles do we need beyond the natural intro to
-        // cover body_duration_secs (with crossfade overlaps)?
-        let needed_after_intro = (body_duration_secs - soundtrack_first_play_end_secs).max(0.0);
-        // Each loop cycle adds (loop_secs - xfade_secs) to the running total.
-        let cycle_advance = (soundtrack_loop_secs - xfade_secs).max(0.1);
-        let n_cycles = ((needed_after_intro / cycle_advance).ceil() as usize).max(1);
-        // Total stream copies = 1 (intro) + n_cycles (loops). Cap at a safety
-        // limit so we don't build an unbounded filter graph for crazy targets.
-        let total_copies = (1 + n_cycles).min(64);
-        let split_targets: Vec<String> = (0..total_copies)
-            .map(|i| format!("[stcp{}]", i))
-            .collect();
-        filtergraph.push_str(&format!(
-            "[1:a]asplit={n}{labels};",
-            n = total_copies,
-            labels = split_targets.join(""),
-        ));
+        let xfade_secs: f32 = loop_plan.crossfade_secs();
+        // Copies = 1 (natural intro) + enough loop cycles to cover the body,
+        // each cycle adding (loop_secs − xfade_secs); capped so we don't
+        // build an unbounded filter graph for crazy targets. Shared with
+        // `SoundtrackLoopPlan::spans`, which the beat-sync check relies on.
+        let total_copies = loop_plan.smart_copies(body_duration_secs);
+        let n_cycles = total_copies - 1;
+        // Each copy reads its own input of the soundtrack file. Splitting
+        // one input with `asplit` does NOT work here: `acrossfade` reads its
+        // first input to the end before touching the second, and the later
+        // `asplit` branches come out empty — the soundtrack stopped after
+        // the first play-through (ffmpeg 7.1; see `SoundtrackLoopPlan`).
+        soundtrack_inputs = total_copies;
         // Trim each copy: copy 0 = intro, the rest = loud region.
         for i in 0..total_copies {
             let (start, end) = if i == 0 {
@@ -1365,7 +1484,8 @@ pub fn mux_with_ducking(
                 (soundtrack_loop_start_secs, loop_end)
             };
             filtergraph.push_str(&format!(
-                "[stcp{i}]atrim={start:.4}:{end:.4},aresample={sr},asetpts=N/SR/TB[sttr{i}];",
+                "[{input}:a]atrim={start:.4}:{end:.4},aresample={sr},asetpts=N/SR/TB[sttr{i}];",
+                input = 1 + i,
                 sr = AUDIO_SAMPLE_RATE,
             ));
         }
@@ -1451,7 +1571,11 @@ pub fn mux_with_ducking(
         "-hide_banner",
         "-loglevel", "error",
         "-i", body.as_str(),
-        "-i", soundtrack.as_str(),
+    ];
+    for _ in 0..soundtrack_inputs {
+        args.extend(["-i", soundtrack.as_str()]);
+    }
+    args.extend([
         "-filter_complex", &filtergraph,
         "-map", "0:v:0",
         "-map", "[a]",
@@ -1459,7 +1583,7 @@ pub fn mux_with_ducking(
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",
-    ];
+    ]);
     if !body_dur.is_empty() {
         args.push("-t");
         args.push(&body_dur);
@@ -1884,7 +2008,7 @@ pub fn concat_with_xfade(
     // truncates the audio chain when many pairs use a sub-AAC-frame
     // duration (1024 samples / 48 000 Hz ≈ 21.3 ms). 0.10 s is well
     // above one AAC frame and still visually a hard cut.
-    let durs: Vec<f32> = transitions.iter().map(|(_, d)| d.max(0.10)).collect();
+    let durs: Vec<f32> = transitions.iter().map(|(_, d)| d.max(MIN_XFADE_SECS)).collect();
 
     // Build the xfade chain. Cumulative output length grows by (D_k - dur_t)
     // for each new input after the first, using THIS pair's transition
@@ -2396,8 +2520,13 @@ mod tests {
         )
         .unwrap();
         let args = &runner.calls.borrow()[0];
-        // Input duration extended to 3.210 s.
-        assert!(args.iter().any(|a| a == "3.210"), "args = {args:?}");
+        // Input window extended to 3.210 s for the ramp, plus a two-frame
+        // read pad (3.210 + 2/30 = 3.277).
+        assert!(args.iter().any(|a| a == "3.277"), "args = {args:?}");
+        // Output is frame-exact: 3.000 s = 90 frames, audio capped to match.
+        let after = |flag: &str| args.iter().skip_while(|a| *a != flag).nth(1).cloned();
+        assert_eq!(after("-frames:v").as_deref(), Some("90"), "args = {args:?}");
+        assert!(args.iter().any(|a| a == "3.000000"), "args = {args:?}");
         // Filter graph went through filter_complex (not -vf).
         assert!(args.iter().any(|a| a == "-filter_complex"));
         // The split + setpts + concat appears in the filter graph.
@@ -2406,10 +2535,15 @@ mod tests {
             .skip_while(|a| *a != "-filter_complex")
             .nth(1)
             .expect("filter_complex value");
+        assert!(fc.contains("trim=2.8600:3.2100"), "ramp reads to 3.210 s: {fc}");
+        assert!(fc.contains("fps=fps=30:start_time=0"), "first frame pinned to 0: {fc}");
         assert!(fc.contains("split[vf1][vf2]"), "expected video split: {fc}");
         assert!(fc.contains("setpts=(PTS-STARTPTS)/2.5000"), "expected speed-up factor: {fc}");
         assert!(fc.contains("atempo=2.5000"), "expected audio atempo: {fc}");
-        assert!(fc.contains("concat=n=2:v=1:a=0[base]"), "expected video concat: {fc}");
+        assert!(
+            fc.contains("concat=n=2:v=1:a=0,tpad=stop_mode=clone:stop=2[base]"),
+            "expected video concat (with end pad): {fc}"
+        );
         // Both halves of the ramp split are resampled to the project fps so
         // the concat seam doesn't stutter.
         assert!(fc.contains(",fps=30[vn]"), "expected fps lock on normal half: {fc}");

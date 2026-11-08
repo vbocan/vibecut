@@ -33,7 +33,20 @@
 //! 3. Tempo: pick the SMALLEST local maximum within 75 % of the global max —
 //!    avoids the classic 1/2-tempo trap when the true period is not an integer
 //!    number of onset frames.
-//! 4. Beats placed at the fixed inferred period from the first strong onset.
+//! 4. Beat grid ([`fit_beat_grid`]). The autocorrelation lag is an integer
+//!    number of onset frames (~23 ms each), so its tempo can be off by up to
+//!    ~4 % — enough for an evenly-spaced grid to drift a whole beat within a
+//!    minute. The grid is refined in three passes:
+//!    - **fold search**: fold the onset envelope modulo candidate periods
+//!      within ±4.5 % of the raw lag (coarse, then fine); the sharpest
+//!      folded peak gives the exact period and phase;
+//!    - **octave check**: when the in-between beats carry almost no onset
+//!      energy the grid is double-time and gets halved; when the half-beat
+//!      positions are as strong as the beats it gets doubled;
+//!    - **least squares**: snap each grid beat to its nearest real onset
+//!      peak (sub-frame, parabolic), drop outliers, and fit `t = t0 + k·T`.
+//!    Residual statistics land in [`BeatGridFit`]. Falls back to the plain
+//!    fixed-period placement when too few onsets match.
 //! 5. A coarse (4 Hz) energy envelope is also produced; consumed by
 //!    [`AnalyzedAudio::detect_loud_region`] for smart-loop seam selection.
 
@@ -114,6 +127,50 @@ pub struct AnalyzedAudio {
     /// Coarse energy envelope, sampled at `energy_rate` Hz.
     pub energy_curve: Vec<f32>,
     pub energy_rate: f32,
+    /// How the beat grid was fitted and how well it matches the music.
+    /// `None` when no tempo was found or the grid fit fell back to plain
+    /// fixed-period placement.
+    pub beat_grid: Option<BeatGridFit>,
+}
+
+/// Diagnostics for the fitted beat grid (see the module docs, step 4).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct BeatGridFit {
+    /// Tempo the autocorrelation picked, before refinement.
+    pub raw_bpm: f32,
+    /// Whether the octave check changed the autocorrelation's tempo.
+    pub octave: GridOctave,
+    /// Exact beat interval of the fitted grid, in seconds.
+    pub interval_secs: f64,
+    /// Fraction of grid beats (between the first and last matched one) that
+    /// have a real onset peak within ±20 % of a beat.
+    pub matched_fraction: f32,
+    /// Mean |onset − grid| over the matched beats, in milliseconds.
+    pub mean_abs_residual_ms: f32,
+    /// Worst |onset − grid| over the matched beats, in milliseconds.
+    pub max_abs_residual_ms: f32,
+}
+
+impl BeatGridFit {
+    /// A grid is "tight" when most beats have a real onset and those onsets
+    /// sit within half a frame at 30 fps of the grid (machine-timed music).
+    /// Loose grids (live drummers, tempo changes) still drive cuts, but the
+    /// numbers say how much to trust them.
+    pub fn is_tight(&self) -> bool {
+        self.matched_fraction >= 0.8 && self.mean_abs_residual_ms <= 15.0
+    }
+}
+
+/// What the octave check did to the autocorrelation tempo.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GridOctave {
+    /// The autocorrelation tempo was kept.
+    Kept,
+    /// Every other beat had almost no onset energy: the grid was double-time.
+    Halved,
+    /// The half-beat positions were as strong as the beats: the grid was half-time.
+    Doubled,
 }
 
 impl AnalyzedAudio {
@@ -318,6 +375,7 @@ pub fn analyze_pcm(pcm: &[f32], sample_rate: u32) -> AnalyzedAudio {
             beats: Vec::new(),
             energy_curve: Vec::new(),
             energy_rate: ENERGY_TARGET_RATE_HZ,
+            beat_grid: None,
         };
     }
 
@@ -358,10 +416,22 @@ pub fn analyze_pcm(pcm: &[f32], sample_rate: u32) -> AnalyzedAudio {
     }
 
     // (3) Tempo via autocorrelation in a musically plausible range.
-    let (bpm, pulse_strength) = estimate_tempo_with_strength(&onset, onset_rate);
+    let (raw_bpm, pulse_strength) = estimate_tempo_with_strength(&onset, onset_rate);
 
-    // (4) Beats: anchor at first strong onset, then place at fixed period.
-    let beats = track_beats(&onset, onset_rate, bpm);
+    // (4) Beats: fit an exact grid to the onsets; fall back to the raw
+    //     fixed-period placement when too few onsets match.
+    let energy_prefix = energy_prefix_sums(pcm);
+    let (bpm, beats, beat_grid) = match fit_beat_grid(
+        &onset,
+        onset_rate,
+        &energy_prefix,
+        sample_rate,
+        raw_bpm,
+        duration_secs,
+    ) {
+        Some((grid_beats, fit)) => ((60.0 / fit.interval_secs) as f32, grid_beats, Some(fit)),
+        None => (raw_bpm, track_beats(&onset, onset_rate, raw_bpm), None),
+    };
 
     // (5) Coarse energy envelope at ENERGY_TARGET_RATE_HZ.
     let bin = ((onset_rate / ENERGY_TARGET_RATE_HZ).round() as usize).max(1);
@@ -384,6 +454,7 @@ pub fn analyze_pcm(pcm: &[f32], sample_rate: u32) -> AnalyzedAudio {
         beats,
         energy_curve,
         energy_rate: ENERGY_TARGET_RATE_HZ,
+        beat_grid,
     }
 }
 
@@ -476,6 +547,446 @@ fn track_beats(onset: &[f32], onset_rate: f32, bpm: f32) -> Vec<f32> {
         t += period_frames;
     }
     beats
+}
+
+// ---------- Beat-grid fit ----------
+
+/// Fold-search span around the raw autocorrelation period. Integer lags in
+/// the 60–200 BPM range quantize the period by at most 0.5 / 12.9 ≈ 3.9 %.
+const GRID_SEARCH_SPAN: f64 = 0.045;
+const GRID_COARSE_STEP: f64 = 0.001;
+const GRID_FINE_SPAN: f64 = 0.002;
+const GRID_FINE_STEP: f64 = 0.000_1;
+/// Snap window around each grid beat, as a fraction of the beat interval.
+const GRID_SNAP_WINDOW: f64 = 0.2;
+/// Weakest onset peak (envelope is normalized to the track's loudest onset)
+/// that counts as a real hit when snapping grid beats.
+const GRID_MIN_PEAK: f32 = 0.05;
+/// Fewest matched onsets for the least-squares fit to be trusted.
+const GRID_MIN_MATCHES: usize = 4;
+/// Attack refinement: sliding energy window (samples) and its step. A
+/// 256-sample window (~12 ms at 22 kHz) is long enough to smooth over a
+/// 70 Hz kick's waveform, short enough to locate the attack to ~1 ms.
+const ATTACK_WINDOW: usize = 256;
+const ATTACK_STEP: usize = 16;
+/// Fewest grid beats the octave check needs before it will judge.
+const OCTAVE_MIN_BEATS: usize = 8;
+/// Halve when the weaker half of the beats (odd or even) carries less than
+/// this fraction of the stronger half's onset energy. Kept low on purpose:
+/// with an energy envelope a snare on 2 and 4 is often only 30–60 % of the
+/// kick on 1 and 3, and that must NOT read as double-time.
+const OCTAVE_HALVE_RATIO: f32 = 0.25;
+/// Double when the half-beat positions carry at least this fraction of the
+/// beats' onset energy.
+const OCTAVE_DOUBLE_RATIO: f32 = 0.85;
+const GRID_BPM_MIN: f64 = 60.0;
+const GRID_BPM_MAX: f64 = 200.0;
+/// Outlier floor for the least-squares fit: residuals under this always
+/// count as on-grid.
+const GRID_OUTLIER_FLOOR_SECS: f64 = 0.005;
+
+/// Beat grid in onset-frame units: beat `k` sits at `phase + k * period`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Grid {
+    period: f64,
+    phase: f64,
+}
+
+impl Grid {
+    fn at(&self, k: i64) -> f64 {
+        self.phase + k as f64 * self.period
+    }
+
+    /// Inclusive range of beat indices that fall inside `[0, n_frames - 1]`.
+    fn index_range(&self, n_frames: usize) -> Option<(i64, i64)> {
+        if n_frames == 0 || self.period <= 0.0 {
+            return None;
+        }
+        let k_min = (-self.phase / self.period).ceil() as i64;
+        let k_max = (((n_frames - 1) as f64 - self.phase) / self.period).floor() as i64;
+        (k_max >= k_min).then_some((k_min, k_max))
+    }
+}
+
+/// A grid beat matched to a real hit: `(beat index k, attack time in
+/// seconds, fit weight)`.
+type BeatPoint = (i64, f64, f64);
+
+/// Fit an exact beat grid to the music, starting from the raw
+/// autocorrelation tempo. `onset` is the analysis-rate onset envelope;
+/// `energy_prefix` is the running sum of squared samples of the PCM at
+/// `sample_rate` (see [`energy_prefix_sums`]) used to time each attack.
+/// Returns beat times (seconds, spanning the whole track) plus fit
+/// diagnostics, or `None` to fall back to [`track_beats`].
+fn fit_beat_grid(
+    onset: &[f32],
+    onset_rate: f32,
+    energy_prefix: &[f64],
+    sample_rate: u32,
+    raw_bpm: f32,
+    duration_secs: f32,
+) -> Option<(Vec<f32>, BeatGridFit)> {
+    if raw_bpm <= 0.0 || onset.len() < 16 {
+        return None;
+    }
+    let rate = onset_rate as f64;
+    let env = smooth_binomial5(onset);
+
+    let p0 = 60.0 * rate / raw_bpm as f64;
+    let coarse = search_period(&env, p0, GRID_SEARCH_SPAN, GRID_COARSE_STEP)?;
+    let folded = search_period(&env, coarse.period, GRID_FINE_SPAN, GRID_FINE_STEP)?;
+    let (grid, octave) = octave_check(onset, folded, rate);
+
+    // From here on, everything is in seconds.
+    let points = snap_to_attacks(onset, grid, energy_prefix, sample_rate);
+    if points.len() < GRID_MIN_MATCHES {
+        return None;
+    }
+    let fold_secs = Grid { period: grid.period / rate, phase: grid.phase / rate };
+    let (fitted, kept) = robust_line_fit(&points, fold_secs)?;
+
+    let first_k = kept.iter().map(|p| p.0).min()?;
+    let last_k = kept.iter().map(|p| p.0).max()?;
+    let span = (last_k - first_k + 1).max(1) as f32;
+    let residuals_ms: Vec<f64> = kept
+        .iter()
+        .map(|&(k, t, _)| (t - fitted.at(k)).abs() * 1000.0)
+        .collect();
+    let mean_abs = residuals_ms.iter().sum::<f64>() / residuals_ms.len() as f64;
+    let max_abs = residuals_ms.iter().cloned().fold(0.0_f64, f64::max);
+
+    // The grid spans the whole track — music keeps its tempo through a soft
+    // intro or outro even where no onset is strong enough to match.
+    let mut beats = Vec::new();
+    let mut k = (-fitted.phase / fitted.period).floor() as i64;
+    loop {
+        let t = fitted.at(k);
+        if t >= duration_secs as f64 {
+            break;
+        }
+        if t >= 0.0 {
+            beats.push(t as f32);
+        }
+        k += 1;
+    }
+    if beats.is_empty() {
+        return None;
+    }
+
+    Some((
+        beats,
+        BeatGridFit {
+            raw_bpm,
+            octave,
+            interval_secs: fitted.period,
+            matched_fraction: (kept.len() as f32 / span).min(1.0),
+            mean_abs_residual_ms: mean_abs as f32,
+            max_abs_residual_ms: max_abs as f32,
+        },
+    ))
+}
+
+/// Running sum of squared samples: `out[i] = Σ pcm[..i]²`, so the energy of
+/// `pcm[a..b]` is `out[b] − out[a]`.
+fn energy_prefix_sums(pcm: &[f32]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(pcm.len() + 1);
+    let mut acc = 0.0_f64;
+    out.push(0.0);
+    for &x in pcm {
+        acc += x as f64 * x as f64;
+        out.push(acc);
+    }
+    out
+}
+
+/// Time (seconds) of the attack near an onset-envelope peak at analysis
+/// frame `frame`. Slides an `ATTACK_WINDOW`-sample energy window from one
+/// hop before the frame to the frame's end, finds the energy peak, and
+/// returns where the window's centre first crosses halfway between the
+/// floor before the peak and the peak itself. For a step attack that is
+/// the attack sample, whatever the hit's decay — unlike the onset frame,
+/// which reads 0–17 ms early depending on how long the hit rings.
+fn refine_attack(energy_prefix: &[f64], sample_rate: u32, frame: usize) -> Option<f64> {
+    let n_samples = energy_prefix.len().saturating_sub(1);
+    if n_samples < ATTACK_WINDOW {
+        return None;
+    }
+    let first_centre = (frame * HOP_SIZE).saturating_sub(HOP_SIZE).max(ATTACK_WINDOW / 2);
+    let last_centre = (frame * HOP_SIZE + FRAME_SIZE).min(n_samples - ATTACK_WINDOW / 2);
+    if last_centre <= first_centre {
+        return None;
+    }
+    let energy_at = |centre: usize| {
+        let a = centre - ATTACK_WINDOW / 2;
+        energy_prefix[a + ATTACK_WINDOW] - energy_prefix[a]
+    };
+    let centres: Vec<usize> = (first_centre..=last_centre).step_by(ATTACK_STEP).collect();
+    let energies: Vec<f64> = centres.iter().map(|&c| energy_at(c)).collect();
+    let mut peak = 0usize;
+    for (j, &e) in energies.iter().enumerate() {
+        if e > energies[peak] {
+            peak = j;
+        }
+    }
+    let floor = energies[..=peak].iter().cloned().fold(f64::INFINITY, f64::min);
+    if energies[peak] <= floor {
+        return None;
+    }
+    let half = floor + 0.5 * (energies[peak] - floor);
+    let j = energies[..=peak].iter().position(|&e| e >= half)?;
+    let centre = if j == 0 {
+        centres[0] as f64
+    } else {
+        let (e0, e1) = (energies[j - 1], energies[j]);
+        let frac = if e1 > e0 { (half - e0) / (e1 - e0) } else { 0.0 };
+        centres[j - 1] as f64 + frac * ATTACK_STEP as f64
+    };
+    Some(centre / sample_rate as f64)
+}
+
+/// 5-tap binomial smoothing ([1 4 6 4 1] / 16, σ ≈ 1 frame). Makes the fold
+/// search tolerant of the ±1-frame jitter every real onset has.
+fn smooth_binomial5(x: &[f32]) -> Vec<f32> {
+    const K: [f32; 5] = [1.0, 4.0, 6.0, 4.0, 1.0];
+    let n = x.len() as i64;
+    (0..n)
+        .map(|i| {
+            let mut acc = 0.0_f32;
+            let mut wsum = 0.0_f32;
+            for (j, w) in K.iter().enumerate() {
+                let idx = i + j as i64 - 2;
+                if (0..n).contains(&idx) {
+                    acc += w * x[idx as usize];
+                    wsum += w;
+                }
+            }
+            acc / wsum
+        })
+        .collect()
+}
+
+/// Sweep periods `center × (1 ± span)` in relative `step`s; return the grid
+/// whose folded onset peak is highest. Ties keep the shorter period, so the
+/// result is deterministic.
+fn search_period(env: &[f32], center: f64, span: f64, step: f64) -> Option<Grid> {
+    let n_steps = (span / step).round() as i64;
+    let mut best: Option<(f64, Grid)> = None;
+    for s in -n_steps..=n_steps {
+        let period = center * (1.0 + s as f64 * step);
+        if period < 2.0 {
+            continue;
+        }
+        let (phase, score) = fold_peak(env, period);
+        if best.map_or(true, |(b, _)| score > b) {
+            best = Some((score, Grid { period, phase }));
+        }
+    }
+    best.map(|(_, g)| g)
+}
+
+/// Fold the envelope modulo `period` into quarter-frame bins and return the
+/// phase (frames, in `[0, period)`) and height of the tallest folded peak.
+/// At the true period every beat's onset lands in the same bin; a slightly
+/// wrong period smears them across the circle and the peak drops.
+fn fold_peak(env: &[f32], period: f64) -> (f64, f64) {
+    let bins = ((period * 4.0).round() as usize).max(8);
+    let scale = bins as f64 / period;
+    let mut hist = vec![0.0_f64; bins];
+    for (i, &v) in env.iter().enumerate() {
+        if v <= 0.0 {
+            continue;
+        }
+        let pos = (i as f64 % period) * scale;
+        let lo = pos.floor();
+        let frac = pos - lo;
+        let lo = lo as usize % bins;
+        hist[lo] += v as f64 * (1.0 - frac);
+        hist[(lo + 1) % bins] += v as f64 * frac;
+    }
+    let smoothed: Vec<f64> = (0..bins)
+        .map(|j| {
+            0.25 * hist[(j + bins - 1) % bins] + 0.5 * hist[j] + 0.25 * hist[(j + 1) % bins]
+        })
+        .collect();
+    let mut j = 0usize;
+    for (idx, &v) in smoothed.iter().enumerate() {
+        if v > smoothed[j] {
+            j = idx;
+        }
+    }
+    let delta = parabolic_vertex(
+        smoothed[(j + bins - 1) % bins],
+        smoothed[j],
+        smoothed[(j + 1) % bins],
+    );
+    let phase = ((j as f64 + delta) / scale).rem_euclid(period);
+    (phase, smoothed[j])
+}
+
+/// Sub-sample offset (in `[-0.5, 0.5]`) of the vertex of the parabola
+/// through three equally spaced samples centred on a local maximum.
+fn parabolic_vertex(y0: f64, y1: f64, y2: f64) -> f64 {
+    let denom = y0 - 2.0 * y1 + y2;
+    if denom.abs() < 1e-12 {
+        0.0
+    } else {
+        (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5)
+    }
+}
+
+/// Strongest raw onset within ±1.5 frames of `center`.
+fn onset_strength_near(onset: &[f32], center: f64) -> f32 {
+    let n = onset.len();
+    if n == 0 || center < -1.5 || center > n as f64 + 0.5 {
+        return 0.0;
+    }
+    let lo = (center - 1.5).ceil().max(0.0) as usize;
+    let hi = ((center + 1.5).floor().max(0.0) as usize).min(n - 1);
+    onset[lo.min(hi)..=hi].iter().cloned().fold(0.0_f32, f32::max)
+}
+
+/// Resolve double-time / half-time grids (see `OCTAVE_*` constants).
+fn octave_check(onset: &[f32], grid: Grid, rate: f64) -> (Grid, GridOctave) {
+    let Some((k_min, k_max)) = grid.index_range(onset.len()) else {
+        return (grid, GridOctave::Kept);
+    };
+    if ((k_max - k_min + 1) as usize) < OCTAVE_MIN_BEATS {
+        return (grid, GridOctave::Kept);
+    }
+    let last = (onset.len() - 1) as f64;
+    let mut on_sum = [0.0_f64; 2];
+    let mut on_n = [0usize; 2];
+    let mut mid_sum = 0.0_f64;
+    let mut mid_n = 0usize;
+    for k in k_min..=k_max {
+        let c = grid.at(k);
+        let parity = k.rem_euclid(2) as usize;
+        on_sum[parity] += onset_strength_near(onset, c) as f64;
+        on_n[parity] += 1;
+        let m = c + 0.5 * grid.period;
+        if m <= last {
+            mid_sum += onset_strength_near(onset, m) as f64;
+            mid_n += 1;
+        }
+    }
+    let mean = |s: f64, n: usize| if n > 0 { s / n as f64 } else { 0.0 };
+    let even = mean(on_sum[0], on_n[0]);
+    let odd = mean(on_sum[1], on_n[1]);
+    let all = mean(on_sum[0] + on_sum[1], on_n[0] + on_n[1]);
+    let mid = mean(mid_sum, mid_n);
+    let bpm = 60.0 * rate / grid.period;
+
+    let (strong, weak, strong_parity) = if even >= odd { (even, odd, 0) } else { (odd, even, 1) };
+    if strong > 0.0 && weak < OCTAVE_HALVE_RATIO as f64 * strong && bpm / 2.0 >= GRID_BPM_MIN {
+        let period = grid.period * 2.0;
+        let phase = (grid.phase + strong_parity as f64 * grid.period).rem_euclid(period);
+        return (Grid { period, phase }, GridOctave::Halved);
+    }
+    if all > 0.0 && mid >= OCTAVE_DOUBLE_RATIO as f64 * all && bpm * 2.0 <= GRID_BPM_MAX {
+        let period = grid.period / 2.0;
+        return (
+            Grid { period, phase: grid.phase.rem_euclid(period) },
+            GridOctave::Doubled,
+        );
+    }
+    (grid, GridOctave::Kept)
+}
+
+/// Snap every grid beat (onset-frame units) to the strongest onset peak
+/// within ±`GRID_SNAP_WINDOW` beats, then time that hit's attack in the
+/// raw audio. Returns `(k, attack_secs, weight)`.
+fn snap_to_attacks(
+    onset: &[f32],
+    grid: Grid,
+    energy_prefix: &[f64],
+    sample_rate: u32,
+) -> Vec<BeatPoint> {
+    let Some((k_min, k_max)) = grid.index_range(onset.len()) else {
+        return Vec::new();
+    };
+    let n = onset.len();
+    let half = GRID_SNAP_WINDOW * grid.period;
+    let mut points = Vec::new();
+    for k in k_min..=k_max {
+        let c = grid.at(k);
+        let lo = (c - half).ceil().max(0.0) as usize;
+        let hi = ((c + half).floor().max(0.0) as usize).min(n - 1);
+        if hi < lo {
+            continue;
+        }
+        let mut best_i = lo;
+        for i in lo..=hi {
+            if onset[i] > onset[best_i] {
+                best_i = i;
+            }
+        }
+        let v = onset[best_i];
+        if v < GRID_MIN_PEAK {
+            continue;
+        }
+        // A maximum on the window edge that keeps rising outside it is the
+        // flank of a neighbouring onset, not a hit on this beat.
+        let rising_left = best_i == lo && lo > 0 && onset[lo - 1] > v;
+        let rising_right = best_i == hi && hi + 1 < n && onset[hi + 1] > v;
+        if rising_left || rising_right {
+            continue;
+        }
+        if let Some(t) = refine_attack(energy_prefix, sample_rate, best_i) {
+            points.push((k, t, (v as f64).sqrt()));
+        }
+    }
+    points
+}
+
+/// Weighted least-squares line `tau = a + b·k`. Returns `(a, b)`.
+fn weighted_line_fit(points: &[BeatPoint]) -> Option<(f64, f64)> {
+    let (mut s, mut sk, mut skk, mut st, mut skt) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(k, tau, w) in points {
+        let k = k as f64;
+        s += w;
+        sk += w * k;
+        skk += w * k * k;
+        st += w * tau;
+        skt += w * k * tau;
+    }
+    let den = s * skk - sk * sk;
+    if s <= 0.0 || den.abs() < 1e-9 {
+        return None;
+    }
+    let b = (s * skt - sk * st) / den;
+    let a = (st - b * sk) / s;
+    Some((a, b))
+}
+
+/// Fit, drop outliers (> 3 robust σ, never under
+/// `GRID_OUTLIER_FLOOR_SECS`), refit. Points and `grid` are in seconds.
+/// Returns the fitted grid and the points it kept. If the refit period
+/// strays more than 5 % from the fold-search period something is badly off
+/// (sparse, syncopated hits); keep the fold grid in that case.
+fn robust_line_fit(
+    points: &[BeatPoint],
+    grid: Grid,
+) -> Option<(Grid, Vec<BeatPoint>)> {
+    let (a, b) = weighted_line_fit(points)?;
+    let mut abs_res: Vec<f64> = points.iter().map(|&(k, t, _)| (t - (a + b * k as f64)).abs()).collect();
+    let mut sorted = abs_res.clone();
+    sorted.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let threshold = (3.0 * 1.4826 * median).max(GRID_OUTLIER_FLOOR_SECS);
+    let kept: Vec<BeatPoint> = points
+        .iter()
+        .zip(abs_res.drain(..))
+        .filter(|(_, r)| *r <= threshold)
+        .map(|(p, _)| *p)
+        .collect();
+    if kept.len() < GRID_MIN_MATCHES {
+        return None;
+    }
+    let (a, b) = weighted_line_fit(&kept)?;
+    if (b / grid.period - 1.0).abs() > 0.05 {
+        return Some((grid, kept));
+    }
+    Some((Grid { period: b, phase: a }, kept))
 }
 
 // ---------- Snap helpers (used by the planner) ----------
@@ -750,6 +1261,219 @@ mod tests {
         let a = analyze_pcm(&pcm, 22_050);
         // 10 seconds at 120 BPM ≈ 20 beats (give or take edge effects).
         assert!(a.beats.len() >= 18 && a.beats.len() <= 22, "got {} beats", a.beats.len());
+    }
+
+    /// Kicks with a sharp attack and an exponential decay (`decay_secs`
+    /// time constant), the first one at `first_secs`, then every beat.
+    fn synth_kicks(bpm: f64, secs: f64, sample_rate: u32, decay_secs: f64, first_secs: f64) -> Vec<f32> {
+        let n = (secs * sample_rate as f64) as usize;
+        let period = 60.0 / bpm;
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / sample_rate as f64;
+                if t < first_secs {
+                    return 0.0;
+                }
+                let since = (t - first_secs) % period;
+                let env = (-since / decay_secs).exp();
+                (0.6 * (2.0 * std::f64::consts::PI * 70.0 * since).sin() * env) as f32
+            })
+            .collect()
+    }
+
+    /// Signed error (s) from each detected beat to the nearest true kick.
+    fn beat_errors(beats: &[f32], bpm: f64, first_secs: f64) -> Vec<f64> {
+        let period = 60.0 / bpm;
+        beats
+            .iter()
+            .filter(|&&b| b as f64 >= first_secs - period * 0.5)
+            .map(|&b| {
+                let k = ((b as f64 - first_secs) / period).round();
+                b as f64 - (first_secs + k * period)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grid_tracks_kicks_over_two_minutes() {
+        // 123 BPM is a non-integer lag at the ~43 Hz onset rate (21.01
+        // frames): the raw fixed-period placement would drift ~1 beat
+        // within the first minute.
+        let bpm = 123.0;
+        let pcm = synth_kicks(bpm, 120.0, 22_050, 0.06, 0.0);
+        let a = analyze_pcm(&pcm, 22_050);
+        assert!((a.tempo_bpm as f64 - bpm).abs() < 0.05, "tempo {} BPM", a.tempo_bpm);
+        let errs = beat_errors(&a.beats, bpm, 0.0);
+        let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+        let worst = errs.iter().map(|e| e.abs()).fold(0.0, f64::max);
+        assert!(worst < 0.005, "worst beat error {:.1} ms", worst * 1000.0);
+        assert!(mean.abs() < 0.003, "mean beat bias {:.1} ms", mean * 1000.0);
+        let expected = (120.0 / (60.0 / bpm)).floor() as usize;
+        assert!(
+            a.beats.len().abs_diff(expected) <= 1,
+            "{} beats, expected ≈ {expected}",
+            a.beats.len()
+        );
+        let fit = a.beat_grid.expect("grid fit");
+        assert_eq!(fit.octave, GridOctave::Kept);
+        assert!(fit.is_tight(), "{fit:?}");
+    }
+
+    #[test]
+    fn grid_attack_timing_does_not_depend_on_decay() {
+        // The onset envelope alone reads 0–17 ms early depending on how long
+        // a hit rings; attack refinement must hold every shape to ±3 ms.
+        for &decay in &[0.02, 0.06, 0.2] {
+            for &bpm in &[84.0, 171.0] {
+                let pcm = synth_kicks(bpm, 40.0, 22_050, decay, 0.37);
+                let a = analyze_pcm(&pcm, 22_050);
+                let errs = beat_errors(&a.beats, bpm, 0.37);
+                let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+                assert!(
+                    mean.abs() < 0.003,
+                    "decay {decay}s @ {bpm} BPM: bias {:.2} ms",
+                    mean * 1000.0
+                );
+            }
+        }
+    }
+
+    /// Deterministic white noise in [-1, 1].
+    fn noise(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+
+    /// A small dance mix: kick on every beat, snare on 2 and 4, closed
+    /// hi-hats on the off-beats, a sustained bass note and a noise floor.
+    fn synth_mix(bpm: f64, secs: f64, sample_rate: u32) -> Vec<f32> {
+        let n = (secs * sample_rate as f64) as usize;
+        let beat = 60.0 / bpm;
+        let mut seed = 0x5eed_u64;
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / sample_rate as f64;
+                let k = (t / beat).floor();
+                let since = t - k * beat;
+                let tau = 2.0 * std::f64::consts::PI;
+                let kick = 0.55 * (tau * 60.0 * since).sin() * (-since / 0.05).exp();
+                let snare = if (k as i64).rem_euclid(2) == 1 {
+                    0.25 * noise(&mut seed) * (-since / 0.08).exp()
+                } else {
+                    0.0
+                };
+                let off = (t - (k + 0.5) * beat).rem_euclid(beat);
+                let hat = 0.06 * noise(&mut seed) * (-off / 0.015).exp();
+                let bass = 0.08 * (tau * 55.0 * t).sin();
+                let floor = 0.01 * noise(&mut seed);
+                (kick + snare + hat + bass + floor) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grid_reads_a_slow_track_with_soft_eighths_at_its_real_tempo() {
+        // 70 BPM kicks with weaker eighth-note ticks between them: neither
+        // the tempo picker nor the octave check may promote the eighth-note
+        // pulse to the beat (140 BPM), and the grid must still sit on the
+        // kicks, not on the ticks.
+        let bpm = 70.0;
+        let sr = 22_050u32;
+        let beat = 60.0 / bpm;
+        let mut pcm = synth_kicks(bpm, 60.0, sr, 0.06, 0.0);
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / sr as f64;
+            let off = (t - 0.5 * beat).rem_euclid(beat);
+            *s += (0.22 * (2.0 * std::f64::consts::PI * 70.0 * off).sin() * (-off / 0.03).exp()) as f32;
+        }
+        let a = analyze_pcm(&pcm, sr);
+        let fit = a.beat_grid.expect("grid fit");
+        assert!((a.tempo_bpm as f64 - bpm).abs() < 0.05, "tempo {} BPM ({fit:?})", a.tempo_bpm);
+        let worst = beat_errors(&a.beats, bpm, 0.0)
+            .iter()
+            .map(|e| e.abs())
+            .fold(0.0, f64::max);
+        assert!(worst < 0.005, "worst beat error {:.1} ms", worst * 1000.0);
+    }
+
+    #[test]
+    fn grid_locks_onto_kicks_in_a_full_mix() {
+        let bpm = 128.0;
+        let a = analyze_pcm(&synth_mix(bpm, 60.0, 22_050), 22_050);
+        assert!((a.tempo_bpm as f64 - bpm).abs() < 0.05, "tempo {} BPM", a.tempo_bpm);
+        let worst = beat_errors(&a.beats, bpm, 0.0)
+            .iter()
+            .map(|e| e.abs())
+            .fold(0.0, f64::max);
+        assert!(worst < 0.010, "worst beat error {:.1} ms", worst * 1000.0);
+        let fit = a.beat_grid.expect("grid fit");
+        assert_eq!(fit.octave, GridOctave::Kept);
+        assert!(fit.is_tight(), "{fit:?}");
+    }
+
+    #[test]
+    fn grid_tracks_kicks_after_silent_intro() {
+        let bpm = 97.0;
+        let first = 5.0;
+        let pcm = synth_kicks(bpm, 60.0, 22_050, 0.08, first);
+        let a = analyze_pcm(&pcm, 22_050);
+        assert!((a.tempo_bpm as f64 - bpm).abs() < 0.05, "tempo {} BPM", a.tempo_bpm);
+        let worst = beat_errors(&a.beats, bpm, first)
+            .iter()
+            .map(|e| e.abs())
+            .fold(0.0, f64::max);
+        assert!(worst < 0.005, "worst beat error {:.1} ms", worst * 1000.0);
+        // The grid is extended back through the silent intro.
+        assert!(a.beats[0] < 60.0 / bpm as f32, "first beat at {}", a.beats[0]);
+    }
+
+    fn spikes(n: usize, every: usize, offset: usize, value: f32, into: &mut [f32]) {
+        let mut i = offset;
+        while i < n {
+            into[i] = into[i].max(value);
+            i += every;
+        }
+    }
+
+    #[test]
+    fn octave_check_halves_double_time_grid() {
+        let rate = 22_050.0 / HOP_SIZE as f64; // ≈ 43 Hz
+        let n = 2000;
+        // Strong hits every 20 frames on odd grid beats, near-silence between.
+        let mut onset = vec![0.0_f32; n];
+        spikes(n, 20, 10, 1.0, &mut onset);
+        spikes(n, 20, 0, 0.1, &mut onset);
+        let (g, oct) = octave_check(&onset, Grid { period: 10.0, phase: 0.0 }, rate);
+        assert_eq!(oct, GridOctave::Halved);
+        assert!((g.period - 20.0).abs() < 1e-9);
+        assert!((g.phase - 10.0).abs() < 1e-9, "phase {}", g.phase);
+    }
+
+    #[test]
+    fn octave_check_doubles_half_time_grid() {
+        let rate = 22_050.0 / HOP_SIZE as f64;
+        let n = 4000;
+        let mut onset = vec![0.0_f32; n];
+        spikes(n, 20, 0, 1.0, &mut onset);
+        // A 40-frame grid (≈ 65 BPM) sits on every other hit.
+        let (g, oct) = octave_check(&onset, Grid { period: 40.0, phase: 0.0 }, rate);
+        assert_eq!(oct, GridOctave::Doubled);
+        assert!((g.period - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn octave_check_keeps_rock_backbeat() {
+        // Kick on 1 and 3, a snare at 40 % of the kick's onset energy on 2
+        // and 4, nothing between: a normal backbeat, not double-time.
+        let rate = 22_050.0 / HOP_SIZE as f64;
+        let n = 2000;
+        let mut onset = vec![0.0_f32; n];
+        spikes(n, 40, 0, 1.0, &mut onset);
+        spikes(n, 40, 20, 0.4, &mut onset);
+        let grid = Grid { period: 20.0, phase: 0.0 };
+        let (g, oct) = octave_check(&onset, grid, rate);
+        assert_eq!(oct, GridOctave::Kept);
+        assert_eq!(g, grid);
     }
 
     #[test]

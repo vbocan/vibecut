@@ -13,6 +13,8 @@
 
 pub mod audio_analysis;
 pub mod beat_burst;
+pub mod beat_lock;
+pub mod beat_sync;
 pub mod benchmark;
 pub mod disk_cache;
 pub mod rng;

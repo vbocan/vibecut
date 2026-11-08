@@ -435,6 +435,7 @@ mod tests {
             beats,
             energy_curve: energy,
             energy_rate: 4.0,
+            beat_grid: None,
         }
     }
 

@@ -820,6 +820,12 @@ pub struct Manifest {
     /// Angle groups discovered or configured for this run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub angle_groups: Vec<AngleGroupRecord>,
+    /// Post-render check of where the cuts landed against the soundtrack's
+    /// beats (see `beat_sync`). Absent without a soundtrack or when the
+    /// check couldn't run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub beat_sync: Option<crate::beat_sync::BeatSyncReport>,
     pub generator: String,
 }
 
