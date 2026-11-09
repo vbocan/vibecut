@@ -18,6 +18,8 @@ pub mod beat_sync;
 pub mod benchmark;
 pub mod disk_cache;
 pub mod fonts;
+#[cfg(test)]
+mod test_env;
 pub mod rng;
 pub mod gopro_metadata;
 pub mod media_probe;

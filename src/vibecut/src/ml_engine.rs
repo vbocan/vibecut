@@ -240,6 +240,27 @@ impl ModelDirs {
     }
 }
 
+/// The Silero VAD model a render of `cfg` loads: `None` when it doesn't
+/// duck the soundtrack (no `[soundtrack]`, or `duck_count = 0`), else the
+/// first `silero_vad.onnx` in `[project].models_dir`, `models_dir_var`
+/// (the value of `$VIBECUT_MODELS_DIR`) and `image_models_dir`.
+pub fn silero_vad_for(
+    cfg: &crate::project_config::Config,
+    models_dir_var: Option<&std::ffi::OsStr>,
+    image_models_dir: &Utf8Path,
+) -> Option<Utf8PathBuf> {
+    if !cfg.soundtrack.as_ref().is_some_and(|s| s.duck_count > 0) {
+        return None;
+    }
+    find_silero_vad(&ModelDirs::new(&cfg.project.models_dir, models_dir_var, image_models_dir))
+}
+
+/// [`silero_vad_for`] with the real `$VIBECUT_MODELS_DIR` and
+/// [`IMAGE_MODELS_DIR`]: what the pipeline calls.
+pub fn silero_vad_from_env(cfg: &crate::project_config::Config) -> Option<Utf8PathBuf> {
+    silero_vad_for(cfg, std::env::var_os(MODELS_DIR_ENV).as_deref(), Utf8Path::new(IMAGE_MODELS_DIR))
+}
+
 /// The Silero VAD model for speech-driven ducking, or `None` when there is
 /// none anywhere in the chain (ducking then picks windows by loudness
 /// alone). Logs the outcome at info level either way.
@@ -417,10 +438,12 @@ mod tests {
         assert_eq!(ModelDirs::new(&odd, None, &odd).find(SILERO_VAD_FILE), None);
     }
 
-    #[test]
-    fn ducking_finds_the_vad_model_through_the_fallbacks() {
-        // A project whose own models_dir has no model, as on a fresh install.
-        let root = temp_dir("ducking");
+    /// A project config whose `models_dir` is `models_dir`, with a
+    /// `[soundtrack]` ducking `duck_count` times (none when `None`).
+    fn config(models_dir: &Utf8Path, duck_count: Option<u32>) -> crate::project_config::Config {
+        let soundtrack = duck_count
+            .map(|n| format!("[soundtrack]\nfile = \"a.mp3\"\nduck_count = {n}\n"))
+            .unwrap_or_default();
         let toml = format!(
             r#"
             schema_version = 1
@@ -428,34 +451,76 @@ mod tests {
             name = "t"
             target_duration = "10s"
             fps = 30
-            models_dir = "{}"
+            models_dir = '{models_dir}'
             [input]
             folder = "."
             [[outputs]]
             path = "out.mp4"
             resolution = "1920x1080"
-            [soundtrack]
-            file = "a.mp3"
-            duck_count = 2
-            "#,
-            root.join("project_models")
+            {soundtrack}
+            "#
         );
-        let cfg: crate::project_config::Config = toml::from_str(&toml).unwrap();
-        assert!(cfg.soundtrack.as_ref().unwrap().duck_count > 0);
-        let models_dir = &cfg.project.models_dir;
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn ducking_finds_the_vad_model_through_the_fallbacks() {
+        // A project whose own models_dir has no model, as on a fresh install.
+        let root = temp_dir("ducking");
+        let cfg = config(&root.join("project_models"), Some(2));
         let (env_dir, image_dir) = (root.join("env_models"), root.join("app_models"));
+        let env = Some(env_dir.as_os_str());
 
         // Nothing anywhere: speech-driven ducking stays off.
-        let none = ModelDirs::new(models_dir, Some(env_dir.as_os_str()), &image_dir);
-        assert_eq!(find_silero_vad(&none), None);
+        assert_eq!(silero_vad_for(&cfg, env, &image_dir), None);
 
         // The image's bundled copy turns it on with no env var set.
         let bundled = put_model(&image_dir);
-        assert_eq!(find_silero_vad(&ModelDirs::new(models_dir, None, &image_dir)), Some(bundled));
+        assert_eq!(silero_vad_for(&cfg, None, &image_dir), Some(bundled.clone()));
 
         // $VIBECUT_MODELS_DIR wins over the bundled copy.
         let from_env = put_model(&env_dir);
-        let dirs = ModelDirs::new(models_dir, Some(env_dir.as_os_str()), &image_dir);
-        assert_eq!(find_silero_vad(&dirs), Some(from_env));
+        assert_eq!(silero_vad_for(&cfg, env, &image_dir), Some(from_env));
+
+        // The project's own models_dir wins over both.
+        let own = put_model(&cfg.project.models_dir);
+        assert_eq!(silero_vad_for(&cfg, env, &image_dir), Some(own));
+
+        // A render that doesn't duck loads no model, wherever one is.
+        let no_ducks = config(&cfg.project.models_dir, Some(0));
+        assert_eq!(silero_vad_for(&no_ducks, env, &image_dir), None);
+        let no_soundtrack = config(&cfg.project.models_dir, None);
+        assert_eq!(silero_vad_for(&no_soundtrack, env, &image_dir), None);
+    }
+
+    #[test]
+    fn the_real_chain_ends_at_the_image_models_dir() {
+        let dirs = ModelDirs::from_env(Utf8Path::new("proj/models"));
+        assert_eq!(dirs.dirs.first(), Some(&(Utf8PathBuf::from("proj/models"), ModelDirKind::Project)));
+        assert_eq!(dirs.dirs.last(), Some(&(Utf8PathBuf::from("/app/models"), ModelDirKind::Image)));
+    }
+
+    /// What the pipeline calls ([`silero_vad_from_env`], [`ModelDirs::from_env`])
+    /// reads `$VIBECUT_MODELS_DIR` from the real environment, checked in a
+    /// child process.
+    #[test]
+    fn the_pipeline_lookup_reads_the_models_dir_var() {
+        const TEST: &str = "ml_engine::tests::the_pipeline_lookup_reads_the_models_dir_var";
+        if crate::test_env::is_child(TEST) {
+            let env_dir = Utf8PathBuf::from(std::env::var(MODELS_DIR_ENV).unwrap());
+            let project = env_dir.with_file_name("project_models");
+            let dirs = ModelDirs::from_env(&project);
+            assert_eq!(dirs.dirs[1], (env_dir.clone(), ModelDirKind::Env));
+            assert_eq!(
+                silero_vad_from_env(&config(&project, Some(2))),
+                Some(env_dir.join(SILERO_VAD_FILE))
+            );
+            return;
+        }
+        let root = temp_dir("pipeline_env");
+        let env_dir = root.join("env_models");
+        put_model(&env_dir);
+        // The documented name, not the constant, so renaming it fails here.
+        crate::test_env::run_child(TEST, &[("VIBECUT_MODELS_DIR", env_dir.as_str())]);
     }
 }

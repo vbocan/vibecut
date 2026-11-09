@@ -1747,9 +1747,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             // unavailable, automatic CPU fallback.
             let mut ml_engine: Option<crate::ml_engine::MlEngine> = None;
             // [project].models_dir → $VIBECUT_MODELS_DIR → /app/models.
-            let vad_model = crate::ml_engine::find_silero_vad(
-                &crate::ml_engine::ModelDirs::from_env(&cfg.project.models_dir),
-            );
+            let vad_model = crate::ml_engine::silero_vad_from_env(cfg);
             if let Some(vad_path) = vad_model {
                 match crate::ml_engine::MlEngine::new() {
                     Ok(mut eng) => {
@@ -2419,6 +2417,32 @@ fn parse_iso_seconds(s: &str) -> Option<f64> {
 /// then a sans-serif default).
 fn resolve_font(name: Option<&str>) -> Option<camino::Utf8PathBuf> {
     crate::fonts::resolve_font(name)
+}
+
+#[cfg(test)]
+mod font_wiring_tests {
+    /// A title card's text layer gets its font through [`crate::fonts`],
+    /// including `$VIBECUT_FONTS_DIR` from the real environment (checked in
+    /// a child process that has it set).
+    #[test]
+    fn card_layers_find_their_font_through_the_fonts_dir() {
+        const TEST: &str = "run_pipeline::font_wiring_tests::card_layers_find_their_font_through_the_fonts_dir";
+        const FACE: &str = "VibecutCardFace-Bold.ttf";
+        if crate::test_env::is_child(TEST) {
+            let dir = camino::Utf8PathBuf::from(std::env::var(crate::fonts::FONTS_DIR_ENV).unwrap());
+            let card: crate::project_config::TextCard = toml::from_str(&format!(
+                "duration = \"2s\"\n[[layers]]\nkind = \"text\"\ncontent = \"Hi\"\nfont = \"{FACE}\"\n"
+            ))
+            .unwrap();
+            let (texts, _) = super::card_to_layers(&card);
+            assert_eq!(texts[0].font_path, Some(dir.join(FACE)));
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vibecut_card_font_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FACE), b"font").unwrap();
+        crate::test_env::run_child(TEST, &[("VIBECUT_FONTS_DIR", dir.to_str().unwrap())]);
+    }
 }
 
 

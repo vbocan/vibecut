@@ -57,11 +57,13 @@ services:
       VIBECUT_LLM_MODEL: ${VIBECUT_LLM_MODEL:-claude-sonnet-5}
       # Container paths of your own title-card fonts and ONNX models,
       # searched before the fonts and the Silero VAD model baked into the
-      # image. The defaults are folders on the projects mount: create
+      # image. They are folders on the projects mount: create
       # <projects>/fonts or <projects>/models only to add or override
-      # something (see DOCKER.md, "Fonts and models").
-      VIBECUT_FONTS_DIR: ${VIBECUT_FONTS_DIR:-/projects/fonts}
-      VIBECUT_MODELS_DIR: ${VIBECUT_MODELS_DIR:-/projects/models}
+      # something (see DOCKER.md, "Fonts and models"). Fixed here rather
+      # than read from the host shell, where the same names may hold host
+      # paths for native renders; change them in a compose.override.yml.
+      VIBECUT_FONTS_DIR: /projects/fonts
+      VIBECUT_MODELS_DIR: /projects/models
 
 volumes:
   vibecut-cache:

@@ -45,31 +45,38 @@ const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc", "otc"];
 /// (`/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Bold.ttf`).
 const MAX_DEPTH: usize = 6;
 
+/// A Windows core font's file stem, fontconfig pattern and metric twin.
+type WindowsFont = (&'static str, &'static str, Option<&'static str>);
+
 /// Windows core-font file names → fontconfig patterns, so a config written
-/// on Windows (`font = "arialbd.ttf"`) still gets a matching face elsewhere.
-/// fontconfig maps Arial, Times New Roman and Courier New to the
-/// metric-compatible Liberation fonts the Docker image installs.
-const WINDOWS_FONT_FILES: &[(&str, &str)] = &[
-    ("arial", "Arial"),
-    ("arialbd", "Arial:bold"),
-    ("ariali", "Arial:italic"),
-    ("arialbi", "Arial:bold:italic"),
-    ("ariblk", "Arial:black"),
-    ("times", "Times New Roman"),
-    ("timesbd", "Times New Roman:bold"),
-    ("timesi", "Times New Roman:italic"),
-    ("timesbi", "Times New Roman:bold:italic"),
-    ("cour", "Courier New"),
-    ("courbd", "Courier New:bold"),
-    ("couri", "Courier New:italic"),
-    ("courbi", "Courier New:bold:italic"),
-    ("verdana", "Verdana"),
-    ("verdanab", "Verdana:bold"),
-    ("calibri", "Calibri"),
-    ("calibrib", "Calibri:bold"),
-    ("segoeui", "Segoe UI"),
-    ("segoeuib", "Segoe UI:bold"),
-    ("impact", "Impact"),
+/// on Windows (`font = "arialbd.ttf"`) still gets a matching face elsewhere,
+/// plus the metric-compatible family that can stand in for it without
+/// changing the layout, if there is one. fontconfig maps Arial, Times New
+/// Roman and Courier New to the Liberation fonts the Docker image installs,
+/// and Calibri to Carlito where that is installed (the image doesn't ship
+/// it). Arial Black, Verdana, Segoe UI and Impact have no such twin, so
+/// whatever replaces them sets differently.
+const WINDOWS_FONT_FILES: &[WindowsFont] = &[
+    ("arial", "Arial", Some("Liberation Sans")),
+    ("arialbd", "Arial:bold", Some("Liberation Sans")),
+    ("ariali", "Arial:italic", Some("Liberation Sans")),
+    ("arialbi", "Arial:bold:italic", Some("Liberation Sans")),
+    ("ariblk", "Arial:black", None),
+    ("times", "Times New Roman", Some("Liberation Serif")),
+    ("timesbd", "Times New Roman:bold", Some("Liberation Serif")),
+    ("timesi", "Times New Roman:italic", Some("Liberation Serif")),
+    ("timesbi", "Times New Roman:bold:italic", Some("Liberation Serif")),
+    ("cour", "Courier New", Some("Liberation Mono")),
+    ("courbd", "Courier New:bold", Some("Liberation Mono")),
+    ("couri", "Courier New:italic", Some("Liberation Mono")),
+    ("courbi", "Courier New:bold:italic", Some("Liberation Mono")),
+    ("verdana", "Verdana", None),
+    ("verdanab", "Verdana:bold", None),
+    ("calibri", "Calibri", Some("Carlito")),
+    ("calibrib", "Calibri:bold", Some("Carlito")),
+    ("segoeui", "Segoe UI", None),
+    ("segoeuib", "Segoe UI:bold", None),
+    ("impact", "Impact", None),
 ];
 
 /// Which step of the chain found the font.
@@ -205,16 +212,16 @@ fn found(path: Utf8PathBuf, source: FontSource) -> ResolvedFont {
 
 /// Resolve a text layer's `font` for drawtext and log the outcome: which
 /// file and why at info level, a stand-in for a missing font as a warning
-/// (info for Windows core fonts, whose stand-ins are metric-compatible), and
-/// a warning when nothing is found at all.
+/// (info when it is the metric-compatible twin of a Windows core font, so
+/// the layout holds), and a warning when nothing is found at all.
 pub fn resolve_font(name: Option<&str>) -> Option<Utf8PathBuf> {
     let lookup = FontLookup::from_env();
     let label = name.unwrap_or("(default)");
     match lookup.resolve(name) {
         Some(f) => {
             match &f.substitute {
-                Some(used) if name.is_some_and(|n| windows_font_pattern(n).is_some()) => {
-                    tracing::info!(font = label, path = %f.path, "Windows font not installed here; using {used} in its place")
+                Some(used) if name.is_some_and(|n| is_metric_twin(n, used)) => {
+                    tracing::info!(font = label, path = %f.path, "Windows font not installed here; using its metric-compatible twin {used}")
                 }
                 Some(used) => tracing::warn!(
                     font = label,
@@ -305,19 +312,28 @@ pub fn find_in_dirs(dirs: &[Utf8PathBuf], file: &str) -> Option<Utf8PathBuf> {
     None
 }
 
-fn windows_font_pattern(name: &str) -> Option<&'static str> {
+fn windows_font(name: &str) -> Option<&'static WindowsFont> {
     let file = Utf8Path::new(name).file_name().unwrap_or(name);
     let stem = font_stem(file);
-    WINDOWS_FONT_FILES
-        .iter()
-        .find(|(f, _)| f.eq_ignore_ascii_case(stem))
-        .map(|&(_, pattern)| pattern)
+    WINDOWS_FONT_FILES.iter().find(|(f, _, _)| f.eq_ignore_ascii_case(stem))
+}
+
+fn windows_font_pattern(name: &str) -> Option<&'static str> {
+    windows_font(name).map(|&(_, pattern, _)| pattern)
+}
+
+/// Whether `used` is the metric-compatible twin of the Windows core font
+/// `name` asks for (Liberation Sans for `arialbd.ttf`), so the text keeps
+/// its width. Any other stand-in (DejaVu Sans for `impact.ttf`) is not.
+fn is_metric_twin(name: &str, used: &str) -> bool {
+    windows_font(name).and_then(|&(_, _, twin)| twin).is_some_and(|twin| same_family(twin, used))
 }
 
 /// A layer's `font` as a fontconfig pattern, plus the family it asks for.
-/// File names become `family:style=Style` (`Inter-Bold.ttf` →
-/// `Inter:style=Bold`; fontconfig ignores blanks in family names, so
-/// `DejaVuSans` finds "DejaVu Sans"); anything else is already a pattern.
+/// File names become `family:style=Style` plus the weight and slant the
+/// style names (`Inter-Bold.ttf` → `Inter:style=Bold:weight=bold`;
+/// fontconfig ignores blanks in family names, so `DejaVuSans` finds
+/// "DejaVu Sans"); anything else is already a pattern.
 pub fn fc_pattern(name: &str) -> (String, String) {
     if let Some(pattern) = windows_font_pattern(name) {
         return (pattern.to_string(), pattern_family(pattern));
@@ -330,10 +346,57 @@ pub fn fc_pattern(name: &str) -> (String, String) {
     }
     match stem.rsplit_once('-') {
         Some((family, style)) if !family.is_empty() && !style.is_empty() => {
-            (format!("{}:style={}", fc_escape(family), fc_escape(style)), family.to_string())
+            let (style, weight, slant) = style_props(style);
+            let mut pattern = format!("{}:style={}", fc_escape(family), fc_escape(&style));
+            for (key, value) in [("weight", weight), ("slant", slant)] {
+                if let Some(value) = value {
+                    pattern.push_str(&format!(":{key}={value}"));
+                }
+            }
+            (pattern, family.to_string())
         }
         _ => (fc_escape(stem), stem.to_string()),
     }
+}
+
+/// A file name's style token (`Black`, `ExtraBold`, `BoldItalic`) → the
+/// style as fonts usually name it (`Bold Italic`) plus fontconfig's weight
+/// and slant constants. fontconfig matches `style` only by exact name, so
+/// when the family is missing the weight and slant are what keep a
+/// substitute heavy or italic: `Montserrat:style=Black` alone gets the
+/// fallback family's Regular face. Tokens that name no weight
+/// (`Condensed`) get none.
+fn style_props(style: &str) -> (String, Option<&'static str>, Option<&'static str>) {
+    let lower = style.to_ascii_lowercase();
+    let slant = ["italic", "oblique"].into_iter().find(|suffix| lower.ends_with(suffix));
+    // `to_ascii_lowercase` keeps byte offsets, and the suffixes are ASCII.
+    let (weight_part, slant_part) = style.split_at(style.len() - slant.map_or(0, str::len));
+    let weight_part = weight_part.trim_end_matches([' ', '_']);
+    let squashed: String =
+        weight_part.chars().filter(|c| !matches!(c, ' ' | '_')).collect::<String>().to_ascii_lowercase();
+    let weight = match squashed.as_str() {
+        "thin" | "hairline" => Some("thin"),
+        "extralight" | "ultralight" => Some("extralight"),
+        "light" => Some("light"),
+        "semilight" | "demilight" => Some("demilight"),
+        "book" => Some("book"),
+        "regular" | "normal" => Some("regular"),
+        "medium" => Some("medium"),
+        "semibold" | "demibold" => Some("semibold"),
+        "bold" => Some("bold"),
+        "extrabold" | "ultrabold" => Some("extrabold"),
+        "black" | "heavy" => Some("black"),
+        "extrablack" | "ultrablack" => Some("extrablack"),
+        _ => None,
+    };
+    // `BoldItalic` → `Bold Italic`, the name Inter, Liberation and
+    // Montserrat give the face.
+    let style = if slant.is_some() && !weight_part.is_empty() {
+        format!("{weight_part} {slant_part}")
+    } else {
+        style.to_string()
+    };
+    (style, weight, slant)
 }
 
 /// Backslash-escape the characters fontconfig's pattern syntax reserves.
@@ -517,7 +580,7 @@ mod tests {
                 let (file, family) = match pattern {
                     p if p.starts_with("Bebas") => (beb.clone(), "Bebas Neue"),
                     "Arial:bold" => (lib.clone(), "Liberation Sans"),
-                    "Gone:style=Bold" => ("/nonexistent/font.ttf".into(), "Gone"),
+                    "Gone:style=Bold:weight=bold" => ("/nonexistent/font.ttf".into(), "Gone"),
                     _ => (lib.clone(), "Liberation Sans"),
                 };
                 Some(FcMatch { file, families: vec![family.into()] })
@@ -536,16 +599,16 @@ mod tests {
         assert_eq!(f.path, liberation);
         assert_eq!(
             *asked.borrow(),
-            ["Bebas Neue", "Arial:bold", "Gone:style=Bold", DEFAULT_FONT_PATTERN]
+            ["Bebas Neue", "Arial:bold", "Gone:style=Bold:weight=bold", DEFAULT_FONT_PATTERN]
         );
     }
 
     #[test]
     fn config_names_become_fontconfig_patterns() {
         let p = |n: &str| fc_pattern(n);
-        assert_eq!(p("Inter-Bold.ttf"), ("Inter:style=Bold".into(), "Inter".into()));
-        assert_eq!(p("DejaVuSans-Bold"), ("DejaVuSans:style=Bold".into(), "DejaVuSans".into()));
-        assert_eq!(p("Noto-Sans-Bold.otf"), ("Noto\\-Sans:style=Bold".into(), "Noto-Sans".into()));
+        assert_eq!(p("Inter-Bold.ttf"), ("Inter:style=Bold:weight=bold".into(), "Inter".into()));
+        assert_eq!(p("DejaVuSans-Bold"), ("DejaVuSans:style=Bold:weight=bold".into(), "DejaVuSans".into()));
+        assert_eq!(p("Noto-Sans-Bold.otf"), ("Noto\\-Sans:style=Bold:weight=bold".into(), "Noto-Sans".into()));
         assert_eq!(p("Lobster.ttf"), ("Lobster".into(), "Lobster".into()));
         assert_eq!(p("ARIALBD.TTF"), ("Arial:bold".into(), "Arial".into()));
         assert_eq!(p("C:/Windows/Fonts/arial.ttf"), ("Arial".into(), "Arial".into()));
@@ -553,6 +616,67 @@ mod tests {
         assert_eq!(p("Inter Display:style=Black"), ("Inter Display:style=Black".into(), "Inter Display".into()));
         assert!(same_family("DejaVuSans", "DejaVu Sans"));
         assert!(!same_family("Inter", "DejaVu Sans"));
+    }
+
+    #[test]
+    fn a_missing_font_keeps_its_weight_and_slant() {
+        // fontconfig matches `style` only by exact name, so without the
+        // weight a missing Black face came back as the substitute's Regular.
+        let p = |n: &str| fc_pattern(n).0;
+        assert_eq!(p("Montserrat-Black.ttf"), "Montserrat:style=Black:weight=black");
+        assert_eq!(p("Inter-ExtraBold.otf"), "Inter:style=ExtraBold:weight=extrabold");
+        assert_eq!(p("Inter-SemiBold"), "Inter:style=SemiBold:weight=semibold");
+        assert_eq!(p("Inter-Thin.otf"), "Inter:style=Thin:weight=thin");
+        assert_eq!(p("BebasNeue-Book.otf"), "BebasNeue:style=Book:weight=book");
+        assert_eq!(p("Brand-Heavy.ttf"), "Brand:style=Heavy:weight=black");
+        // CamelCase italics get fontconfig's spaced style name and a slant.
+        assert_eq!(
+            p("LiberationSans-BoldItalic.ttf"),
+            "LiberationSans:style=Bold Italic:weight=bold:slant=italic"
+        );
+        assert_eq!(
+            p("Inter-ExtraBoldItalic.otf"),
+            "Inter:style=ExtraBold Italic:weight=extrabold:slant=italic"
+        );
+        assert_eq!(p("Inter-Italic.otf"), "Inter:style=Italic:slant=italic");
+        assert_eq!(p("DejaVuSans-BoldOblique"), "DejaVuSans:style=Bold Oblique:weight=bold:slant=oblique");
+        // A token that names no weight stays a bare style.
+        assert_eq!(p("Brand-Condensed.ttf"), "Brand:style=Condensed");
+    }
+
+    #[test]
+    fn only_a_metric_twin_of_a_windows_font_is_a_quiet_substitute() {
+        assert!(is_metric_twin("arialbd.ttf", "Liberation Sans"));
+        assert!(is_metric_twin("C:/Windows/Fonts/TIMES.TTF", "Liberation Serif"));
+        assert!(is_metric_twin("courbd.ttf", "LiberationMono"));
+        assert!(is_metric_twin("calibri.ttf", "Carlito"));
+        // What fontconfig serves in the image when there is no twin.
+        assert!(!is_metric_twin("impact.ttf", "DejaVu Sans"));
+        assert!(!is_metric_twin("calibri.ttf", "DejaVu Sans"));
+        assert!(!is_metric_twin("verdana.ttf", "DejaVu Sans"));
+        assert!(!is_metric_twin("segoeui.ttf", "DejaVu Sans"));
+        // Liberation Sans has no Black face: Arial Black's stand-in is wider.
+        assert!(!is_metric_twin("ariblk.ttf", "Liberation Sans"));
+        assert!(!is_metric_twin("arial.ttf", "DejaVu Sans"));
+        assert!(!is_metric_twin("Inter-Bold.ttf", "Liberation Sans"));
+    }
+
+    /// `resolve_font` (what title cards call) reads `$VIBECUT_FONTS_DIR`
+    /// from the real environment, checked in a child process.
+    #[test]
+    fn resolve_font_searches_the_fonts_dir_from_the_environment() {
+        const TEST: &str = "fonts::tests::resolve_font_searches_the_fonts_dir_from_the_environment";
+        if crate::test_env::is_child(TEST) {
+            let dir = Utf8PathBuf::from(std::env::var(FONTS_DIR_ENV).unwrap());
+            let want = dir.join("deep/VibecutTestFace-Black.otf");
+            assert_eq!(FontLookup::from_env().fonts_dirs, vec![dir]);
+            assert_eq!(resolve_font(Some("VibecutTestFace-Black.ttf")), Some(want));
+            return;
+        }
+        let dir = temp_dir("from_env");
+        touch(&dir, "deep/VibecutTestFace-Black.otf");
+        // The documented name, not the constant, so renaming it fails here.
+        crate::test_env::run_child(TEST, &[("VIBECUT_FONTS_DIR", dir.as_str())]);
     }
 
     #[test]
@@ -571,5 +695,44 @@ mod tests {
         let Some(m) = run_fc_match(DEFAULT_FONT_PATTERN) else { return };
         assert!(m.file.is_file(), "fc-match returned {m:?}");
         assert!(!m.families.is_empty());
+    }
+
+    /// The real `fc-match` parses every pattern [`fc_pattern`] builds and,
+    /// for a family that isn't installed, serves a heavy style with a face
+    /// of the substitute family that's heavier than its regular one when
+    /// that family has one (DejaVu Sans Bold in the images). No-op without
+    /// fontconfig.
+    #[test]
+    fn real_fc_match_keeps_the_weight_of_a_missing_font() {
+        let query = |format: &str, pattern: &str| -> Option<String> {
+            let out = Command::new("fc-match").arg(format!("--format={format}")).arg(pattern).output().ok()?;
+            assert!(out.status.success(), "fc-match rejected {pattern:?}");
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let weight = |name: &str| -> Option<f32> { query("%{weight}", &fc_pattern(name).0)?.parse().ok() };
+        if query("%{file}", DEFAULT_FONT_PATTERN).is_none() {
+            return;
+        }
+        for style in [
+            "Thin", "ExtraLight", "Light", "Book", "Regular", "Medium", "SemiBold", "Bold", "ExtraBold",
+            "Black", "ExtraBlack", "Italic", "BoldItalic", "BlackOblique", "Condensed",
+        ] {
+            query("%{file}", &fc_pattern(&format!("NoSuchVibecutFace-{style}.ttf")).0);
+        }
+        let (Some(regular), Some(black)) =
+            (weight("NoSuchVibecutFace-Regular.ttf"), weight("NoSuchVibecutFace-Black.ttf"))
+        else {
+            return;
+        };
+        let family = query("%{family}", &fc_pattern("NoSuchVibecutFace-Regular.ttf").0).unwrap_or_default();
+        let heavier_face = Command::new("fc-list")
+            .arg("--format=%{weight}\n")
+            .arg(&family)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|w| w.parse::<f32>().ok()).any(|w| w > regular))
+            .unwrap_or(false);
+        if heavier_face {
+            assert!(black > regular, "{family}: Black came back at weight {black}, Regular at {regular}");
+        }
     }
 }

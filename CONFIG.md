@@ -144,8 +144,9 @@ duck_min_dur          = "4s"             # shortest duck window length (default:
 duck_max_dur          = "7s"             # longest; actual length scales with audio interestingness (default: 7s)
 duck_ramp             = "300ms"          # fade in/out each duck window (default: 300ms)
 ducking_db            = -18.0            # how far the music dips during a duck (default: -18 dB)
-vad_speech_weight     = 1.5              # speech presence boost for duck pick (default: 1.5)
-                                         # only consulted when silero_vad.onnx is in [project].models_dir
+vad_speech_weight     = 1.5              # speech presence boost for duck pick (default: 1.5; 0 = off)
+                                         # only consulted when silero_vad.onnx is found in [project].models_dir,
+                                         # $VIBECUT_MODELS_DIR or /app/models (always there in the Docker image)
 
 # --- Beat burst: rapid music-video cuts at the soundtrack's energy peak ---
 beat_burst            = "auto"           # auto | off | on
@@ -332,14 +333,19 @@ also name a family, optionally with a style: `"Bebas Neue"`,
 `"Inter:bold"`, `"Inter Display:style=Black"`. Windows file names such as
 `arial.ttf` / `arialbd.ttf` / `times.ttf` / `cour.ttf` map to their
 families there, which fontconfig serves with the metric-compatible
-Liberation fonts when the originals aren't installed.
+Liberation fonts when the originals aren't installed. Verdana, Calibri,
+Segoe UI, Impact and Arial Black have no such twin in the Docker image:
+they get another face that sets wider or narrower, and the log warns.
 
 With no `font`, a layer uses the first installed of `Inter-Regular`,
 `DejaVuSans` and `arial`, then fontconfig's `sans-serif`. A font that
 can't be found falls back to fontconfig's closest match, or to that
-default, and the render log names the font that stood in. If nothing at
-all is found, a warning says so and ffmpeg picks, which fails on ffmpeg
-builds without fontconfig.
+default, and the render log warns and names the file that stood in. The
+match keeps the weight and slant the file name asks for where the
+fallback family has them: a missing `Montserrat-Black.ttf` gets DejaVu
+Sans Bold, not its regular face. If nothing at all is found, a warning
+says so and ffmpeg picks, which fails on ffmpeg builds without
+fontconfig.
 
 The Docker image ships these families (see [DOCKER.md](DOCKER.md#fonts-and-models)):
 

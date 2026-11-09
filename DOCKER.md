@@ -172,8 +172,12 @@ speech, set `[soundtrack].vad_speech_weight = 0`.
 | `VIBECUT_FONTS_DIR` | `/projects/fonts` | Extra font folders (`:`-separated), searched before the system fonts. |
 | `VIBECUT_MODELS_DIR` | `/projects/models` | Extra model folders (`:`-separated), searched after `[project].models_dir` and before `/app/models`. |
 
-Missing folders are skipped. `compose.yml` passes both through, so the
-same names on the host override them.
+Missing folders are skipped. `compose.yml` sets both to these container
+paths itself rather than reading them from your shell, where the same
+names may hold host paths for native renders (a `D:\Fonts` there would
+replace the drop-in folder and match nothing in the container). To point
+them elsewhere, override `environment:` in a `compose.override.yml`, or
+pass `-e` to `docker run`.
 
 ## CPU-only fallback
 
