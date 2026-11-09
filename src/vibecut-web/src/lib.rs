@@ -22,6 +22,7 @@ pub mod error;
 pub mod llm;
 pub mod routes;
 pub mod state;
+pub mod webhook;
 pub mod ws;
 
 pub use state::AppState;
@@ -437,6 +438,87 @@ mod tests {
     /// avoids pulling in a whole crate for one test's sake.
     fn urlencoding_lite(s: &str) -> String {
         s.replace('\\', "%5C")
+    }
+
+    /// The watcher's routes: status, the toggle (JSON only, like every
+    /// state-changing route), and 404s for unknown entries.
+    #[tokio::test]
+    async fn watch_status_toggle_and_entry_routes() {
+        let state = AppState::default();
+        let app = router(state.clone());
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/watch").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["available"], false);
+        assert!(body["entries"].as_array().unwrap().is_empty());
+        assert!(body["webhook"].is_null());
+
+        let put = |ct: &str, body: &'static str| {
+            Request::builder()
+                .method("PUT")
+                .uri("/api/watch")
+                .header("content-type", ct)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let res = app.clone().oneshot(put("text/plain", r#"{"enabled":true}"#)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(!state.watch.enabled().await, "a cross-site simple request switched it on");
+        let res = app.clone().oneshot(put("application/json", r#"{"enabled":true}"#)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["enabled"], true);
+        assert!(state.watch.enabled().await);
+
+        for action in ["dismiss", "retry"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/watch/w_nope/{action}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{action}");
+        }
+    }
+
+    /// The event stream opens with a snapshot and then carries changes.
+    #[tokio::test]
+    async fn watch_events_stream_a_snapshot_then_changes() {
+        let state = AppState { webhook_host: Some("https://ntfy.sh".into()), ..AppState::default() };
+        let app = router(state.clone());
+        let res = app
+            .oneshot(Request::builder().uri("/api/watch/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/event-stream"));
+        let mut body = res.into_body();
+        let mut next = async || {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+                .await
+                .expect("no event within 5 s")
+                .unwrap()
+                .unwrap();
+            String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap()
+        };
+        let first = next().await;
+        assert!(first.starts_with("event: snapshot
+"), "{first}");
+        assert!(first.contains(r#""webhook":"https://ntfy.sh""#), "{first}");
+        state.watch.set_enabled(true).await;
+        let ev = next().await;
+        assert!(ev.starts_with("event: status
+") && ev.contains(r#""enabled":true"#), "{ev}");
     }
 
     #[test]

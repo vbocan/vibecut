@@ -10,6 +10,7 @@ import type { Segment } from './types/generated/Segment';
 import type { Config } from './types/generated/Config';
 import { captionMusicLines, labelsFollowProject, projectSongPath, trackForPath } from './music';
 import { decideChange } from './changes';
+import { applyWatchEvent, reelNotification, reelTitle } from './watch';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
 
@@ -1424,6 +1425,218 @@ class AppState {
 		this.selectedSegmentIndex = null;
 		this.videoDuration = null;
 		await Promise.all([this.loadManifest(), this.loadFrames()]);
+	}
+
+	// ---------- Footage watcher ----------
+	//
+	// The server can watch the footage folder (and card mounts) and make a
+	// reel of every new trip or card by itself. This keeps its list live
+	// over the event stream, shows a toast (and a browser notification)
+	// when a reel is ready, and opens one in the Studio.
+
+	watch = $state<api.WatchStatus | null>(null);
+	watchError = $state<string | null>(null);
+	/** A watched reel that just finished: the toast offering to open it. */
+	reelReady = $state<api.WatchEntry | null>(null);
+	/** Browser notifications: what the user allowed ('unsupported' without
+	 *  the API or outside a secure context, where browsers refuse it). */
+	notifyPermission = $state<NotificationPermission | 'unsupported'>('unsupported');
+	private watchSource: EventSource | null = null;
+
+	async loadWatch() {
+		this.readNotifyPermission();
+		try {
+			this.watch = await api.getWatch();
+			this.watchError = null;
+		} catch (e) {
+			this.watchError = e instanceof api.ApiError ? e.describe() : String(e);
+		}
+	}
+
+	/** Follow the watcher's event stream (once; EventSource reconnects by
+	 *  itself and every reconnect starts with a fresh snapshot). */
+	connectWatch() {
+		if (typeof EventSource === 'undefined' || this.watchSource) return;
+		const es = api.watchEvents();
+		this.watchSource = es;
+		const data = <T>(ev: Event): T | null => {
+			try {
+				return JSON.parse((ev as MessageEvent).data) as T;
+			} catch {
+				return null;
+			}
+		};
+		es.addEventListener('snapshot', (ev) => {
+			const st = data<api.WatchStatus>(ev);
+			if (st) this.watch = st;
+		});
+		es.addEventListener('status', (ev) => {
+			const st = data<{ enabled: boolean }>(ev);
+			if (st && this.watch) this.watch = { ...this.watch, enabled: st.enabled };
+		});
+		for (const name of ['entry', 'removed', 'reel_ready'] as const) {
+			es.addEventListener(name, (ev) => {
+				const e = data<api.WatchEvent>(ev);
+				if (!e) return;
+				if (this.watch) this.watch = { ...this.watch, entries: applyWatchEvent(this.watch.entries, e) };
+				if (e.type === 'reel_ready') {
+					this.reelReady = e.entry;
+					this.notifyReel(e.entry);
+				} else if (e.type === 'entry' && (e.entry.status === 'queued' || e.entry.status === 'skipped')) {
+					// A copy just finished: the footage picker can offer it too.
+					void this.loadFootage();
+				} else if (e.type === 'removed' && this.reelReady?.id === e.id) {
+					this.reelReady = null;
+				}
+			});
+		}
+	}
+
+	disconnectWatch() {
+		this.watchSource?.close();
+		this.watchSource = null;
+	}
+
+	/** The toggle. Turning it on also asks to notify this device — the
+	 *  click is the gesture browsers want for that question. */
+	async setWatchEnabled(on: boolean) {
+		if (on) void this.askNotifications();
+		try {
+			this.watch = await api.setWatch(on);
+			this.watchError = null;
+		} catch (e) {
+			this.watchError = e instanceof api.ApiError ? e.describe() : String(e);
+			this.showNotice(`Couldn't switch auto-reel ${on ? 'on' : 'off'}: ${this.watchError}`);
+		}
+	}
+
+	private readNotifyPermission() {
+		const ok = typeof Notification !== 'undefined' && typeof window !== 'undefined' && window.isSecureContext;
+		this.notifyPermission = ok ? Notification.permission : 'unsupported';
+	}
+
+	/** Ask (once) to show a notification when a watched reel is ready. */
+	async askNotifications() {
+		this.readNotifyPermission();
+		if (this.notifyPermission !== 'default') return;
+		try {
+			this.notifyPermission = await Notification.requestPermission();
+		} catch {
+			/* an old browser without the promise form: leave it */
+		}
+	}
+
+	/** A system notification while the tab is in the background; clicking
+	 *  it brings the tab back and opens the reel. */
+	private notifyReel(e: api.WatchEntry) {
+		this.readNotifyPermission();
+		if (this.notifyPermission !== 'granted' || !document.hidden) return;
+		const { title, body } = reelNotification(e);
+		try {
+			const n = new Notification(title, {
+				body,
+				tag: `vibecut-${e.id}`,
+				icon: e.poster_path ? api.outputFileUrl(e.poster_path) : undefined
+			});
+			n.onclick = () => {
+				window.focus();
+				n.close();
+				void this.openWatched(e);
+			};
+		} catch {
+			/* some mobile browsers only notify from a service worker: the toast is there */
+		}
+	}
+
+	async dismissWatched(id: string) {
+		try {
+			await api.dismissWatched(id);
+			if (this.watch) this.watch = { ...this.watch, entries: this.watch.entries.filter((e) => e.id !== id) };
+			if (this.reelReady?.id === id) this.reelReady = null;
+		} catch (e) {
+			this.showNotice(`Couldn't dismiss it: ${e instanceof api.ApiError ? e.describe() : String(e)}`);
+		}
+	}
+
+	async retryWatched(id: string) {
+		try {
+			const entry = await api.retryWatched(id);
+			if (this.watch)
+				this.watch = { ...this.watch, entries: applyWatchEvent(this.watch.entries, { type: 'entry', entry }) };
+		} catch (e) {
+			this.showNotice(`Couldn't try again: ${e instanceof api.ApiError ? e.describe() : String(e)}`);
+		}
+	}
+
+	/**
+	 * Open a watched reel in the Studio as the current project: its
+	 * proposal becomes the project, the reel its first version — tweak,
+	 * re-render and share it like any other. `target` may be just the id
+	 * (a notification or a `?watch=` link).
+	 */
+	async openWatched(target: api.WatchEntry | string): Promise<boolean> {
+		let e = typeof target === 'string' ? (this.watch?.entries.find((x) => x.id === target) ?? null) : target;
+		if (!e && typeof target === 'string') {
+			try {
+				e = (await api.getWatch()).entries.find((x) => x.id === target) ?? null;
+			} catch {
+				e = null;
+			}
+		}
+		const proposal = e?.proposal;
+		const render = e?.render;
+		if (!e || e.status !== 'done' || !proposal || !render) {
+			this.showNotice("That reel isn't available any more.");
+			return false;
+		}
+		if (this.rendering) {
+			this.showNotice('A render is running — open the new reel once it has finished, or stop it first.');
+			return false;
+		}
+		if (this.reelReady?.id === e.id) this.reelReady = null;
+		const file = render.version_path ?? render.output_path;
+		if (this.proposeResult?.config_path === proposal.config_path) {
+			const i = this.renderHistory.findIndex((v) => v.output_path === file);
+			if (i >= 0) {
+				await this.openVersion(i);
+				return true;
+			}
+		} else if (
+			this.renderHistory.length > 0 &&
+			!confirm(
+				`Open “${reelTitle(e)}”? The video you're working on stays saved in your output folder, but its versions leave the Studio.`
+			)
+		) {
+			return false;
+		}
+		let toml: string;
+		try {
+			toml = (await api.readConfig(proposal.config_path)).config_toml;
+		} catch (err) {
+			this.showNotice(`Couldn't open the reel: ${err instanceof api.ApiError ? err.describe() : String(err)}`);
+			return false;
+		}
+		this.resetRender();
+		this.undo = null;
+		this.pendingChange = null;
+		this.lastChanges = [];
+		this.makeError = null;
+		this.proposeResult = { ...proposal, config_toml: toml };
+		this.proposedPickKey = '';
+		this.configToml = toml;
+		this.configDirty = false;
+		this.selectedVibe = proposal.vibe;
+		this.selectedTrackPath = null;
+		this.renderHistory = [];
+		this.compareA = null;
+		this.compareB = null;
+		await this.loadStructuredConfig();
+		this.recordRenderHistory(render);
+		await this.openVersion(0);
+		// The footage behind it, for the Studio's clip thumbnails.
+		if (this.folder !== e.folder) this.selectFolder(e.folder);
+		this.persist();
+		return true;
 	}
 
 	// ---------- Persistence ----------

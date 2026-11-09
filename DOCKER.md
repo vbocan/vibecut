@@ -68,6 +68,112 @@ env var of the same name if present; `docker run` needs `-e
 ANTHROPIC_API_KEY` as shown above). Without it, that one box returns a
 clear error — everything else in the UI works regardless.
 
+## Auto-reel: watched footage folders
+
+Plug in an SD card, or copy a trip into the footage folder, and Vibecut
+makes the reel by itself and tells you when it's ready. Off by default.
+
+**Turning it on.** `VIBECUT_WATCH=1` switches it on at start; the
+**Auto-reel** switch in the web UI's top bar switches it at runtime. The
+switch is remembered (in the state file below) and wins over
+`VIBECUT_WATCH` from then on.
+
+**What it watches.** `/footage` plus any folders in `VIBECUT_WATCH_DIRS`.
+In each of them:
+
+- every folder directly inside is one **trip** (`/footage/Alps Ski Day`);
+- every folder with a camera card's layout — a `DCIM` folder holding DCF
+  folders like `100GOPRO`, `101GOPRO` or DJI's `100MEDIA` — is one
+  **card**, whose clips under `DCIM` make the reel (the watched folder
+  itself counts too, for a card mounted straight at it).
+
+**When it renders.** Every `VIBECUT_WATCH_INTERVAL` seconds it looks
+again. A new trip or card waits ("Waiting for the copy to finish") until
+every file in it has kept the same size and time for
+`VIBECUT_WATCH_SETTLE` seconds, and while a downloader's partial file
+(`*.part`, `*.crdownload`, rsync's hidden `.GX010001.MP4.xxxxxx`) is in
+it. Then it proposes a project with what the Create screen would pick —
+the vibe from the footage (no sound anywhere: drone, high-frame-rate
+clips: action, else family), about a tenth of the footage as length
+(30–90 s), the auto-picked song — and renders it as an ordinary job,
+one at a time and only once no other render is running. The reel is
+`/projects/out/<folder>.mp4` (a card's: `<card>_<date>.mp4`), never over
+another video (`_2`, `_3`, … when the name is taken), and shows up in the
+Renders list like any render; Stop works the same way.
+
+**What it leaves alone.** The first time it runs it only takes note of
+what is already there (footage that arrives while it is switched off is
+picked up when it is switched back on). Folders that already have a project (a
+`/projects/*.toml` whose `[input].folder` is that folder) are listed as
+skipped ("Make it anyway" renders them). A trip folder is handled once;
+a card is handled once per set of clips, so the same card plugged in
+again is ignored, but brought back with new footage it makes a new reel.
+
+**State.** `/projects/.vibecut-watch.json` records every folder handled
+(and the switch), so a restart never renders a folder twice; a render
+cut short by a restart is made again, at most twice in all. Delete the
+file to start over: the next run takes a new baseline.
+
+**Notifications.** In the web UI, Create shows a **New footage found**
+list (waiting, up next, cutting with progress, ready, failed, skipped),
+and a finished reel pops a toast with its poster frame and beat score
+that opens it in the Studio — plus a browser notification when the tab
+is in the background and you allowed them (browsers only offer this on
+`https://` or `localhost`). Elsewhere: set `VIBECUT_WATCH_WEBHOOK` and
+each finished reel is POSTed there as JSON:
+
+```json
+{
+  "event": "reel_ready",
+  "id": "w3f9c…",
+  "title": "Coastline Bike Ride · 2026-11-09",
+  "message": "Your reel “Coastline Bike Ride · 2026-11-09” is ready: 30 s, 12/12 cuts on the beat.",
+  "folder": "Coastline Bike Ride",
+  "output": "/projects/out/coastline_bike_ride.mp4",
+  "output_url": "http://nas.local:8090/api/output?path=/projects/out/versions/…mp4",
+  "duration_secs": 30.03,
+  "beat_sync": { "tempo_bpm": 132.0, "n_cuts": 12, "within_tolerance": 12,
+                 "mean_abs_error_ms": 8.1, "summary": "12/12 cuts on the beat" },
+  "poster_url": "http://nas.local:8090/api/output?path=/projects/out/versions/…poster.jpg",
+  "poster_path": "/projects/out/versions/…poster.jpg",
+  "app_url": "http://nas.local:8090/?watch=w3f9c…",
+  "finished_at": "2026-11-09T10:15:00+00:00"
+}
+```
+
+The `*_url` fields need `VIBECUT_PUBLIC_URL` (the address your phone
+reaches the web UI at); without it they are `null`. `app_url` opens the
+reel in the Studio. Point it at a Home Assistant webhook trigger, an
+ntfy topic (`message` reads well as the notification text) or a small
+relay for Telegram. Only that URL is ever called: redirects are not
+followed, each POST times out after 10 s, and a failure is retried once,
+30 s later, only when there was no answer or a 5xx. Logs show the
+webhook's scheme and host, never its path or query (where tokens live).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VIBECUT_WATCH` | off | `1` / `true` / `on`: watcher on at start (the UI switch wins once used). |
+| `VIBECUT_WATCH_DIRS` | — | More folders to watch, `:`-separated, absolute (e.g. where cards are mounted). |
+| `VIBECUT_WATCH_INTERVAL` | `7` | Seconds between looks (1–600). |
+| `VIBECUT_WATCH_SETTLE` | `20` | Seconds a folder must stay unchanged before it is rendered. |
+| `VIBECUT_WATCH_VIBE` | from the footage | A fixed vibe key for watched reels. |
+| `VIBECUT_WATCH_LENGTH` | from the footage | A fixed length (`45s`, `1m30s`). |
+| `VIBECUT_WATCH_WEBHOOK` | — | http(s) URL that gets each finished reel as JSON. |
+| `VIBECUT_PUBLIC_URL` | — | Base URL for links in the webhook (`http://nas.local:8090`). |
+
+SD cards: the host mounts them, so bind-mount the host's removable-media
+folder with mount propagation, so cards inserted later appear inside the
+running container — for example
+`-v /media/$USER:/cards:ro,rslave -e VIBECUT_WATCH_DIRS=/cards`.
+
+**Routes.** `GET /api/watch` (switch, watched folders, the list),
+`PUT /api/watch` with `{"enabled": true|false}`,
+`POST /api/watch/{id}/dismiss` (a waiting or queued folder is then not
+rendered) and `POST /api/watch/{id}/retry`, both with a JSON body (`{}`),
+and `GET /api/watch/events`, a server-sent event stream: `snapshot` (the
+`GET /api/watch` body, first and after any gap), then `status`, `entry`,
+`removed` and `reel_ready`.
+
 ## Test the server in isolation
 
 Two options, both LLM-free:

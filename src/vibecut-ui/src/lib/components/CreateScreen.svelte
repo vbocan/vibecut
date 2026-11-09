@@ -5,6 +5,7 @@
 	import VibePicker from './VibePicker.svelte';
 	import SongPicker from './SongPicker.svelte';
 	import CommandBar from './CommandBar.svelte';
+	import NewFootage from './NewFootage.svelte';
 
 	// Keyboard focus scrolls clear of the fixed "Make it" dock.
 	onMount(() => {
@@ -39,6 +40,10 @@
 			cut to the music.
 		</p>
 	</header>
+
+	{#if s.watch && (s.watch.enabled || s.watch.entries.length > 0)}
+		<div class="glass act-card watch-card" class:found={s.watch.entries.length > 0}><NewFootage /></div>
+	{/if}
 
 	<div class="acts">
 		<div class="glass act-card"><TripPicker /></div>
@@ -138,6 +143,14 @@
 	.act-card {
 		padding: clamp(16px, 2.2vw, 26px);
 		animation: rise 800ms var(--ease-out) both;
+	}
+
+	.watch-card.found {
+		border-color: rgba(184, 243, 90, 0.22);
+		box-shadow:
+			var(--shadow-1),
+			0 0 0 1px rgba(184, 243, 90, 0.06),
+			0 18px 50px -24px rgba(184, 243, 90, 0.35);
 	}
 
 	.act-card:nth-child(2) {

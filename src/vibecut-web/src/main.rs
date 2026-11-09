@@ -13,7 +13,10 @@
 
 use std::net::SocketAddr;
 
+use vibecut_ops::jobs::JobRegistry;
 use vibecut_ops::logger::SessionLogger;
+use vibecut_ops::watch::{OpsReelMaker, WatchService, WatchSettings};
+use vibecut_web::webhook::Webhook;
 use vibecut_web::AppState;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -35,12 +38,35 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "0.0.0.0:8090".to_string())
         .parse()?;
 
+    // The footage watcher renders into the same job registry as the UI,
+    // so its reels show up in the Renders list and stop the same way.
+    let jobs = JobRegistry::new();
+    let watch = WatchService::new(WatchSettings::from_env(), jobs.clone());
+    let webhook = Webhook::from_env();
     let state = AppState {
         logger: SessionLogger::open("vibecut-web", env!("CARGO_PKG_VERSION")),
+        jobs: jobs.clone(),
+        watch: watch.clone(),
+        webhook_host: webhook.as_ref().map(Webhook::host),
         ..Default::default()
     };
     let app = vibecut_web::router(state);
     vibecut_ops::music::warm_up();
+    watch.spawn(OpsReelMaker {
+        jobs,
+        vibe: watch.settings().vibe.clone(),
+        target_duration: watch.settings().target_duration.clone(),
+    });
+    if let Some(hook) = webhook {
+        tracing::info!("  webhook  finished watched reels are posted to {}", hook.host());
+        hook.spawn(watch.subscribe());
+    }
+    let roots: Vec<String> = watch.settings().roots.iter().map(|r| r.display().to_string()).collect();
+    tracing::info!(
+        "  watcher  {} ({})",
+        if watch.enabled().await { "on" } else { "off" },
+        roots.join(", ")
+    );
 
     tracing::info!("vibecut-web starting on {bind_addr}");
     tracing::info!("  GET/POST http://{bind_addr}/api/*");

@@ -55,6 +55,15 @@ services:
       # clear error rather than the server failing to start.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       VIBECUT_LLM_MODEL: ${VIBECUT_LLM_MODEL:-claude-sonnet-5}
+      # Auto-reel: watch /footage (plus VIBECUT_WATCH_DIRS) and make a reel
+      # of every new trip folder or camera card. Off unless set; the web
+      # UI's switch overrides it once used. The webhook gets each finished
+      # reel as JSON; VIBECUT_PUBLIC_URL makes its links absolute. See
+      # DOCKER.md, "Auto-reel: watched footage folders".
+      VIBECUT_WATCH: ${VIBECUT_WATCH:-}
+      VIBECUT_WATCH_DIRS: ${VIBECUT_WATCH_DIRS:-}
+      VIBECUT_WATCH_WEBHOOK: ${VIBECUT_WATCH_WEBHOOK:-}
+      VIBECUT_PUBLIC_URL: ${VIBECUT_PUBLIC_URL:-}
       # Container paths of your own title-card fonts and ONNX models,
       # searched before the fonts and the Silero VAD model baked into the
       # image. They are folders on the projects mount: create

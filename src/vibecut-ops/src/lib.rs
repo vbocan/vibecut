@@ -28,3 +28,4 @@ pub mod propose;
 pub mod reformat;
 pub mod render;
 pub mod vibes;
+pub mod watch;

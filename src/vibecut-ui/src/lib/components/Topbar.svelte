@@ -34,6 +34,23 @@
 	</button>
 
 	<nav class="right" aria-label="App">
+		{#if s.watch?.available}
+			{@const on = s.watch.enabled}
+			<button
+				class="watch-switch"
+				class:on
+				type="button"
+				role="switch"
+				aria-checked={on}
+				title={on
+					? 'Watching your footage folder: new trips and camera cards become reels by themselves'
+					: 'Make a reel by itself whenever new footage lands in your footage folder'}
+				onclick={() => s.setWatchEnabled(!on)}
+			>
+				<span class="track" aria-hidden="true"><span class="knob"></span></span>
+				Auto-reel
+			</button>
+		{/if}
 		{#if s.aiAvailable}
 			<span class="pill ai" title="Free-text requests are available">
 				<span class="spark" aria-hidden="true"></span> AI on
@@ -130,6 +147,65 @@
 		border-radius: 50%;
 		background: var(--lime);
 		box-shadow: 0 0 10px var(--lime);
+	}
+
+	.watch-switch {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		padding: 6px 12px 6px 8px;
+		border-radius: 999px;
+		border: 1px solid var(--line);
+		background: rgba(255, 255, 255, 0.04);
+		color: var(--text-dim);
+		font-size: var(--fs-xs);
+		font-weight: 700;
+		cursor: pointer;
+		transition:
+			color var(--dur-1) var(--ease-out),
+			border-color var(--dur-1) var(--ease-out);
+	}
+
+	.watch-switch:hover {
+		color: var(--text);
+		border-color: var(--line-strong);
+	}
+
+	.watch-switch.on {
+		color: var(--text);
+		border-color: rgba(184, 243, 90, 0.3);
+	}
+
+	.track {
+		position: relative;
+		width: 26px;
+		height: 15px;
+		border-radius: 999px;
+		background: rgba(255, 255, 255, 0.14);
+		transition: background var(--dur-2) var(--ease-out);
+	}
+
+	.knob {
+		position: absolute;
+		top: 2px;
+		left: 2px;
+		width: 11px;
+		height: 11px;
+		border-radius: 50%;
+		background: var(--text-dim);
+		transition:
+			transform var(--dur-2) var(--ease-spring),
+			background var(--dur-2) var(--ease-out);
+	}
+
+	.on .track {
+		background: rgba(184, 243, 90, 0.35);
+	}
+
+	.on .knob {
+		transform: translateX(11px);
+		background: var(--lime);
+		box-shadow: 0 0 8px var(--lime);
 	}
 
 	@media (max-width: 560px) {

@@ -538,3 +538,95 @@ export interface SessionFileInfo {
 export function listSessions(): Promise<{ sessions: SessionFileInfo[] }> {
 	return getJson('/sessions');
 }
+
+// ---------- footage watcher ----------
+//
+// Mirrors /api/watch*: the watcher turns new footage folders and camera
+// cards into reels by itself (see vibecut_ops::watch).
+
+/** Where a watched folder is. */
+export type WatchState = 'waiting' | 'queued' | 'rendering' | 'done' | 'failed' | 'stopped' | 'skipped';
+
+/** The proposal a watched reel was made from (the propose result
+ *  without its TOML), plus the title and length the watcher chose. */
+export type WatchProposal = Omit<ProposeResult, 'config_toml'> & {
+	title?: string;
+	target_duration?: string;
+};
+
+/** One folder or card the watcher found. */
+export interface WatchEntry {
+	id: string;
+	/** The trip folder, or the card's root. */
+	path: string;
+	/** What discover / propose take (relative to /footage when inside it). */
+	folder: string;
+	kind: 'folder' | 'card';
+	name: string;
+	content_id: string;
+	status: WatchState | 'baseline';
+	/** Why it is waiting, skipped or failed. */
+	note: string | null;
+	n_videos: number;
+	total_bytes: number;
+	found_at: string;
+	updated_at: string;
+	attempts: number;
+	job_id: string | null;
+	/** 0..1 while rendering. */
+	progress: number | null;
+	stage: string | null;
+	proposal: WatchProposal | null;
+	/** The finished render (same body as a done render job). */
+	render: RenderResult | null;
+	poster_path: string | null;
+	dismissed: boolean;
+}
+
+export interface WatchStatus {
+	enabled: boolean;
+	/** A watched folder exists (else there is nothing to switch on). */
+	available: boolean;
+	roots: { path: string; exists: boolean }[];
+	interval_secs: number;
+	settle_secs: number;
+	vibe: string | null;
+	target_duration: string | null;
+	/** Where finished reels are posted (scheme and host only), or null. */
+	webhook: string | null;
+	/** Newest first; never the folders that were there before watching began. */
+	entries: WatchEntry[];
+}
+
+/** What `GET /api/watch/events` sends after its first `snapshot`. */
+export type WatchEvent =
+	| { type: 'status'; enabled: boolean }
+	| { type: 'entry'; entry: WatchEntry }
+	| { type: 'removed'; id: string }
+	| { type: 'reel_ready'; entry: WatchEntry };
+
+export function getWatch(): Promise<WatchStatus> {
+	return getJson('/watch');
+}
+
+/** Switch the watcher on or off (remembered by the server). */
+export function setWatch(enabled: boolean): Promise<WatchStatus> {
+	return sendJson('/watch', { enabled }, 'PUT');
+}
+
+/** Take a folder off the list; a waiting or queued one is then not rendered. */
+export function dismissWatched(id: string): Promise<WatchEntry> {
+	return sendJson(`/watch/${encodeURIComponent(id)}/dismiss`, {});
+}
+
+/** Queue a failed, stopped or skipped folder again. */
+export function retryWatched(id: string): Promise<WatchEntry> {
+	return sendJson(`/watch/${encodeURIComponent(id)}/retry`, {});
+}
+
+/** The live feed: `snapshot` (a `WatchStatus`) on every (re)connect, then
+ *  `status`, `entry`, `removed` and `reel_ready` events. EventSource
+ *  reconnects by itself. */
+export function watchEvents(): EventSource {
+	return new EventSource(`${BASE}/watch/events`);
+}

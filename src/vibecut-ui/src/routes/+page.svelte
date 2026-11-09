@@ -7,6 +7,9 @@
 	import StudioScreen from '$lib/components/StudioScreen.svelte';
 	import ProDrawer from '$lib/components/ProDrawer.svelte';
 	import UndoToast from '$lib/components/UndoToast.svelte';
+	import ReelToast from '$lib/components/ReelToast.svelte';
+	import { deepLinkId } from '$lib/watch';
+	import { replaceState } from '$app/navigation';
 	import { prefersReducedMotion } from '$lib/motion';
 	import { focusTransient } from '$lib/focus';
 
@@ -27,12 +30,28 @@
 		void s.loadFootage();
 		void s.loadMusic();
 		void s.loadSessions();
-		void s.restore();
+		const restored = s.restore();
+		// The footage watcher: its list, live, and "reel ready" toasts. A
+		// webhook's `?watch=<id>` link opens that reel once the session is back.
+		void s.loadWatch();
+		s.connectWatch();
+		const watchId = deepLinkId(location.search);
+		if (watchId) {
+			try {
+				replaceState(location.pathname, {});
+			} catch {
+				/* the link just stays in the address bar */
+			}
+			void restored.then(() => s.openWatched(watchId));
+		}
 		const seen = () => {
 			if (!document.hidden) unseenReady = false;
 		};
 		document.addEventListener('visibilitychange', seen);
-		return () => document.removeEventListener('visibilitychange', seen);
+		return () => {
+			document.removeEventListener('visibilitychange', seen);
+			s.disconnectWatch();
+		};
 	});
 
 	// Three screens, chosen by where the flow is:
@@ -138,6 +157,7 @@
 
 <ProDrawer bind:open={proOpen} />
 <UndoToast />
+<ReelToast />
 
 <style>
 	/* Focused only as a reading position (skip link, screen changes). */
