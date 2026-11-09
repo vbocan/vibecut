@@ -608,51 +608,20 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         Vec::new()
     };
 
-    // Pre-compute intro/outro/xfade durations (the rendering happens later
-    // but the durations are known up front and feed into K computation).
-    let intro_dur: f32 = cfg.intro.as_ref().map(|i| i.duration.as_secs_f32()).unwrap_or(0.0);
-    let outro_dur: f32 = cfg.outro.as_ref().map(|o| o.duration.as_secs_f32()).unwrap_or(0.0);
+    // Pre-compute the intro/outro/xfade durations that add length (the
+    // rendering happens later but the durations are known up front and
+    // feed into K computation). Only a card in card mode joins the chain;
+    // an overlay card is drawn on the first / last clip and adds nothing,
+    // so counting it left overlay-card projects short of their target.
+    let (intro_dur, outro_dur) = chain_cards_secs(cfg);
     let trans_dur: f32 = cfg.transition.duration.as_secs_f32();
-    let use_transitions = (intro_dur > 0.0 || outro_dur > 0.0 || trans_dur > 0.0)
-        && cfg.transition.default != "cut"
-        && cfg.transition.default != "none";
-
-    // Compute K so the FINAL output duration ≈ target_duration.
-    // Output = K × clip_len + intro + outro − (K + n_endcaps − 1) × xfade
-    //        = K × (clip_len − xfade) + intro + outro − (n_endcaps − 1) × xfade
-    // Solve for K:
-    //   K = (target − intro − outro + (n_endcaps − 1) × xfade) / (clip_len − xfade)
-    // Then we pass `K × clip_len` to select_multi_source (which will divide
-    // it back out the same way to get K). This collapses to K = target / clip_len
-    // when there are no intro/outro/xfade contributions.
-    let intro_p: f64 = if intro_dur > 0.0 { 1.0 } else { 0.0 };
-    let outro_p: f64 = if outro_dur > 0.0 { 1.0 } else { 0.0 };
-    let xfade = if use_transitions { trans_dur as f64 } else { 0.0 };
-    let n_endcaps = intro_p + outro_p;
+    let xfade = if cfg.transition.hard_cut() { 0.0 } else { trans_dur as f64 };
     // Subtract image segment durations from the picker's budget so the total
     // output length stays close to `target_duration` even with images added.
     let video_target = (target - image_total_dur).max(clip_len);
-    // With beat-locked cuts (see the beat-lock pass below), each clip runs on
-    // through half of each crossfade so the span between its cuts is its
-    // full planned length; the crossfades no longer eat into the cut, so:
-    //   Output ≈ intro + K × clip_len + outro
     let beat_locked = cfg.soundtrack.as_ref().is_some_and(|s| s.beat_align)
         && audio.as_ref().is_some_and(|a| a.tempo_bpm > 0.0 && !a.beats.is_empty());
-    let inflated_target = if beat_locked {
-        ((video_target - intro_dur as f64 - outro_dur as f64) / clip_len)
-            .round()
-            .max(1.0)
-            * clip_len
-    } else if (clip_len - xfade) > 1e-3 {
-        let k_for_output = ((video_target - intro_dur as f64 - outro_dur as f64
-            + (n_endcaps - 1.0).max(0.0) * xfade)
-            / (clip_len - xfade))
-            .round()
-            .max(1.0);
-        k_for_output * clip_len
-    } else {
-        video_target
-    };
+    let inflated_target = picker_budget(video_target, clip_len, intro_dur, outro_dur, xfade, beat_locked);
     // Apply [[selection.source_weights]] BEFORE excludes.
     // Last-write-wins on duplicate source_ids; weight is clamped to
     // [0, 10]. weight = 0 effectively drops the source from picks
@@ -2611,6 +2580,126 @@ mod font_wiring_tests {
     }
 }
 
+
+/// The lengths the intro and outro cards add to the output: their
+/// [`chain_card_secs`], 0 for an overlay card or none.
+fn chain_cards_secs(cfg: &Config) -> (f64, f64) {
+    (
+        chain_card_secs(cfg.intro.as_ref()).unwrap_or(0.0),
+        chain_card_secs(cfg.outro.as_ref()).unwrap_or(0.0),
+    )
+}
+
+/// The footage budget handed to the picker (`K × clip_len`), with K chosen
+/// so the FINAL output lands near `video_target`:
+///
+/// * crossfaded chain: Output = K × clip_len + intro + outro − (K + n − 1) × xfade,
+///   n = the cards in the chain, so
+///   K = (target − intro − outro + (n − 1) × xfade) / (clip_len − xfade);
+/// * beat-locked cuts (see the beat-lock pass): each clip runs on through
+///   half of each crossfade, so the span between its cuts is its full
+///   planned length and Output ≈ intro + K × clip_len + outro.
+///
+/// `intro` / `outro` are what the cards add ([`chain_cards_secs`]): 0 for an
+/// overlay card. This collapses to K = target / clip_len with no cards and
+/// no crossfades.
+fn picker_budget(
+    video_target: f64,
+    clip_len: f64,
+    intro: f64,
+    outro: f64,
+    xfade: f64,
+    beat_locked: bool,
+) -> f64 {
+    let n_endcaps = f64::from(u8::from(intro > 0.0) + u8::from(outro > 0.0));
+    if beat_locked {
+        ((video_target - intro - outro) / clip_len).round().max(1.0) * clip_len
+    } else if (clip_len - xfade) > 1e-3 {
+        let k = ((video_target - intro - outro + (n_endcaps - 1.0).max(0.0) * xfade) / (clip_len - xfade))
+            .round()
+            .max(1.0);
+        k * clip_len
+    } else {
+        video_target
+    }
+}
+
+#[cfg(test)]
+mod picker_budget_tests {
+    use super::*;
+
+    fn cfg_with_cards(mode: &str) -> Config {
+        let toml = format!(
+            "schema_version = 1
+             [project]
+name = \"x\"
+target_duration = \"30s\"
+fps = 30
+             [input]
+folder = \".\"
+             [[outputs]]
+path = \"out/a.mp4\"
+resolution = \"1920x1080\"
+             [intro]
+mode = \"{mode}\"
+duration = \"3s\"
+             [[intro.layers]]
+kind = \"text\"
+content = \"Hi\"
+             [outro]
+mode = \"{mode}\"
+duration = \"2s\"
+             [[outro.layers]]
+kind = \"text\"
+content = \"Bye\"
+"
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    /// What the chain renders from a budget: K clips, the cards, minus
+    /// the crossfades (or, beat-locked, the cards plus K full clips).
+    fn output_secs(budget: f64, clip: f64, intro: f64, outro: f64, xfade: f64, beat_locked: bool) -> f64 {
+        let k = (budget / clip).round();
+        if beat_locked {
+            return intro + k * clip + outro;
+        }
+        let n = f64::from(u8::from(intro > 0.0) + u8::from(outro > 0.0));
+        k * clip + intro + outro - (k + n - 1.0) * xfade
+    }
+
+    #[test]
+    fn overlay_cards_add_no_length_so_they_take_none_of_the_budget() {
+        let overlay = cfg_with_cards("overlay");
+        assert_eq!(chain_cards_secs(&overlay), (0.0, 0.0));
+        let card = cfg_with_cards("card");
+        assert_eq!(chain_cards_secs(&card), (3.0, 2.0));
+        let (target, clip) = (30.0, 3.0);
+        for (xfade, beat_locked) in [(0.4, false), (0.0, false), (0.4, true)] {
+            for cfg in [&overlay, &card] {
+                let (i, o) = chain_cards_secs(cfg);
+                let budget = picker_budget(target, clip, i, o, xfade, beat_locked);
+                let out = output_secs(budget, clip, i, o, xfade, beat_locked);
+                assert!(
+                    (out - target).abs() <= clip / 2.0 + xfade,
+                    "{:?} xfade={xfade} locked={beat_locked}: budget {budget} renders {out:.2}s for a {target}s target",
+                    cfg.intro.as_ref().unwrap().mode
+                );
+            }
+            // Overlay: the same footage as with no cards at all.
+            assert_eq!(
+                picker_budget(target, clip, 0.0, 0.0, xfade, beat_locked),
+                picker_budget(target, clip, chain_cards_secs(&overlay).0, chain_cards_secs(&overlay).1, xfade, beat_locked)
+            );
+        }
+        // The old count (cards' durations whatever their mode) came out short
+        // with overlays: 8 beat-locked clips = 24 s of a 30 s target.
+        let short = picker_budget(target, clip, 3.0, 2.0, 0.4, true);
+        assert!(output_secs(short, clip, 0.0, 0.0, 0.4, true) < target - clip);
+    }
+}
 
 /// Length of an intro/outro card as its own concat input, or `None` when it
 /// doesn't join the chain: an overlay card is drawn on the footage. A card
