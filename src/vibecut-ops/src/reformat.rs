@@ -6,7 +6,9 @@
 //! The version lands next to the source as `<stem>.<preset>.mp4`
 //! (`<stem>.<preset>-<fit>.mp4` for a non-default fit), so the output
 //! file route serves it like any render. A version that is newer than its
-//! source is reused instead of being made again.
+//! source is reused instead of being made again. Asked to reformat a
+//! version (`<stem>.square.mp4`), it works from the render next to it
+//! (`vibecut::output_format::reformat_source`).
 //!
 //! [`submit_async`] runs it as a job in the shared [`JobRegistry`] —
 //! poll it like a render (`render_status`, the WebSocket feed); the
@@ -17,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use vibecut::output_format::{manifest_card_windows, Fit, OutputPreset, ReformatOptions};
+use vibecut::output_format::{manifest_card_windows, reformat_source, Fit, OutputPreset, ReformatOptions};
 pub use vibecut::output_format::version_path;
 use vibecut::progress::{Progress, Stage};
 
@@ -73,6 +75,9 @@ pub fn prepare(output_path: &str, preset: &str, fit: Option<&str>) -> Result<Ref
     if !source.is_file() {
         return Err(OpsError::not_found_with("video", source.to_string_lossy().into_owned()));
     }
+    // A version (`reel.square.mp4`) is made over from its render, never
+    // reframed again into the render's own `<stem>.<preset>.mp4`.
+    let source = reformat_source(&source);
     let target = version_path(&source, preset, fit);
     Ok(ReformatTarget { source, target, preset, fit })
 }
@@ -264,6 +269,30 @@ mod tests {
         let manifest = d.join("reel.manifest.json");
         std::fs::write(&manifest, b"{}").unwrap();
         assert!(matches!(prepare(&manifest.to_string_lossy(), "reels", None), Err(OpsError::InvalidInput { .. })));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_version_of_a_version_is_made_from_the_render() {
+        let d = tmp("nested");
+        std::fs::write(d.join("coast.mp4"), b"render").unwrap();
+        std::fs::write(d.join("coast.square.mp4"), b"square").unwrap();
+        std::fs::write(d.join("coast.reels-crop.mp4"), b"crop").unwrap();
+        // "Now make the square one vertical too": made from the render, into
+        // the render's reels slot — the version a request from the render
+        // reuses, so it must hold the render's picture.
+        let t = prepare(&d.join("coast.square.mp4").to_string_lossy(), "reels", None).unwrap();
+        assert_eq!((t.source.clone(), t.target.clone()), (d.join("coast.mp4"), d.join("coast.reels.mp4")));
+        assert_eq!(t, prepare(&d.join("coast.mp4").to_string_lossy(), "reels", None).unwrap());
+        // A crop version asked for as a blur reel: from the render, not a
+        // same-shape stream copy of the crop.
+        let t = prepare(&d.join("coast.reels-crop.mp4").to_string_lossy(), "reels", None).unwrap();
+        assert_eq!(t.source, d.join("coast.mp4"));
+        // Render gone: the version is the source, and the result keeps its
+        // whole stem instead of taking `coast.reels.mp4`.
+        std::fs::remove_file(d.join("coast.mp4")).unwrap();
+        let t = prepare(&d.join("coast.square.mp4").to_string_lossy(), "reels", None).unwrap();
+        assert_eq!((t.source, t.target), (d.join("coast.square.mp4"), d.join("coast.square.reels.mp4")));
         let _ = std::fs::remove_dir_all(&d);
     }
 

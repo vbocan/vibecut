@@ -184,18 +184,47 @@ pub const DEFAULT_RESOLUTION: (u32, u32) = (1920, 1080);
 pub const DEFAULT_CRF: u32 = 20;
 pub const DEFAULT_AUDIO_BITRATE: &str = "192k";
 
-/// Encoder preset names `preset` used to hold before it named platforms
-/// (libx264/x265, NVENC, QSV, AMF). Still accepted there, as an
-/// `encoder_preset`, so older configs keep loading.
-const ENCODER_PRESET_NAMES: &[&str] = &[
+/// `-preset` names libx264 and libx265 take.
+const X26X_PRESETS: &[&str] = &[
     "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower",
-    "veryslow", "placebo", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "default", "hp", "hq",
-    "bd", "ll", "llhq", "llhp", "lossless", "losslesshp", "speed", "balanced", "quality",
+    "veryslow", "placebo",
 ];
+/// `-preset` names h264_nvenc and hevc_nvenc take.
+const NVENC_PRESETS: &[&str] = &[
+    "p1", "p2", "p3", "p4", "p5", "p6", "p7", "default", "slow", "medium", "fast", "hp", "hq",
+    "bd", "ll", "llhq", "llhp", "lossless", "losslesshp",
+];
+/// `-quality` names h264_amf takes.
+const AMF_PRESETS: &[&str] = &["speed", "balanced", "quality"];
+/// `-preset` names h264_qsv takes.
+const QSV_PRESETS: &[&str] = &["veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
 
+/// The preset names `encoder` takes (its `-preset`, or AMF's `-quality`).
+fn encoder_presets(encoder: EncoderChoice) -> &'static [&'static str] {
+    match encoder {
+        EncoderChoice::Libx264 | EncoderChoice::Libx265 => X26X_PRESETS,
+        EncoderChoice::H264Nvenc | EncoderChoice::HevcNvenc => NVENC_PRESETS,
+        EncoderChoice::H264Amf => AMF_PRESETS,
+        EncoderChoice::H264Qsv => QSV_PRESETS,
+    }
+}
+
+/// Whether `encoder` takes `name` as its preset. A name for another
+/// encoder (`p5` on libx264, `veryfast` on NVENC) makes ffmpeg fail the
+/// pass, and `encoder = "auto"` only settles the encoder at render time.
+pub fn encoder_accepts_preset(encoder: EncoderChoice, name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    encoder_presets(encoder).contains(&name.as_str())
+}
+
+/// An encoder preset name for any encoder — what `preset` held before it
+/// named platforms. Still accepted there, as an `encoder_preset`, so older
+/// configs keep loading.
 pub fn is_encoder_preset_name(s: &str) -> bool {
     let s = s.trim().to_ascii_lowercase();
-    ENCODER_PRESET_NAMES.contains(&s.as_str())
+    [X26X_PRESETS, NVENC_PRESETS, AMF_PRESETS, QSV_PRESETS]
+        .iter()
+        .any(|names| names.contains(&s.as_str()))
 }
 
 /// One output with every preset default and override applied.
@@ -334,7 +363,10 @@ pub fn same_aspect(a: (u32, u32), b: (u32, u32)) -> bool {
 /// The body's render resolution: the largest master-shaped output (no
 /// preset, `master`, `youtube`), ties going to the first. When every
 /// output is a derived shape (vertical, square), a 16:9 master as tall as
-/// the largest output's short side.
+/// the largest output's short side, but never smaller than
+/// [`DEFAULT_RESOLUTION`]: card text sizes are absolute pixels, set for a
+/// 1080p frame, so a smaller body (1280x720 for a WhatsApp-only project)
+/// would cut a title off before the reframe ever sees it.
 pub fn body_resolution(outs: &[ResolvedOutput]) -> (u32, u32) {
     let mut best: Option<(u32, u32)> = None;
     let mut best_pixels = 0u64;
@@ -349,7 +381,10 @@ pub fn body_resolution(outs: &[ResolvedOutput]) -> (u32, u32) {
         return b;
     }
     match outs.iter().map(|o| o.width.min(o.height)).max() {
-        Some(short) => (even((short * 16).div_ceil(9)), even(short)),
+        Some(short) => {
+            let short = short.max(DEFAULT_RESOLUTION.1);
+            (even((short * 16).div_ceil(9)), even(short))
+        }
         None => (0, 0),
     }
 }
@@ -663,7 +698,11 @@ pub fn reframe_graph(
 
 /// Video encoder args for an output's own pass: the encoder's quality
 /// settings from `hw`, with the encoder preset swapped in and a peak
-/// bitrate cap applied, when given.
+/// bitrate cap applied, when given. An encoder preset the resolved
+/// encoder doesn't take ([`encoder_accepts_preset`]) is skipped with a
+/// warning, keeping that encoder's default: configs that never had their
+/// preset applied (`preset = "p5"` with `encoder = "auto"`, rendered on a
+/// machine without NVENC) must keep rendering.
 pub fn output_encode_args(
     hw: &HwConfig,
     crf: u32,
@@ -672,9 +711,17 @@ pub fn output_encode_args(
 ) -> Vec<String> {
     let mut a = hw.encode_args(crf);
     if let Some(p) = encoder_preset.map(str::trim).filter(|p| !p.is_empty()) {
-        let key = if hw.encoder == EncoderChoice::H264Amf { "-quality" } else { "-preset" };
-        if let Some(i) = a.iter().position(|x| x == key) {
-            a[i + 1] = p.to_string();
+        if encoder_accepts_preset(hw.encoder, p) {
+            let key = if hw.encoder == EncoderChoice::H264Amf { "-quality" } else { "-preset" };
+            if let Some(i) = a.iter().position(|x| x == key) {
+                a[i + 1] = p.to_ascii_lowercase();
+            }
+        } else {
+            tracing::warn!(
+                "encoder preset {p:?} is not one {} takes (one of: {}); using its default",
+                hw.encoder.name(),
+                encoder_presets(hw.encoder).join(", ")
+            );
         }
     }
     if let Some(cap) = max_bitrate.filter(|&c| c > 0) {
@@ -885,16 +932,44 @@ pub struct ReformatOutcome {
 }
 
 /// Where a platform version of `source` goes: `<stem>.<preset>.mp4` next
-/// to it, `<stem>.<preset>-<fit>.mp4` for a non-default fit. A source that
-/// already is a version (`reel.reels.mp4`) names its versions from the
-/// base stem (`reel.square.mp4`).
+/// to it, `<stem>.<preset>-<fit>.mp4` for a non-default fit. Callers pass
+/// [`reformat_source`]'s path, so a version's versions come from its
+/// render (`reel.square.mp4` → `reel.mp4` → `reel.reels.mp4`). A version
+/// whose render is gone keeps its whole stem (`reel.square.reels.mp4`): a
+/// reframe of a reframe never takes the render's own `reel.reels.mp4`,
+/// which a later request from the render would reuse as fresh.
 pub fn version_path(source: &Path, preset: OutputPreset, fit: Option<Fit>) -> PathBuf {
-    let base = version_base_stem(source).unwrap_or_else(|| file_stem(source));
     let fit_tag = match fit {
         Some(f) if f != Fit::default() => format!("-{}", f.name()),
         _ => String::new(),
     };
-    source.with_file_name(format!("{base}.{}{fit_tag}.mp4", preset.name()))
+    source.with_file_name(format!("{}.{}{fit_tag}.mp4", file_stem(source), preset.name()))
+}
+
+/// Containers a render (and so a version's source) can be.
+const RENDER_EXTS: &[&str] = &["mp4", "m4v", "mov"];
+
+/// The render a platform version of `source` is made from. A version
+/// (`reel.square.mp4`, `reel.reels-crop.mp4`) is already reframed, so when
+/// its render (`reel.mp4`) sits next to it, that render is the source —
+/// a vertical version of a square one would otherwise carry two layers of
+/// fill bands, and a same-shape request would copy the wrong fit. Without
+/// the render, `source` itself.
+pub fn reformat_source(source: &Path) -> PathBuf {
+    let mut src = source.to_path_buf();
+    while let Some(base) = version_base_stem(&src) {
+        let own_ext = src.extension().map(|e| e.to_string_lossy().into_owned());
+        let render = own_ext
+            .into_iter()
+            .chain(RENDER_EXTS.iter().map(|e| e.to_string()))
+            .map(|ext| src.with_file_name(format!("{base}.{ext}")))
+            .find(|p| p.is_file());
+        match render {
+            Some(r) => src = r,
+            None => break,
+        }
+    }
+    src
 }
 
 fn file_stem(source: &Path) -> String {
@@ -914,15 +989,17 @@ pub fn version_base_stem(source: &Path) -> Option<String> {
 }
 
 /// The title spans `source`'s manifest recorded (`card_windows`), for
-/// [`ReformatOptions::card_windows`]. A version (`reel.reels.mp4`) has the
-/// same timeline as its render, so it reads that render's manifest. Empty
-/// when there's no manifest.
+/// [`ReformatOptions::card_windows`]. A version (`reel.reels.mp4`, or
+/// `reel.square.reels.mp4`) has the same timeline as its render, so it
+/// reads that render's manifest. Empty when there's no manifest.
 pub fn manifest_card_windows(source: &Path) -> Vec<[f64; 2]> {
-    let own = source.with_extension("manifest.json");
-    let manifest = match version_base_stem(source) {
-        Some(base) if !own.is_file() => source.with_file_name(format!("{base}.manifest.json")),
-        _ => own,
-    };
+    let mut manifest = source.with_extension("manifest.json");
+    let mut at = source.to_path_buf();
+    while !manifest.is_file() {
+        let Some(base) = version_base_stem(&at) else { break };
+        at = at.with_file_name(format!("{base}.mp4"));
+        manifest = at.with_extension("manifest.json");
+    }
     let Ok(text) = std::fs::read_to_string(manifest) else {
         return Vec::new();
     };
@@ -1087,8 +1164,12 @@ mod tests {
         assert_eq!(body_resolution(&[r("preset = \"youtube\""), r("resolution = \"3840x2160\"")]), (3840, 2160));
         // Only derived shapes: a 16:9 master as tall as the largest short side.
         assert_eq!(body_resolution(&[r("preset = \"reels\"")]), (1920, 1080));
-        assert_eq!(body_resolution(&[r("preset = \"whatsapp\"")]), (1280, 720));
         assert_eq!(body_resolution(&[r("preset = \"whatsapp\""), r("preset = \"square\"")]), (1920, 1080));
+        assert_eq!(body_resolution(&[r("preset = \"reels\"\nresolution = \"2160x3840\"")]), (3840, 2160));
+        // ... but never below 1080p, where card text sizes are calibrated:
+        // a 1280x720 body would cut a 110 px title before the reframe.
+        assert_eq!(body_resolution(&[r("preset = \"whatsapp\"")]), (1920, 1080));
+        assert_eq!(body_resolution(&[r("preset = \"square\"\nresolution = \"640x640\"")]), (1920, 1080));
         // An explicit vertical resolution without a preset still sets the body (as before).
         assert_eq!(body_resolution(&[r("resolution = \"1080x1920\"")]), (1080, 1920));
     }
@@ -1345,6 +1426,35 @@ mod tests {
     }
 
     #[test]
+    fn encoder_presets_only_reach_an_encoder_that_takes_them() {
+        // An NVENC preset with `encoder = "auto"` on a machine without
+        // NVENC (the Docker image): libx264 keeps its own, instead of
+        // ffmpeg failing on `-preset p5`.
+        assert_eq!(output_encode_args(&sw(), 20, Some("p5"), None).join(" "), "-c:v libx264 -preset veryfast -crf 20");
+        let mut nv = sw();
+        nv.encoder = EncoderChoice::H264Nvenc;
+        assert!(output_encode_args(&nv, 20, Some("p7"), None).join(" ").contains("-preset p7"));
+        // ... and the other way round.
+        let a = output_encode_args(&nv, 20, Some("veryfast"), None).join(" ");
+        assert!(a.contains("-preset p5") && !a.contains("veryfast"), "{a}");
+        let mut amf = sw();
+        amf.encoder = EncoderChoice::H264Amf;
+        assert!(output_encode_args(&amf, 20, Some("quality"), None).join(" ").contains("-quality quality"));
+        assert!(output_encode_args(&amf, 20, Some("slow"), None).join(" ").contains("-quality balanced"));
+        let mut qsv = sw();
+        qsv.encoder = EncoderChoice::H264Qsv;
+        assert!(output_encode_args(&qsv, 20, Some("veryslow"), None).join(" ").contains("-preset veryslow"));
+        assert!(output_encode_args(&qsv, 20, Some("ultrafast"), None).join(" ").contains("-preset medium"));
+        // Case doesn't matter; the name goes to ffmpeg in its own case.
+        assert_eq!(output_encode_args(&sw(), 20, Some(" Slow "), None).join(" "), "-c:v libx264 -preset slow -crf 20");
+        // Every per-encoder name is still a legacy `preset` spelling.
+        for e in [EncoderChoice::Libx264, EncoderChoice::H264Nvenc, EncoderChoice::H264Amf, EncoderChoice::H264Qsv] {
+            assert!(encoder_presets(e).iter().all(|n| is_encoder_preset_name(n)), "{e:?}");
+        }
+        assert!(!is_encoder_preset_name("reels"));
+    }
+
+    #[test]
     fn transcode_args_map_the_graph_and_audio() {
         let a = transcode_args(
             Utf8Path::new("in.mp4"),
@@ -1388,9 +1498,17 @@ mod tests {
             v("/projects/out/versions/reel__20261109T101010_job_3.mp4", OutputPreset::Square, None),
             p("/projects/out/versions/reel__20261109T101010_job_3.square.mp4")
         );
-        // A version of a version is named from the base stem.
-        assert_eq!(v("/projects/out/reel.reels.mp4", OutputPreset::Whatsapp, None), p("/projects/out/reel.whatsapp.mp4"));
-        assert_eq!(v("/projects/out/reel.square-crop.mp4", OutputPreset::Reels, None), p("/projects/out/reel.reels.mp4"));
+        // A version made from a version (its render gone, see
+        // `reformat_source`) keeps the whole stem: it never takes the
+        // render's own `reel.reels.mp4`.
+        assert_eq!(
+            v("/projects/out/reel.reels.mp4", OutputPreset::Whatsapp, None),
+            p("/projects/out/reel.reels.whatsapp.mp4")
+        );
+        assert_eq!(
+            v("/projects/out/reel.square-crop.mp4", OutputPreset::Reels, None),
+            p("/projects/out/reel.square-crop.reels.mp4")
+        );
         // The default fit isn't spelled out; the others are.
         assert_eq!(v("/projects/out/reel.mp4", OutputPreset::Reels, Some(Fit::Blur)), p("/projects/out/reel.reels.mp4"));
         assert_eq!(v("/projects/out/reel.mp4", OutputPreset::Reels, Some(Fit::Crop)), p("/projects/out/reel.reels-crop.mp4"));
@@ -1410,7 +1528,45 @@ mod tests {
         // A version reads its render's manifest; a dotted name that isn't a
         // version doesn't.
         assert_eq!(manifest_card_windows(&d.join("reel.reels.mp4")), vec![[0.0, 3.0], [27.5, 30.0]]);
+        assert_eq!(manifest_card_windows(&d.join("reel.square.reels.mp4")), vec![[0.0, 3.0], [27.5, 30.0]]);
         assert!(manifest_card_windows(&d.join("reel.2026.mp4")).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn versions_are_made_from_the_render() {
+        let d = std::env::temp_dir().join(format!("vibecut_output_format_source_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let touch = |n: &str| std::fs::write(d.join(n), b"x").unwrap();
+        touch("coast.mp4");
+        touch("coast.square.mp4");
+        touch("coast.reels-crop.mp4");
+        touch("coast.square.whatsapp.mp4");
+        touch("trip.2026.mp4");
+        // A version's versions come from the render next to it, so a
+        // vertical version of the square one lands in the render's own
+        // slot with the render's picture (not a 9:16 blur of a 1:1 blur).
+        assert_eq!(reformat_source(&d.join("coast.square.mp4")), d.join("coast.mp4"));
+        assert_eq!(
+            version_path(&reformat_source(&d.join("coast.square.mp4")), OutputPreset::Reels, None),
+            d.join("coast.reels.mp4")
+        );
+        // A crop version asked for as reels must not stream-copy into the blur slot.
+        assert_eq!(reformat_source(&d.join("coast.reels-crop.mp4")), d.join("coast.mp4"));
+        // Down a chain of versions, too.
+        assert_eq!(reformat_source(&d.join("coast.square.whatsapp.mp4")), d.join("coast.mp4"));
+        // The render itself, and names that aren't versions, stay as they are.
+        assert_eq!(reformat_source(&d.join("coast.mp4")), d.join("coast.mp4"));
+        assert_eq!(reformat_source(&d.join("trip.2026.mp4")), d.join("trip.2026.mp4"));
+        // Render gone: the version is the source, and its versions keep its stem.
+        std::fs::remove_file(d.join("coast.mp4")).unwrap();
+        let src = reformat_source(&d.join("coast.square.mp4"));
+        assert_eq!(src, d.join("coast.square.mp4"));
+        assert_eq!(version_path(&src, OutputPreset::Reels, None), d.join("coast.square.reels.mp4"));
+        // A render in another container is found as well.
+        touch("coast.mov");
+        assert_eq!(reformat_source(&d.join("coast.square.mp4")), d.join("coast.mov"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

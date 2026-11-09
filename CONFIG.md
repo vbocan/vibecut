@@ -105,7 +105,7 @@ path           = "out/edit_4k.mp4"
 resolution     = "3840x2160"              # WIDTHxHEIGHT; optional when `preset` sets it
 encoder        = "auto"                   # auto | libx264 | libx265 | nvenc | amf | qsv
 crf            = 20                       # quality factor (-crf libx264, -cq NVENC, etc.); lower = better. Default: the preset's, else 20
-encoder_preset = "p5"                     # optional; encoder-specific (libx264: "veryfast", NVENC: "p5", …), used by this output's own encode pass
+encoder_preset = "slow"                   # optional; for this output's own encode pass, see below
 audio_bitrate  = "192k"                   # AAC bitrate. Default: the preset's, else "192k"
 
 # A second output at 1080p alongside the 4K above:
@@ -124,6 +124,16 @@ fit    = "blur"                           # blur (default) | crop | pad; only us
 `encoder = "auto"` picks the best available hardware encoder
 (NVENC > AMF > QSV > libx264) at runtime.
 
+`encoder_preset` names a preset of the encoder that actually runs:
+libx264 / libx265 `ultrafast` … `veryslow` (`placebo`), NVENC `p1` … `p7`
+(and its older `slow`, `medium`, `fast`, `hq`, …), AMF `speed`, `balanced`
+or `quality`, QSV `veryfast` … `veryslow`. Since `encoder = "auto"` only
+settles the encoder at render time, a name that encoder doesn't take (`p5`
+on a machine without NVENC, as in the Docker image) is skipped with a
+warning and the encoder keeps its default (libx264 `veryfast`, NVENC `p5`,
+AMF `balanced`, QSV `medium`). It applies to an output's own encode pass;
+a single output written straight from the body uses the default.
+
 ### Platform presets (`preset`)
 
 A `preset` fills in every key the output leaves unset; keys you set
@@ -140,7 +150,10 @@ yourself (`resolution`, `crf`, `audio_bitrate`, `max_bitrate`) always win.
 Vertical and square presets never set the body's shape. The body is the
 largest `master` / `youtube` / no-preset output; when every output is
 vertical or square, it is a 16:9 master as tall as the largest output's
-short side (1920x1080 for `reels`, 1280x720 for `whatsapp`). An explicit
+short side, and at least 1920x1080 (so 1920x1080 for `reels` and for
+`whatsapp`, 3840x2160 for a `reels` output at `resolution = "2160x3840"`):
+card text `size`s are pixels of a 1080p frame, and a smaller body would cut
+a long title off before the reframe. An explicit
 `resolution` with no platform preset sets the body as before, vertical or
 not.
 
@@ -148,7 +161,8 @@ not.
 `"none"` drops a preset's cap. A capped output always gets its own encode
 pass. Before platform presets, `preset` held the encoder preset: a value
 like `"p5"` or `"veryfast"` there still works and is read as
-`encoder_preset` (with a warning).
+`encoder_preset` (with a warning), under the same rule — skipped when the
+encoder that runs doesn't take it.
 
 **`fit`** — how a frame fills an output of a different aspect:
 
@@ -173,6 +187,10 @@ reformat out/edit.mp4 --preset reels` (optionally `--fit crop|pad`, `--out
 <path>`) writes `out/edit.reels.mp4` in one ffmpeg pass with the same
 reframe, reading `card_windows` from the render's manifest. The web UI's
 Share sheet (`POST /api/reformat`) and the MCP `reformat` tool do the same.
+Given a version instead (`out/edit.square.mp4`), it works from the render
+next to it (`out/edit.mp4`), so a vertical version of the square one is
+still one reframe of the master; if the render is gone, the result keeps
+the version's whole name (`out/edit.square.reels.mp4`).
 
 ---
 

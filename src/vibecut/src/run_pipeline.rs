@@ -2367,6 +2367,36 @@ fn direct_single_output(cfg: &Config) -> bool {
     outs.len() == 1 && !crate::output_format::needs_own_pass(cfg.body_resolution(), &outs[0])
 }
 
+#[cfg(test)]
+mod direct_output_tests {
+    use super::*;
+
+    fn cfg_with(output: &str) -> Config {
+        let cfg: Config = toml::from_str(&format!(
+            "schema_version = 1\n\
+             [project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\n\
+             [input]\nfolder = \".\"\n\
+             [[outputs]]\npath = \"out/a.mp4\"\n{output}"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    #[test]
+    fn only_a_body_shaped_single_output_skips_its_own_pass() {
+        // The body is a 16:9 master, so a lone vertical or capped output
+        // must be reframed / re-encoded, not get the body's mux as is.
+        for output in ["preset = \"reels\"", "preset = \"whatsapp\"", "preset = \"square\"",
+                       "resolution = \"1920x1080\"\nmax_bitrate = \"8M\""] {
+            assert!(!direct_single_output(&cfg_with(output)), "{output}");
+        }
+        for output in ["resolution = \"1920x1080\"", "preset = \"youtube\"", "resolution = \"3840x2160\""] {
+            assert!(direct_single_output(&cfg_with(output)), "{output}");
+        }
+    }
+}
+
 fn encoder_pref_from_cfg(e: &crate::project_config::Encoder) -> EncoderPref {
     use crate::project_config::Encoder as E;
     match e {

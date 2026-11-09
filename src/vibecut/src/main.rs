@@ -228,10 +228,19 @@ fn reformat_cmd(input: &Utf8Path, preset: &str, fit: Option<&str>, out: Option<U
     let fit = fit
         .map(|f| Fit::parse(f).with_context(|| format!("unknown fit {f:?} (blur, crop or pad)")))
         .transpose()?;
+    let utf8 = |p: std::path::PathBuf| {
+        Utf8PathBuf::from_path_buf(p).map_err(|p| anyhow::anyhow!("non-UTF-8 path: {}", p.display()))
+    };
+    // A version (`edit.square.mp4`) is made over from its render, never
+    // reframed a second time.
+    let source = utf8(of::reformat_source(input.as_std_path()))?;
+    if source != input {
+        println!("{input} is a version of {source}; working from {source}");
+    }
+    let input = source.as_path();
     let output = match out {
         Some(o) => o,
-        None => Utf8PathBuf::from_path_buf(of::version_path(input.as_std_path(), preset, fit))
-            .map_err(|p| anyhow::anyhow!("non-UTF-8 path: {}", p.display()))?,
+        None => utf8(of::version_path(input.as_std_path(), preset, fit))?,
     };
     if output == input {
         anyhow::bail!("{input} already is the {} version", preset.name());

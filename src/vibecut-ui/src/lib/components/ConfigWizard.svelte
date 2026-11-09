@@ -158,20 +158,52 @@
 		if (!outs) return;
 		const last = outs[outs.length - 1];
 		const path = last ? last.path.replace(/(\.[a-zA-Z0-9]+)?$/, `_${outs.length + 1}$1`) : `out/output_${outs.length + 1}.mp4`;
-		outs.push({
-			path,
-			resolution: last?.resolution ?? '1920x1080',
-			encoder: last?.encoder ?? 'auto',
-			crf: last?.crf ?? 20,
-			preset: last?.preset ?? null,
-			audio_bitrate: last?.audio_bitrate ?? '192k'
-		});
+		// A clone copies every key as it is, unset ones included: a platform
+		// row leaves resolution / crf / audio unset so its preset decides
+		// them, and an explicit default there would beat the preset.
+		outs.push(
+			last
+				? { ...$state.snapshot(last), path }
+				: { path, resolution: '1920x1080', encoder: 'auto', crf: 20, preset: null, audio_bitrate: '192k' }
+		);
+	}
+
+	type OutputRow = NonNullable<typeof s.configStructured>['outputs'][number];
+	// Encoder preset names `preset` held before it named platforms; the
+	// engine still reads one there as the encoder preset
+	// (output_format::is_encoder_preset_name).
+	const LEGACY_ENCODER_PRESETS = new Set([
+		'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow', 'placebo',
+		'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'default', 'hp', 'hq', 'bd', 'll', 'llhq', 'llhp', 'lossless',
+		'losslesshp', 'speed', 'balanced', 'quality'
+	]);
+	/** The encoder preset an older config keeps in `preset`, if any. */
+	function legacyEncoderPreset(out: OutputRow): string | null {
+		const p = out.preset?.trim().toLowerCase();
+		return p && LEGACY_ENCODER_PRESETS.has(p) ? p : null;
+	}
+	/** The Platform option a row's `preset` reads as: the engine treats
+	 *  tiktok / shorts as reels, `master` (and a legacy encoder preset) as
+	 *  the master. */
+	function platformValue(out: OutputRow): string {
+		const p = out.preset?.trim().toLowerCase() ?? '';
+		if (p === 'tiktok' || p === 'shorts') return 'reels';
+		if (p === 'master' || legacyEncoderPreset(out)) return '';
+		return p;
+	}
+	/** Edit the encoder preset; a legacy one in `preset` moves out of the way. */
+	function setEncoderPreset(out: OutputRow, value: string) {
+		if (legacyEncoderPreset(out)) out.preset = null;
+		out.encoder_preset = optionalString(value) ?? undefined;
 	}
 	/** Pick a platform preset (`''` = the master). A platform decides its
 	 *  own size, quality and audio unless a key is set explicitly, so
 	 *  choosing one clears those keys; back on the master, an output needs
-	 *  a resolution again. */
-	function setPlatform(out: NonNullable<typeof s.configStructured>['outputs'][number], value: string) {
+	 *  a resolution again. A legacy encoder preset in `preset` moves to
+	 *  `encoder_preset` first, so it isn't lost. */
+	function setPlatform(out: OutputRow, value: string) {
+		const legacy = legacyEncoderPreset(out);
+		if (legacy && out.encoder_preset === undefined) out.encoder_preset = legacy;
 		out.preset = value || null;
 		if (out.preset) {
 			out.resolution = null;
@@ -423,7 +455,7 @@
 								<span>Platform</span>
 								<select
 									class="text-input"
-									value={out.preset ?? ''}
+									value={platformValue(out)}
 									onchange={(e) => setPlatform(out, (e.currentTarget as HTMLSelectElement).value)}
 								>
 									<option value="">Master</option>
@@ -488,8 +520,8 @@
 								<input
 									class="text-input mono"
 									placeholder="auto"
-									value={out.encoder_preset ?? ''}
-									oninput={(e) => (out.encoder_preset = optionalString((e.target as HTMLInputElement).value) ?? undefined)}
+									value={out.encoder_preset ?? legacyEncoderPreset(out) ?? ''}
+									oninput={(e) => setEncoderPreset(out, (e.target as HTMLInputElement).value)}
 								/>
 							</label>
 						</div>

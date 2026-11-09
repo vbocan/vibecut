@@ -86,6 +86,10 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST);
         let s = post(serde_json::json!({ "output_path": "/etc/x.mp4", "preset": "reels" })).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+        // A reformat writes next to its source: a sibling of the mount
+        // that merely shares its prefix must not pass.
+        let s = post(serde_json::json!({ "output_path": "/projects_backup/clip.mp4", "preset": "reels" })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

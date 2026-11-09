@@ -134,7 +134,12 @@ pub(crate) fn is_safe_projects_path(user_path: &str) -> bool {
     // PROJECTS_ROOT to be allowed through.
     let looks_rooted = normalized.starts_with('/') || normalized.as_bytes().get(1) == Some(&b':');
     if looks_rooted {
-        return normalized.starts_with(PROJECTS_ROOT);
+        // Whole path components: "/projects-old/x.mp4" is a sibling of
+        // the mount, not inside it.
+        return normalized == PROJECTS_ROOT
+            || normalized
+                .strip_prefix(PROJECTS_ROOT)
+                .is_some_and(|rest| rest.starts_with('/'));
     }
     true
 }
@@ -165,6 +170,18 @@ mod tests {
         assert!(!is_safe_projects_path("C:/Windows/System32"));
         assert!(!is_safe_projects_path("C:\\Windows\\System32"));
         assert!(!is_safe_projects_path("D:/anything"));
+    }
+
+    #[test]
+    fn rejects_siblings_of_the_projects_mount() {
+        // A string prefix isn't a path prefix: these sit next to /projects.
+        assert!(!is_safe_projects_path("/projects-old/x.mp4"));
+        assert!(!is_safe_projects_path("/projects2/x.mp4"));
+        assert!(!is_safe_projects_path("/projectsX/a.mp4"));
+        assert!(!is_safe_projects_path("/projects_backup/clip.mp4"));
+        assert!(is_safe_projects_path("/projects"));
+        assert!(is_safe_projects_path("/projects/"));
+        assert!(is_safe_projects_path("\\projects\\out\\render.mp4"));
     }
 
     #[test]
