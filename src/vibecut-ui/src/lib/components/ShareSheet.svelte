@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
-	import { ApiError, inspectAt, outputFileUrl, reformat, reformatStatus } from '$lib/api';
-	import type { PlatformPreset, ReformatResult } from '$lib/api';
+	import { ApiError, exportTimeline, inspectAt, outputFileUrl, reformat, reformatStatus } from '$lib/api';
+	import type { PlatformPreset, ReformatResult, TimelineFormat } from '$lib/api';
+	import { saveBlob } from '$lib/download';
 	import { clock } from '$lib/vibes';
 	import { radiogroup } from '$lib/radiogroup';
 	import { cropBoxAt, fitFor, previewTime, progressLabel, reframes } from '$lib/reframe';
@@ -200,6 +201,38 @@
 
 	function megabytes(bytes: number): string {
 		return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
+	}
+
+	// Open in an editor: this version's cut as a timeline of the original
+	// clips (GET /api/export) — dissolves, ramps, title cards, the music
+	// and its beats — to finish in Final Cut, Resolve or an OTIO editor.
+	const EDITORS: { format: TimelineFormat; label: string; tag: string }[] = [
+		{ format: 'fcpxml', label: 'Final Cut / Resolve', tag: 'FCPXML' },
+		{ format: 'otio', label: 'OpenTimelineIO', tag: '.otio' }
+	];
+	let exporting = $state<TimelineFormat | null>(null);
+	let exportError = $state<string | null>(null);
+	let exported = $state<string | null>(null);
+	/** Renders from before the exact timeline was recorded can't export. */
+	const timelineMissing = $derived(!!s.manifest && !s.manifest.timeline);
+
+	async function saveTimeline(format: TimelineFormat) {
+		const path = s.outputPath;
+		if (!path || exporting) return;
+		exporting = format;
+		exportError = null;
+		exported = null;
+		try {
+			// Fetched first, so a failure reads as a message here rather
+			// than as a broken download.
+			const { blob, fileName } = await exportTimeline(path, format);
+			saveBlob(blob, fileName);
+			exported = fileName;
+		} catch (e) {
+			exportError = e instanceof ApiError ? e.describe() : String(e);
+		} finally {
+			exporting = null;
+		}
 	}
 </script>
 
@@ -404,6 +437,48 @@
 		{/if}
 	</section>
 
+	<section class="editors" aria-labelledby="editors-h">
+		<span class="eyebrow" id="editors-h">Open in an editor</span>
+		<p class="e-note">
+			The cut as a timeline of your original clips — every dissolve, speed ramp, title and beat in place — to
+			finish in Final Cut Pro, DaVinci Resolve or any editor that reads OpenTimelineIO.
+		</p>
+		<div class="e-actions">
+			{#each EDITORS as ed (ed.format)}
+				<button
+					type="button"
+					class="btn editor"
+					disabled={!s.outputPath || timelineMissing || exporting !== null}
+					aria-busy={exporting === ed.format}
+					onclick={() => saveTimeline(ed.format)}
+				>
+					<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"
+						><path
+							d="M3 6h9M3 12h18M3 18h6M15 3v6M12 15v6"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="2"
+							stroke-linecap="round"
+						/></svg
+					>
+					<span class="e-name">{exporting === ed.format ? 'Preparing…' : ed.label}</span>
+					<span class="e-tag mono">{ed.tag}</span>
+				</button>
+			{/each}
+		</div>
+		<p class="sr-only" role="status">{exported ? `Saved ${exported}` : ''}</p>
+		{#if timelineMissing}
+			<p class="e-hint">This version predates timeline export — render it again to open it in an editor.</p>
+		{:else if exportError}
+			<p class="error inline" role="alert">Couldn’t export the timeline: {exportError}</p>
+		{:else}
+			<p class="e-hint">
+				{#if exported}<span class="e-saved">Saved {exported}.</span>{' '}{/if}Clips link to your original footage; if
+				the editor asks where it is, point it at your footage folder.
+			</p>
+		{/if}
+	</section>
+
 	<div class="caption">
 		<div class="cap-head">
 			<span class="eyebrow">Caption</span>
@@ -427,7 +502,10 @@
 		background: rgba(14, 16, 23, 0.97);
 		color: var(--text);
 		box-shadow: var(--shadow-2);
-		overflow: hidden;
+		/* Taller than a laptop window: scroll inside the sheet, not past it. */
+		overflow-x: hidden;
+		overflow-y: auto;
+		overscroll-behavior: contain;
 	}
 
 	.sheet[open] {
@@ -761,6 +839,60 @@
 		margin: 0 0 6px;
 	}
 
+	.editors {
+		margin: 16px 22px 0;
+	}
+
+	.e-note {
+		margin: 6px 0 0;
+		font-size: var(--fs-sm);
+		line-height: 1.45;
+		color: var(--text-dim);
+	}
+
+	.e-actions {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 8px;
+		margin-top: 10px;
+	}
+
+	.editor {
+		justify-content: flex-start;
+		min-width: 0;
+		padding: 10px 14px;
+		border-radius: var(--r-md);
+	}
+
+	.e-name {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		text-align: left;
+	}
+
+	.e-tag {
+		font-size: var(--fs-xs);
+		font-weight: 500;
+		color: var(--text-faint);
+	}
+
+	.e-hint {
+		margin: 8px 0 0;
+		font-size: var(--fs-xs);
+		line-height: 1.45;
+		color: var(--text-faint);
+	}
+
+	.e-saved {
+		color: var(--text-dim);
+	}
+
+	.editors .error.inline {
+		margin: 8px 0 0;
+	}
+
 	@media (max-width: 480px) {
 		.platforms {
 			grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -773,6 +905,10 @@
 
 		.shot {
 			height: 96px;
+		}
+
+		.e-actions {
+			grid-template-columns: 1fr;
 		}
 	}
 

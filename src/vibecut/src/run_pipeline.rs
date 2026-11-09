@@ -2146,6 +2146,22 @@ fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) ->
         _ => None,
     };
 
+    // What a timeline export (OTIO / FCPXML) needs beyond the clips: where
+    // the music plays, exactly as the mux laid it, and the titles' text.
+    let mut timeline = timeline;
+    timeline.music = match (&audio, &cfg.soundtrack, soundtrack_layout) {
+        (Some(a), Some(snd), Some((plan, body_secs))) => Some(crate::output_timeline::TimelineMusic::from_loop_plan(
+            &plan,
+            body_secs,
+            a.duration_secs,
+            &a.beats,
+            crate::output_timeline::music_files(&snd.files, a.duration_secs),
+            snd.fade_out.as_secs_f64(),
+        )),
+        _ => None,
+    };
+    timeline.titles = crate::output_timeline::timeline_titles(cfg.intro.as_ref(), cfg.outro.as_ref(), &card_windows);
+
     // 8. Manifest.
     let manifest_path = manifest_path_for(primary_output);
     let manifest = Manifest {
@@ -2281,6 +2297,9 @@ pub struct PlanSummary {
     /// manifest.
     pub segments: Vec<Segment>,
     /// Where every clip and card will play (the manifest's `timeline`).
+    /// Its `music` and `titles` are left empty: the render fills them from
+    /// the encoded body (the music is laid out over its probed length), for
+    /// timeline exports. Everything else equals the rendered timeline.
     pub timeline: crate::output_timeline::OutputTimeline,
     /// One frame per timeline clip, for thumbnails: grab `source_path` at
     /// `t_secs` (e.g. `GET /api/frames/at`).
@@ -4417,7 +4436,13 @@ mod plan_render_tests {
         assert_eq!(json(&hooked), json(&standalone), "the render planned the same edit");
 
         let m = manifest(&done.manifest);
-        assert_eq!(m["timeline"], json(&standalone.timeline), "planned timeline = rendered timeline");
+        // The render adds the music layout and the titles' text for timeline
+        // exports (laid over the encoded body); the edit itself must match.
+        let mut rendered_edit = m["timeline"].clone();
+        let rendered_obj = rendered_edit.as_object_mut().unwrap();
+        assert!(rendered_obj.remove("music").is_some(), "the render records the music layout");
+        assert!(rendered_obj.remove("titles").is_some(), "the render records the titles");
+        assert_eq!(rendered_edit, json(&standalone.timeline), "planned timeline = rendered timeline");
         assert_eq!(m["segments"], json(&standalone.segments));
         assert!((standalone.duration_secs - m["timeline"]["duration_secs"].as_f64().unwrap()).abs() < 1e-9);
         // A final's manifest says nothing about quality (as before drafts).

@@ -128,6 +128,15 @@ form: `http://localhost:8080/`.
 | `/projects` | Generated TOMLs, rendered outputs, conversation logs. |
 | `/cache` | Persisted visual-analysis cache; speeds up re-renders. |
 
+A timeline export (Share → **Open in an editor**, `GET /api/export`; see
+CONFIG.md, "Open in another editor") points Final Cut / Resolve at the
+footage and music by path. Inside the container those are `/footage/…` and
+`/projects/…`; pass the host folders as `VIBECUT_HOST_FOOTAGE` and
+`VIBECUT_HOST_PROJECTS` (absolute paths, e.g. `-e
+VIBECUT_HOST_FOOTAGE=E:/footage`) and the exported timeline uses the host
+paths instead. `compose.yml` fills them from `VIBECUT_FOOTAGE` /
+`VIBECUT_PROJECTS` when those are absolute.
+
 `/projects/fonts` and `/projects/models` are optional drop-in folders on
 the projects mount; see below.
 
@@ -171,6 +180,7 @@ speech, set `[soundtrack].vad_speech_weight = 0`.
 |---|---|---|
 | `VIBECUT_FONTS_DIR` | `/projects/fonts` | Extra font folders (`:`-separated), searched before the system fonts. |
 | `VIBECUT_MODELS_DIR` | `/projects/models` | Extra model folders (`:`-separated), searched after `[project].models_dir` and before `/app/models`. |
+| `VIBECUT_HOST_FOOTAGE` / `VIBECUT_HOST_PROJECTS` | `$VIBECUT_FOOTAGE` / `$VIBECUT_PROJECTS` | Absolute host folders behind `/footage` and `/projects`, for the paths in a timeline export (see Volumes). |
 
 Missing folders are skipped. `compose.yml` sets both to these container
 paths itself rather than reading them from your shell, where the same
@@ -231,6 +241,7 @@ not the container's baked-in static build.
 | `apply_feedback(config_path, action)` | Mutate a TOML in response to user feedback (six action variants: scale_duration, calmer, punchier, different_music, reroll, drop_segment). |
 | `inspect_output(output_path)` | Curated 12-frame overview of a rendered mp4 as inline JPEG content. |
 | `inspect_at(output_path, timestamps)` | Frames at specific output-time positions. |
+| `export_timeline(output_path, format, fps?)` | The render's edit as a timeline for another editor — `fcpxml` (Final Cut Pro, DaVinci Resolve) or `otio` (OpenTimelineIO) — written next to the render as `<stem>.fcpxml` / `<stem>.otio`. (Web: `GET /api/export`, a download.) |
 
 Each tool returns a JSON-serialisable string (or `Content::image`
 entries for the `inspect_*` tools); the LLM client stitches them into

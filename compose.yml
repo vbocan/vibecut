@@ -64,6 +64,12 @@ services:
       # paths for native renders; change them in a compose.override.yml.
       VIBECUT_FONTS_DIR: /projects/fonts
       VIBECUT_MODELS_DIR: /projects/models
+      # The host folders behind /footage and /projects, so a timeline
+      # export (Share → Open in an editor) points Final Cut / Resolve at
+      # the files on this computer. Only absolute paths count; unset or
+      # relative, the export keeps the container paths (relink there).
+      VIBECUT_HOST_FOOTAGE: ${VIBECUT_FOOTAGE:-}
+      VIBECUT_HOST_PROJECTS: ${VIBECUT_PROJECTS:-}
 
 volumes:
   vibecut-cache:
