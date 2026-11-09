@@ -78,7 +78,7 @@ fn music_request(s: Option<&str>) -> MusicRequest<'_> {
 }
 
 /// Render `vibe` and check the pipeline would accept the result.
-fn render_checked(vibe: &vibes::Vibe, subs: &vibes::Substitutions<'_>) -> Result<(String, Config), OpsError> {
+pub(crate) fn render_checked(vibe: &vibes::Vibe, subs: &vibes::Substitutions<'_>) -> Result<(String, Config), OpsError> {
     let toml = vibe.render(subs);
     // Never write a config the pipeline would reject — same rule
     // `config_io::write_config_toml` applies to hand-edited TOML,
@@ -96,7 +96,7 @@ fn render_checked(vibe: &vibes::Vibe, subs: &vibes::Substitutions<'_>) -> Result
     Ok((toml, cfg))
 }
 
-fn get_vibe(key: &str) -> Result<&'static vibes::Vibe, OpsError> {
+pub(crate) fn get_vibe(key: &str) -> Result<&'static vibes::Vibe, OpsError> {
     vibes::get(key).ok_or_else(|| {
         OpsError::invalid_with_hint(
             format!("unknown vibe: {key:?}"),
@@ -171,7 +171,7 @@ fn decide_soundtrack(
     }
 }
 
-async fn library_tracks() -> Vec<TrackInfo> {
+pub(crate) async fn library_tracks() -> Vec<TrackInfo> {
     match music::list_tracks().await {
         Ok(t) => t,
         Err(e) => {

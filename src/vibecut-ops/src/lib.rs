@@ -26,6 +26,7 @@ pub mod music;
 pub mod paths;
 pub mod plan;
 pub mod propose;
+pub mod recipe;
 pub mod reformat;
 pub mod render;
 pub mod vibes;

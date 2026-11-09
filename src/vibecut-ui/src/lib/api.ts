@@ -586,3 +586,110 @@ export interface SessionFileInfo {
 export function listSessions(): Promise<{ sessions: SessionFileInfo[] }> {
 	return getJson('/sessions');
 }
+
+// ---------- style codes (recipes) ----------
+//
+// A style code ("VC1-…") carries a video's creative choices — vibe,
+// length, pacing, cuts, cards, song, formats — never its footage.
+
+/** One thing a style sets, in words ("Length" · "30 s"). */
+export interface StyleChip {
+	label: string;
+	value: string;
+}
+
+export interface StyleSong {
+	/** Track id (12 hex digits): the same file matches on any machine. */
+	id: string | null;
+	title: string;
+	artist: string | null;
+	bpm: number | null;
+}
+
+export type StyleMusic = { kind: 'original' } | { kind: 'auto' } | { kind: 'songs'; songs: StyleSong[] };
+
+/** A setting that differs from the vibe's own (`transition.duration` …). */
+export interface StyleSetting {
+	path: string;
+	value?: unknown;
+	remove?: boolean;
+	count?: number;
+}
+
+export interface StyleSummary {
+	vibe: string;
+	vibe_name: string;
+	/** As a config writes it ("1m 30s"). */
+	target_duration: string;
+	target_secs: number;
+	seed: number;
+	music: StyleMusic;
+	chips: StyleChip[];
+	settings: StyleSetting[];
+}
+
+/** Which song a style gets from this library, and why. */
+export interface StyleMusicMatch {
+	how: 'same_song' | 'same_title' | 'similar_tempo' | 'vibecut_pick' | 'original_sound' | 'no_music';
+	/** The files the new config uses; empty for no music. */
+	files: string[];
+	title: string | null;
+	note: string;
+}
+
+export interface StyleShare {
+	code: string;
+	chars: number;
+	style: StyleSummary;
+}
+
+export interface StylePreview {
+	code: string;
+	style: StyleSummary;
+	music_match: StyleMusicMatch;
+}
+
+/** A proposal made from a code: propose's result plus the style. */
+export interface StyleProposal extends ProposeResult {
+	code: string;
+	style: StyleSummary;
+	music_match: StyleMusicMatch;
+}
+
+export interface SavedStyle {
+	name: string;
+	code: string;
+	file: string;
+	created_at: string | null;
+	style: StyleSummary;
+}
+
+/** The style of a project's config as a code. `manifest_path`: the shown
+ *  version's, whose song credit and tempo fill in a song the library lacks. */
+export function shareStyle(args: {
+	config_path: string;
+	manifest_path?: string;
+	vibe?: string;
+	let_vibecut_pick?: boolean;
+}): Promise<StyleShare> {
+	return sendJson('/recipes/code', args);
+}
+
+/** What a code (or a saved style's name) would make, and its song here. */
+export function previewStyle(code: string): Promise<StylePreview> {
+	return getJson(`/recipes/preview?code=${encodeURIComponent(code)}`);
+}
+
+/** A proposal for `folder` in that style — then the normal render. */
+export function applyStyle(args: { code: string; folder: string; title?: string }): Promise<StyleProposal> {
+	return sendJson('/recipes/apply', args);
+}
+
+export function listStyles(): Promise<{ styles: SavedStyle[]; warnings: string[]; dir: string }> {
+	return getJson('/recipes');
+}
+
+/** Keep a code under a name (`/projects/recipes`); the same name replaces it. */
+export function saveStyle(name: string, code: string): Promise<SavedStyle> {
+	return sendJson('/recipes', { name, code });
+}

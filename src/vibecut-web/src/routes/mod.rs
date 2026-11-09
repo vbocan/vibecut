@@ -11,6 +11,7 @@ pub mod music;
 pub mod output;
 pub mod plan;
 pub mod propose;
+pub mod recipes;
 pub mod reformat;
 pub mod render;
 pub mod sessions;
@@ -32,6 +33,10 @@ pub fn api_router() -> Router<AppState> {
         .route("/footage", get(discover::list_footage))
         .route("/vibes", get(vibes::list_vibes))
         .route("/propose", post(propose::propose_vibe))
+        .route("/recipes", get(recipes::list).post(recipes::save))
+        .route("/recipes/code", post(recipes::make_code))
+        .route("/recipes/preview", get(recipes::preview))
+        .route("/recipes/apply", post(recipes::apply))
         .route(
             "/config",
             get(config::read_config).put(config::write_config),

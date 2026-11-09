@@ -14,6 +14,7 @@
 	import CuttingRoom from './CuttingRoom.svelte';
 	import BeatClock from './BeatClock.svelte';
 	import ShareSheet from './ShareSheet.svelte';
+	import StyleShare from './StyleShare.svelte';
 
 	let { onOpenPro }: { onOpenPro?: () => void } = $props();
 	let shareOpen = $state(false);
@@ -403,6 +404,8 @@
 		</div>
 
 		<div class="glass panel"><VersionsStrip /></div>
+
+		<div class="glass panel"><StyleShare /></div>
 	</aside>
 </div>
 

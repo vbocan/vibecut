@@ -5,6 +5,7 @@
 	import VibePicker from './VibePicker.svelte';
 	import SongPicker from './SongPicker.svelte';
 	import CommandBar from './CommandBar.svelte';
+	import StyleCodeCard from './StyleCodeCard.svelte';
 
 	// Keyboard focus scrolls clear of the fixed "Make it" dock.
 	onMount(() => {
@@ -13,13 +14,17 @@
 		return () => (html.style.scrollPaddingBottom = '');
 	});
 
-	const ready = $derived(!!s.folder && !!s.effectiveVibe && !s.discovering);
+	/** A style code in use decides the vibe and the song. */
+	const style = $derived(s.stylePreview);
+	const ready = $derived(!!s.folder && (!!s.effectiveVibe || !!style) && !s.discovering);
 	const vibe = $derived(s.vibes.find((v) => v.key === s.effectiveVibe));
 	const track = $derived(s.effectiveTrack);
+	const vibeName = $derived(style ? style.style.vibe_name : vibe?.name);
+	const songTitle = $derived(style ? style.music_match.title : track?.title);
 	const trip = $derived(s.footage.find((f) => f.folder === s.folder)?.name ?? s.folder);
 
 	const missing = $derived(
-		!s.folder ? 'Pick your footage' : s.discovering ? 'Reading your clips…' : !s.effectiveVibe ? 'Choose a vibe' : ''
+		!s.folder ? 'Pick your footage' : s.discovering ? 'Reading your clips…' : !s.effectiveVibe && !style ? 'Choose a vibe' : ''
 	);
 
 	function make() {
@@ -50,18 +55,22 @@
 		<CommandBar />
 	</div>
 
+	<div class="glass act-card style-card">
+		<StyleCodeCard />
+	</div>
+
 	<div class="make-dock" class:ready>
 		<!-- Not live: it repeats each choice, which the focused control has
 		     already announced. Only becoming ready is news. -->
 		<p class="sr-only" role="status">{ready ? 'Ready to make your video.' : ''}</p>
 		<div class="summary">
 			{#if ready}
-				<span class="eyebrow">Ready</span>
+				<span class="eyebrow">{style ? 'Ready · style code' : 'Ready'}</span>
 				<span class="line">
 					<strong>{trip}</strong>
 					<span class="sep">·</span>
-					<strong>{vibe?.name}</strong>
-					{#if track}<span class="sep">·</span> <span class="serif">♪ {track.title}</span>{/if}
+					<strong>{vibeName}</strong>
+					{#if songTitle}<span class="sep">·</span> <span class="serif">♪ {songTitle}</span>{/if}
 				</span>
 			{:else}
 				<span class="eyebrow">Next</span>

@@ -1,0 +1,548 @@
+{
+  "action_highlight": {
+    "grading": {
+      "stabilize": false
+    },
+    "intro": {
+      "bg_color": "#0a0a0a",
+      "duration": "3s",
+      "fade_in": "300ms",
+      "fade_out": "300ms",
+      "layers": [
+        {
+          "appear_at": null,
+          "background": null,
+          "color": "#FFFFFF",
+          "content": "{title}",
+          "disappear_at": null,
+          "fade_in": null,
+          "fade_out": null,
+          "font": null,
+          "kind": "text",
+          "position": "center",
+          "size": 110,
+          "x_offset": 0,
+          "y_offset": 0
+        }
+      ],
+      "mode": "card"
+    },
+    "multi_angle": {
+      "enabled": false,
+      "min_hold": "1s 500ms",
+      "sync": "auto"
+    },
+    "outputs": [
+      {
+        "audio_bitrate": "192k",
+        "crf": 20,
+        "preset": null,
+        "resolution": "1920x1080"
+      }
+    ],
+    "outro": null,
+    "project": {
+      "fade_in": "200ms",
+      "fade_out": "1s 500ms",
+      "fps": 30,
+      "seed": 42,
+      "target_duration": "1m 30s"
+    },
+    "scoring": {
+      "accel_peaks": 0.6000000238418579,
+      "diversity_per_source": 0.5,
+      "exposure_floor": 0.15000000596046448,
+      "faces": 0.30000001192092896,
+      "gps_speed": 0.4000000059604645,
+      "hilight_tags": 1.0,
+      "motion_peaks": 0.30000001192092896,
+      "sharpness_floor": 0.20000000298023224
+    },
+    "selection": {
+      "max_clip": "4s",
+      "max_per_source": null,
+      "min_clip": "1s 500ms",
+      "order": "energy_arc",
+      "variety": 0.10000000149011612
+    },
+    "soundtrack": {
+      "beat_align": true,
+      "beat_burst": "auto",
+      "beat_burst_max_beats": 12,
+      "beat_burst_min_beats": 8,
+      "duck_count": 2,
+      "duck_max_dur": "7s",
+      "duck_min_dur": "4s",
+      "duck_min_spacing": "4s",
+      "duck_ramp": "300ms",
+      "ducking_db": -20.0,
+      "energy_drives_pacing": true,
+      "fade_out": "2s",
+      "vad_speech_weight": 1.5
+    },
+    "transition": {
+      "default": "fade",
+      "duration": "300ms",
+      "palette": [],
+      "speed_ramp_duration": "2s",
+      "speed_ramp_factor": 3.0,
+      "speed_ramp_flash": true,
+      "speed_ramp_probability": 0.699999988079071
+    }
+  },
+  "documentary": {
+    "grading": {
+      "stabilize": false
+    },
+    "intro": {
+      "bg_color": "#000000",
+      "duration": "5s",
+      "fade_in": "800ms",
+      "fade_out": "800ms",
+      "layers": [
+        {
+          "appear_at": null,
+          "background": null,
+          "color": "#EEEEEE",
+          "content": "{title}",
+          "disappear_at": null,
+          "fade_in": null,
+          "fade_out": null,
+          "font": null,
+          "kind": "text",
+          "position": "center",
+          "size": 84,
+          "x_offset": 0,
+          "y_offset": 0
+        }
+      ],
+      "mode": "card"
+    },
+    "multi_angle": {
+      "enabled": false,
+      "min_hold": "1s 500ms",
+      "sync": "auto"
+    },
+    "outputs": [
+      {
+        "audio_bitrate": "192k",
+        "crf": 20,
+        "preset": null,
+        "resolution": "1920x1080"
+      }
+    ],
+    "outro": null,
+    "project": {
+      "fade_in": "600ms",
+      "fade_out": "2s 500ms",
+      "fps": 30,
+      "seed": 42,
+      "target_duration": "5m"
+    },
+    "scoring": {
+      "accel_peaks": 0.6000000238418579,
+      "diversity_per_source": 0.5,
+      "exposure_floor": 0.15000000596046448,
+      "faces": 0.30000001192092896,
+      "gps_speed": 0.4000000059604645,
+      "hilight_tags": 1.0,
+      "motion_peaks": 0.30000001192092896,
+      "sharpness_floor": 0.20000000298023224
+    },
+    "selection": {
+      "max_clip": "8s",
+      "max_per_source": null,
+      "min_clip": "3s",
+      "order": "chronological",
+      "variety": 0.0
+    },
+    "soundtrack": {
+      "beat_align": true,
+      "beat_burst": "off",
+      "beat_burst_max_beats": 12,
+      "beat_burst_min_beats": 8,
+      "duck_count": 8,
+      "duck_max_dur": "12s",
+      "duck_min_dur": "4s",
+      "duck_min_spacing": "4s",
+      "duck_ramp": "300ms",
+      "ducking_db": -20.0,
+      "energy_drives_pacing": true,
+      "fade_out": "3s 500ms",
+      "vad_speech_weight": 2.5
+    },
+    "transition": {
+      "default": "fade",
+      "duration": "800ms",
+      "palette": [],
+      "speed_ramp_duration": "350ms",
+      "speed_ramp_factor": 2.5,
+      "speed_ramp_flash": true,
+      "speed_ramp_probability": 0.0
+    }
+  },
+  "drone_cinematic": {
+    "grading": {
+      "stabilize": false
+    },
+    "intro": {
+      "bg_color": "#000000",
+      "duration": "5s",
+      "fade_in": "700ms",
+      "fade_out": "700ms",
+      "layers": [
+        {
+          "appear_at": null,
+          "background": null,
+          "color": "#FFFFFF",
+          "content": "{title}",
+          "disappear_at": null,
+          "fade_in": null,
+          "fade_out": null,
+          "font": null,
+          "kind": "text",
+          "position": "center",
+          "size": 110,
+          "x_offset": 0,
+          "y_offset": 0
+        }
+      ],
+      "mode": "card"
+    },
+    "multi_angle": {
+      "enabled": false,
+      "min_hold": "1s 500ms",
+      "sync": "auto"
+    },
+    "outputs": [
+      {
+        "audio_bitrate": "192k",
+        "crf": 20,
+        "preset": null,
+        "resolution": "1920x1080"
+      }
+    ],
+    "outro": null,
+    "project": {
+      "fade_in": "500ms",
+      "fade_out": "6s",
+      "fps": 30,
+      "seed": 42,
+      "target_duration": "2m"
+    },
+    "scoring": {
+      "accel_peaks": 0.6000000238418579,
+      "diversity_per_source": 0.5,
+      "exposure_floor": 0.15000000596046448,
+      "faces": 0.30000001192092896,
+      "gps_speed": 0.4000000059604645,
+      "hilight_tags": 1.0,
+      "motion_peaks": 0.30000001192092896,
+      "sharpness_floor": 0.20000000298023224
+    },
+    "selection": {
+      "max_clip": "8s",
+      "max_per_source": null,
+      "min_clip": "3s",
+      "order": "energy_arc",
+      "variety": 0.20000000298023224
+    },
+    "soundtrack": {
+      "beat_align": true,
+      "beat_burst": "off",
+      "beat_burst_max_beats": 12,
+      "beat_burst_min_beats": 8,
+      "duck_count": 0,
+      "duck_max_dur": "7s",
+      "duck_min_dur": "4s",
+      "duck_min_spacing": "4s",
+      "duck_ramp": "300ms",
+      "ducking_db": -18.0,
+      "energy_drives_pacing": true,
+      "fade_out": "6s",
+      "vad_speech_weight": 1.5
+    },
+    "transition": {
+      "default": "fade",
+      "duration": "600ms",
+      "palette": [],
+      "speed_ramp_duration": "350ms",
+      "speed_ramp_factor": 2.5,
+      "speed_ramp_flash": true,
+      "speed_ramp_probability": 0.0
+    }
+  },
+  "family_chronicle": {
+    "grading": {
+      "stabilize": false
+    },
+    "intro": {
+      "bg_color": "#0a1628",
+      "duration": "5s",
+      "fade_in": "700ms",
+      "fade_out": "600ms",
+      "layers": [
+        {
+          "appear_at": null,
+          "background": null,
+          "color": "#F5E6C8",
+          "content": "{title}",
+          "disappear_at": null,
+          "fade_in": null,
+          "fade_out": null,
+          "font": null,
+          "kind": "text",
+          "position": "center",
+          "size": 90,
+          "x_offset": 0,
+          "y_offset": 0
+        }
+      ],
+      "mode": "card"
+    },
+    "multi_angle": {
+      "enabled": false,
+      "min_hold": "1s 500ms",
+      "sync": "auto"
+    },
+    "outputs": [
+      {
+        "audio_bitrate": "192k",
+        "crf": 20,
+        "preset": null,
+        "resolution": "1920x1080"
+      }
+    ],
+    "outro": null,
+    "project": {
+      "fade_in": "500ms",
+      "fade_out": "2s",
+      "fps": 30,
+      "seed": 42,
+      "target_duration": "5m"
+    },
+    "scoring": {
+      "accel_peaks": 0.6000000238418579,
+      "diversity_per_source": 0.5,
+      "exposure_floor": 0.15000000596046448,
+      "faces": 0.30000001192092896,
+      "gps_speed": 0.4000000059604645,
+      "hilight_tags": 1.0,
+      "motion_peaks": 0.30000001192092896,
+      "sharpness_floor": 0.20000000298023224
+    },
+    "selection": {
+      "max_clip": "7s",
+      "max_per_source": null,
+      "min_clip": "3s",
+      "order": "chronological",
+      "variety": 0.05000000074505806
+    },
+    "soundtrack": {
+      "beat_align": true,
+      "beat_burst": "auto",
+      "beat_burst_max_beats": 12,
+      "beat_burst_min_beats": 8,
+      "duck_count": 4,
+      "duck_max_dur": "10s",
+      "duck_min_dur": "5s",
+      "duck_min_spacing": "4s",
+      "duck_ramp": "300ms",
+      "ducking_db": -16.0,
+      "energy_drives_pacing": true,
+      "fade_out": "3s",
+      "vad_speech_weight": 1.5
+    },
+    "transition": {
+      "default": "fade",
+      "duration": "700ms",
+      "palette": [],
+      "speed_ramp_duration": "350ms",
+      "speed_ramp_factor": 2.5,
+      "speed_ramp_flash": true,
+      "speed_ramp_probability": 0.0
+    }
+  },
+  "kid_reel": {
+    "grading": {
+      "stabilize": false
+    },
+    "intro": {
+      "bg_color": "#1c1c2e",
+      "duration": "4s",
+      "fade_in": "500ms",
+      "fade_out": "500ms",
+      "layers": [
+        {
+          "appear_at": null,
+          "background": null,
+          "color": "#FFE0A0",
+          "content": "{title}",
+          "disappear_at": null,
+          "fade_in": null,
+          "fade_out": null,
+          "font": null,
+          "kind": "text",
+          "position": "center",
+          "size": 100,
+          "x_offset": 0,
+          "y_offset": 0
+        }
+      ],
+      "mode": "card"
+    },
+    "multi_angle": {
+      "enabled": false,
+      "min_hold": "1s 500ms",
+      "sync": "auto"
+    },
+    "outputs": [
+      {
+        "audio_bitrate": "192k",
+        "crf": 20,
+        "preset": null,
+        "resolution": "1920x1080"
+      }
+    ],
+    "outro": null,
+    "project": {
+      "fade_in": "300ms",
+      "fade_out": "1s 500ms",
+      "fps": 30,
+      "seed": 42,
+      "target_duration": "3m"
+    },
+    "scoring": {
+      "accel_peaks": 0.6000000238418579,
+      "diversity_per_source": 0.5,
+      "exposure_floor": 0.15000000596046448,
+      "faces": 0.30000001192092896,
+      "gps_speed": 0.4000000059604645,
+      "hilight_tags": 1.0,
+      "motion_peaks": 0.30000001192092896,
+      "sharpness_floor": 0.20000000298023224
+    },
+    "selection": {
+      "max_clip": "5s",
+      "max_per_source": null,
+      "min_clip": "2s",
+      "order": "energy_arc",
+      "variety": 0.15000000596046448
+    },
+    "soundtrack": {
+      "beat_align": true,
+      "beat_burst": "auto",
+      "beat_burst_max_beats": 12,
+      "beat_burst_min_beats": 8,
+      "duck_count": 3,
+      "duck_max_dur": "7s",
+      "duck_min_dur": "4s",
+      "duck_min_spacing": "4s",
+      "duck_ramp": "300ms",
+      "ducking_db": -18.0,
+      "energy_drives_pacing": true,
+      "fade_out": "3s",
+      "vad_speech_weight": 1.5
+    },
+    "transition": {
+      "default": "fade",
+      "duration": "400ms",
+      "palette": [],
+      "speed_ramp_duration": "2s 500ms",
+      "speed_ramp_factor": 3.0,
+      "speed_ramp_flash": true,
+      "speed_ramp_probability": 0.5
+    }
+  },
+  "memory_keeper": {
+    "grading": {
+      "stabilize": false
+    },
+    "intro": {
+      "bg_color": "#142028",
+      "duration": "6s",
+      "fade_in": "800ms",
+      "fade_out": "800ms",
+      "layers": [
+        {
+          "appear_at": null,
+          "background": null,
+          "color": "#F0E4C8",
+          "content": "{title}",
+          "disappear_at": null,
+          "fade_in": null,
+          "fade_out": null,
+          "font": null,
+          "kind": "text",
+          "position": "center",
+          "size": 96,
+          "x_offset": 0,
+          "y_offset": 0
+        }
+      ],
+      "mode": "card"
+    },
+    "multi_angle": {
+      "enabled": false,
+      "min_hold": "1s 500ms",
+      "sync": "auto"
+    },
+    "outputs": [
+      {
+        "audio_bitrate": "192k",
+        "crf": 20,
+        "preset": null,
+        "resolution": "1920x1080"
+      }
+    ],
+    "outro": null,
+    "project": {
+      "fade_in": "800ms",
+      "fade_out": "4s",
+      "fps": 30,
+      "seed": 42,
+      "target_duration": "8m"
+    },
+    "scoring": {
+      "accel_peaks": 0.6000000238418579,
+      "diversity_per_source": 0.5,
+      "exposure_floor": 0.15000000596046448,
+      "faces": 0.30000001192092896,
+      "gps_speed": 0.4000000059604645,
+      "hilight_tags": 1.0,
+      "motion_peaks": 0.30000001192092896,
+      "sharpness_floor": 0.20000000298023224
+    },
+    "selection": {
+      "max_clip": "8s",
+      "max_per_source": 5,
+      "min_clip": "3s",
+      "order": "chronological",
+      "variety": 0.0
+    },
+    "soundtrack": {
+      "beat_align": true,
+      "beat_burst": "off",
+      "beat_burst_max_beats": 12,
+      "beat_burst_min_beats": 8,
+      "duck_count": 2,
+      "duck_max_dur": "12s",
+      "duck_min_dur": "5s",
+      "duck_min_spacing": "1m",
+      "duck_ramp": "300ms",
+      "ducking_db": -18.0,
+      "energy_drives_pacing": true,
+      "fade_out": "5s",
+      "vad_speech_weight": 1.5
+    },
+    "transition": {
+      "default": "fade",
+      "duration": "800ms",
+      "palette": [],
+      "speed_ramp_duration": "350ms",
+      "speed_ramp_factor": 2.5,
+      "speed_ramp_flash": true,
+      "speed_ramp_probability": 0.0
+    }
+  }
+}
