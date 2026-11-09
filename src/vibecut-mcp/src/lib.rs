@@ -48,8 +48,8 @@ impl Default for VibecutMcpServer {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DiscoverArgs {
     /// Folder name relative to the container's `/footage` mount, or an
-    /// absolute container path. Pass `""` (or omit) to scan the whole
-    /// `/footage` mount.
+    /// absolute path under `/footage` or `/projects`. Pass `""` (or
+    /// omit) to scan the whole `/footage` mount.
     #[serde(default)]
     pub folder: String,
 }
@@ -474,7 +474,7 @@ impl VibecutMcpServer {
     /// Render a TOML config to an mp4. Blocking; takes 1–10 minutes.
     /// Returns the output path, manifest summary (segment count, actual
     /// vs target duration), and a status. Runs the pipeline in-process
-    /// through `vibecut::run_pipeline::run_cmd` via `vibecut-ops`
+    /// through `vibecut::run_pipeline::run_config` via `vibecut-ops`
     /// — no subprocess, no stdout-parse fragility.
     #[tool(description = "Run the vibecut pipeline on a TOML config. Blocking; takes 1-10 minutes. Returns output path, manifest summary, and exit status. Use `render_async` if you'd rather not wait.")]
     async fn render(

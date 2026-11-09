@@ -41,9 +41,24 @@ pub fn run_cmd(
     print_effective_config: bool,
     random_seed: bool,
 ) -> Result<()> {
-    let mut cfg = Config::load(config_path)
+    let cfg = Config::load(config_path)
         .with_context(|| format!("loading config {config_path}"))?;
+    run_config(cfg, dry_run, no_visual, no_cache, explain, print_effective_config, random_seed)
+}
 
+/// [`run_cmd`] for a config the caller has already loaded. The server
+/// (`vibecut-ops`) checks every path in a config before rendering it,
+/// so it must run the value it checked rather than re-read a file that
+/// may have changed in between.
+pub fn run_config(
+    mut cfg: Config,
+    dry_run: bool,
+    no_visual: bool,
+    no_cache: bool,
+    explain: bool,
+    print_effective_config: bool,
+    random_seed: bool,
+) -> Result<()> {
     // `--random-seed` overrides whatever seed the TOML had (or didn't have)
     // with a fresh value derived from the system clock + a SplitMix64 mix.
     // The seed lands in the manifest, so the user can lock it back in via
@@ -2245,7 +2260,9 @@ fn generate_random_seed() -> u64 {
     crate::rng::splitmix64(nanos.wrapping_add(crate::rng::GOLDEN_RATIO_64))
 }
 
-fn manifest_path_for(output: &Utf8Path) -> Utf8PathBuf {
+/// Where a render writes the manifest for `output` (its first
+/// `[[outputs]]` entry): `<stem>.manifest.json` beside it.
+pub fn manifest_path_for(output: &Utf8Path) -> Utf8PathBuf {
     let parent = output.parent().unwrap_or(Utf8Path::new("."));
     let stem = output.file_stem().unwrap_or("output");
     parent.join(format!("{stem}.manifest.json"))

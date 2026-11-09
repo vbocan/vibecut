@@ -18,7 +18,6 @@
 //! a `[[selection.exclude]]` mechanism on the picker side that doesn't
 //! exist yet.
 
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -30,7 +29,7 @@ use vibecut::project_config::{
 };
 
 use crate::error::OpsError;
-use crate::paths::{ensure_toml_extension, resolve_under, PROJECTS_ROOT};
+use crate::paths::{confine_config_path, ensure_toml_extension, resolve_under, ConfigRoots};
 
 /// One discrete pattern of feedback. Each variant is a self-contained
 /// deterministic mutation against a [`Config`]; the LLM picks the
@@ -393,6 +392,25 @@ fn apply_different_music(cfg: &mut Config, new_path: &str) -> Result<Vec<ChangeN
     Ok(notes)
 }
 
+/// The manifest a previous render of `cfg` left beside its first
+/// output: `<output>.manifest.json` if that exists, else
+/// `<stem>.manifest.json`, the name `run_pipeline` writes.
+fn derived_manifest_path(cfg: &Config) -> Result<std::path::PathBuf> {
+    let out = cfg
+        .outputs
+        .first()
+        .ok_or_else(|| anyhow!("config has no [[outputs]] entry"))?;
+    // Append ".manifest.json" to the basename. We don't use
+    // `.with_extension()` because it would replace `.mp4`.
+    let mut s = out.path.as_std_path().as_os_str().to_os_string();
+    s.push(".manifest.json");
+    let p = std::path::PathBuf::from(&s);
+    if p.exists() {
+        return Ok(p);
+    }
+    Ok(vibecut::run_pipeline::manifest_path_for(&out.path).into_std_path_buf())
+}
+
 fn apply_drop_segment(
     cfg: &mut Config,
     at_seconds: f32,
@@ -403,35 +421,11 @@ fn apply_drop_segment(
             "at_seconds must be a non-negative finite number; got {at_seconds}"
         ));
     }
-    // Resolve the manifest path. Either explicit, or derived from
-    // the config's first output: `<output_path>.manifest.json` —
-    // matching the convention `manifest_path_for` uses in run_pipeline.
+    // Resolve the manifest path: explicit, or derived from the
+    // config's first output.
     let manifest_path = match explicit_manifest_path {
         Some(p) => std::path::PathBuf::from(p),
-        None => {
-            let out = cfg
-                .outputs
-                .first()
-                .ok_or_else(|| anyhow!("config has no [[outputs]] entry"))?;
-            let mut p = out.path.as_std_path().to_path_buf();
-            // Append ".manifest.json" to the basename. We don't use
-            // `.with_extension()` because it would replace `.mp4`.
-            let mut s = p.as_os_str().to_os_string();
-            s.push(".manifest.json");
-            p = std::path::PathBuf::from(&s);
-            // Fallback: try `<stem>.manifest.json` (the convention
-            // vibecut actually uses when there's a single output).
-            if !p.exists() {
-                if let Some(stem) = out.path.file_stem() {
-                    if let Some(parent) = out.path.parent() {
-                        p = parent
-                            .as_std_path()
-                            .join(format!("{stem}.manifest.json"));
-                    }
-                }
-            }
-            p
-        }
+        None => derived_manifest_path(cfg)?,
     };
 
     let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|e| {
@@ -609,20 +603,22 @@ pub struct ApplyFeedbackResult {
 /// round-trip themselves.
 ///
 /// `config_path` is confined to `/projects` and must be a `.toml`
-/// (this writes to it), and so is a drop-segment's explicit
-/// `manifest_path` — both arrive from unauthenticated callers.
+/// (this writes to it), and so is a drop-segment's manifest — the
+/// explicit `manifest_path` from the caller, or the one derived from
+/// the config's first output, which the config's author chose.
 pub async fn apply_feedback_to_file(
     config_path: &str,
     action: &FeedbackAction,
 ) -> Result<ApplyFeedbackResult, OpsError> {
-    apply_feedback_to_file_in(Path::new(PROJECTS_ROOT), config_path, action).await
+    apply_feedback_to_file_in(&ConfigRoots::mounts()?, config_path, action).await
 }
 
 async fn apply_feedback_to_file_in(
-    root: &Path,
+    roots: &ConfigRoots,
     config_path: &str,
     action: &FeedbackAction,
 ) -> Result<ApplyFeedbackResult, OpsError> {
+    let root = roots.projects.as_path();
     let cfg_path = resolve_under(root, config_path)?;
     ensure_toml_extension(&cfg_path)?;
 
@@ -652,6 +648,32 @@ async fn apply_feedback_to_file_in(
 
     let mut cfg = Config::load(&cfg_camino)
         .map_err(|e| OpsError::internal(format!("could not load config: {e:#}")))?;
+
+    // A derived manifest path comes from the config's contents, so it
+    // resolves the way the pipeline wrote it (relative to the cwd) and
+    // must still sit under /projects.
+    let derived;
+    let action = match action {
+        FeedbackAction::DropSegment {
+            at_seconds,
+            manifest_path: None,
+        } => {
+            let p = derived_manifest_path(&cfg)
+                .map_err(|e| OpsError::invalid(format!("feedback action failed: {e:#}")))?;
+            let p = confine_config_path(
+                "the manifest for outputs[0].path",
+                &p.to_string_lossy(),
+                &[root],
+                &roots.cwd,
+            )?;
+            derived = FeedbackAction::DropSegment {
+                at_seconds: *at_seconds,
+                manifest_path: Some(p.to_string_lossy().into_owned()),
+            };
+            &derived
+        }
+        other => other,
+    };
 
     let notes = apply(&mut cfg, action)
         .map_err(|e| OpsError::invalid(format!("feedback action failed: {e:#}")))?;
@@ -1151,10 +1173,20 @@ stabilize = false
         dir
     }
 
+    /// `root` as `/projects` and as the working directory.
+    fn roots_at(root: &std::path::Path) -> ConfigRoots {
+        ConfigRoots {
+            footage: root.join("footage"),
+            projects: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+        }
+    }
+
     #[tokio::test]
     async fn file_level_feedback_is_confined_to_the_root() {
         let root = temp_root("root");
         let outside = temp_root("outside");
+        let roots = roots_at(&root);
         let original = toml::to_string_pretty(&base_config()).unwrap();
         std::fs::write(root.join("cfg.toml"), &original).unwrap();
         std::fs::write(root.join("cfg.json"), &original).unwrap();
@@ -1169,7 +1201,7 @@ stabilize = false
             format!("..\\{outside_name}\\cfg.toml"),
             "cfg.json".to_string(),
         ] {
-            let r = apply_feedback_to_file_in(&root, &p, &FeedbackAction::Calmer).await;
+            let r = apply_feedback_to_file_in(&roots, &p, &FeedbackAction::Calmer).await;
             assert!(
                 matches!(r, Err(OpsError::InvalidInput { .. })),
                 "{p:?} should be rejected, got {r:?}"
@@ -1183,7 +1215,7 @@ stabilize = false
                 at_seconds: 1.0,
                 manifest_path: Some(m.to_string()),
             };
-            let r = apply_feedback_to_file_in(&root, "cfg.toml", &action).await;
+            let r = apply_feedback_to_file_in(&roots, "cfg.toml", &action).await;
             assert!(
                 matches!(r, Err(OpsError::InvalidInput { .. })),
                 "manifest {m:?} should be rejected, got {r:?}"
@@ -1192,10 +1224,62 @@ stabilize = false
         assert_eq!(std::fs::read_to_string(root.join("cfg.toml")).unwrap(), original);
 
         // The same call on a config inside the root goes through.
-        let r = apply_feedback_to_file_in(&root, "cfg.toml", &FeedbackAction::Calmer)
+        let r = apply_feedback_to_file_in(&roots, "cfg.toml", &FeedbackAction::Calmer)
             .await
             .expect("a config under the root should accept feedback");
         assert_eq!(std::path::PathBuf::from(r.config_path), root.join("cfg.toml"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Without an explicit `manifest_path`, drop-segment reads the
+    /// manifest beside the config's first output — a path the config's
+    /// author chose, so it gets the same confinement.
+    #[tokio::test]
+    async fn derived_drop_segment_manifest_is_confined_to_the_root() {
+        let root = temp_root("derived_root");
+        let outside = temp_root("derived_outside");
+        let roots = roots_at(&root);
+        let manifest = serde_json::json!({
+            "segments": [
+                { "chapter_path": "/footage/GH010023.MP4",
+                  "in_chapter_start_secs": 10.0,
+                  "duration_secs": 4.0 },
+            ],
+        })
+        .to_string();
+        let drop_at_one = FeedbackAction::DropSegment {
+            at_seconds: 1.0,
+            manifest_path: None,
+        };
+
+        // Output (and so its manifest) outside the root: refused, and
+        // the config is left alone.
+        std::fs::write(outside.join("x.manifest.json"), &manifest).unwrap();
+        let mut cfg = base_config();
+        cfg.outputs[0].path = Utf8PathBuf::from_path_buf(outside.join("x.mp4")).unwrap();
+        let original = toml::to_string_pretty(&cfg).unwrap();
+        std::fs::write(root.join("cfg.toml"), &original).unwrap();
+        let r = apply_feedback_to_file_in(&roots, "cfg.toml", &drop_at_one).await;
+        match r {
+            Err(OpsError::InvalidInput { message, .. }) => {
+                assert!(message.contains("manifest"), "{message}")
+            }
+            other => panic!("a manifest outside the root should be refused, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(root.join("cfg.toml")).unwrap(), original);
+
+        // Output under the root (relative, so against the cwd): read.
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("out").join("x.manifest.json"), &manifest).unwrap();
+        cfg.outputs[0].path = "out/x.mp4".into();
+        std::fs::write(root.join("cfg.toml"), toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        let r = apply_feedback_to_file_in(&roots, "cfg.toml", &drop_at_one)
+            .await
+            .expect("a manifest under the root should be read");
+        assert_eq!(r.changes.len(), 1);
+        assert_eq!(r.changes[0].field, "selection.exclude");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);

@@ -7,7 +7,7 @@
 //! fire-and-fetch model:
 //!
 //! 1. `render_async(config_path)` returns a `job_id` immediately.
-//! 2. A background task drives `vibecut::run_pipeline::run_cmd`.
+//! 2. A background task drives `vibecut::run_pipeline::run_config`.
 //! 3. `render_status(job_id)` returns the current state (queued /
 //!    running / done / failed) and, when done, the same manifest
 //!    summary the synchronous `render` returns.

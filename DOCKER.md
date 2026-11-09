@@ -128,6 +128,19 @@ form: `http://localhost:8080/`.
 | `/projects` | Generated TOMLs, rendered outputs, conversation logs. |
 | `/cache` | Persisted visual-analysis cache; speeds up re-renders. |
 
+The servers keep every path inside these mounts. Paths passed to a
+tool or endpoint (config, output and manifest paths) must be under
+`/projects`; footage folders under `/footage` (relative names) or
+`/projects`. A config rendered by the server must write under
+`/projects` (`[[outputs]].path`, `[project].temp_dir`) and read from
+`/footage` or `/projects` (input folder and files, soundtrack, intro
+and outro images, LUT, `models_dir`); fonts may also come from
+`/usr/share/fonts`. Anything else is refused with a 400 naming the
+setting. Use absolute paths inside a config: the pipeline opens a
+relative path against the server's working directory (`/` in the
+image), not the config's folder, so `out/final.mp4` would mean
+`/out/final.mp4` and is refused. The `vibecut` CLI is not restricted.
+
 ## CPU-only fallback
 
 Drop `--gpus all` from the docker invocation. The pipeline detects the

@@ -123,6 +123,37 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("not found"));
     }
 
+    /// `GET /api/sources?folder=/` used to list media files anywhere
+    /// in the container; footage folders now stay in the mounts.
+    #[tokio::test]
+    async fn footage_folders_outside_the_mounts_are_400() {
+        let app = router(AppState::default());
+        for folder in ["%2F", "%2Fetc", "..%2Fetc", "..%5Cetc", "%2Ffootage%2F..%2Fetc"] {
+            let uri = format!("/api/sources?folder={folder}");
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/propose")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "folder": "/etc", "vibe": "kid_reel" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn render_status_unknown_job_is_404() {
         let app = router(AppState::default());
