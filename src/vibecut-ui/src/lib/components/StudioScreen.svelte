@@ -155,6 +155,22 @@
 		if (video) video.currentTime = t;
 		currentTime = t;
 	}
+
+	// The shortcuts list is a small non-modal dialog: focus moves into it
+	// when it opens and, when it closes from inside, goes back to
+	// whatever had it before (the Shortcuts button, or wherever "?" was
+	// pressed).
+	let helpEl: HTMLDivElement | undefined = $state();
+	$effect(() => {
+		const el = helpEl;
+		if (!helpOpen || !el) return;
+		const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		el.querySelector<HTMLElement>('button')?.focus();
+		return () => {
+			const at = document.activeElement;
+			if (opener?.isConnected && (!at || at === document.body || el.contains(at))) opener.focus();
+		};
+	});
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -162,7 +178,20 @@
 <ShareSheet bind:open={shareOpen} {title} {fileName} />
 
 {#if helpOpen}
-	<div class="help glass" role="dialog" aria-label="Keyboard shortcuts">
+	<div
+		class="help glass"
+		role="dialog"
+		aria-label="Keyboard shortcuts"
+		tabindex="-1"
+		bind:this={helpEl}
+		onkeydown={(e) => {
+			// Also from the checkbox, where the page shortcuts stand aside.
+			if (e.key === 'Escape') {
+				e.stopPropagation();
+				helpOpen = false;
+			}
+		}}
+	>
 		<div class="help-head">
 			<strong>Keyboard shortcuts</strong>
 			<button class="btn ghost small" type="button" onclick={() => (helpOpen = false)}>Close</button>
@@ -188,7 +217,7 @@
 				<h1>{title}</h1>
 			</div>
 			<div class="head-actions">
-				<button class="btn ghost small" type="button" aria-pressed={helpOpen} onclick={() => (helpOpen = !helpOpen)}
+				<button class="btn ghost small" type="button" aria-haspopup="dialog" aria-expanded={helpOpen} onclick={() => (helpOpen = !helpOpen)}
 					>Shortcuts <kbd>?</kbd></button
 				>
 				{#if s.outputPath}
@@ -214,7 +243,7 @@
 			<Player bind:currentTime bind:video />
 			{#if beat && !rerendering && beat.n_cuts > 0}
 				{@const pctOn = Math.round((beat.within_tolerance / beat.n_cuts) * 100)}
-				<div class="stamp" aria-label="{pctOn}% of cuts on the beat at {Math.round(beat.tempo_bpm)} BPM">
+				<div class="stamp" role="img" aria-label="{pctOn}% of cuts on the beat at {Math.round(beat.tempo_bpm)} BPM">
 					<svg viewBox="0 0 100 100" aria-hidden="true">
 						<defs>
 							<path id="stamp-ring" d="M50,50 m-37,0 a37,37 0 1,1 74,0 a37,37 0 1,1 -74,0" />
@@ -395,8 +424,9 @@
 		color: var(--text-dim);
 	}
 
+	/* Dimmed, but still readable (≥ 4.5:1). */
 	.help dl.off {
-		opacity: 0.4;
+		opacity: 0.7;
 	}
 
 	.keys-toggle {

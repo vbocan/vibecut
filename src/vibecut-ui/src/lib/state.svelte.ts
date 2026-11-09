@@ -136,10 +136,25 @@ class AppState {
 	/** Folder (as passed to discover) that `discoverResult` describes. */
 	discoveredFolder = $state<string | null>(null);
 
-	selectFolder(folder: string) {
-		if (this.discoveredFolder === folder && this.discoverResult) return;
+	/** `defer`: the arrow keys moved the selection here. The scan waits
+	 *  until they stop, so arrowing across the folders scans only the one
+	 *  the user lands on (each scan probes every file, seconds apiece on
+	 *  a slow card, and the server can't drop one it has started). */
+	selectFolder(folder: string, opts: { defer?: boolean } = {}) {
+		// Already on its way. A click or Enter on a folder the arrows only
+		// passed over scans it now.
+		if (folder === this.folder && this.discovering && (opts.defer || this.discoverTimer === null)) return;
+		this.cancelDiscover();
 		this.folder = folder;
-		void this.discover();
+		// Its clips are already here: make it the selection again (a
+		// quick A → B → A must land on A) without a scan.
+		if (this.discoveredFolder === folder && this.discoverResult) return;
+		if (!opts.defer) {
+			void this.discover();
+			return;
+		}
+		this.discovering = true;
+		this.discoverTimer = setTimeout(() => void this.discover(), this.scanSettleMs);
 	}
 
 	// ---------- Source thumbnails ----------
@@ -551,19 +566,49 @@ class AppState {
 	discoverResult = $state<api.DiscoverResult | null>(null);
 	discoverError = $state<string | null>(null);
 
+	/** Bumped per discover() call: only the latest call's answer lands,
+	 *  so arrowing across the footage radios can't leave the clips of
+	 *  one folder showing under another. */
+	private discoverSeq = 0;
+	/** A scan waiting for the arrow keys to stop (see selectFolder). */
+	private discoverTimer: ReturnType<typeof setTimeout> | null = null;
+	private discoverAbort: AbortController | null = null;
+	private readonly scanSettleMs = 300;
+
 	async discover() {
+		this.cancelDiscover();
+		const seq = this.discoverSeq;
+		const ctrl = new AbortController();
+		this.discoverAbort = ctrl;
 		this.discovering = true;
-		this.discoverError = null;
 		try {
 			const folder = this.folder;
-			this.discoverResult = await api.discoverSources(folder);
+			const result = await api.discoverSources(folder, ctrl.signal);
+			if (seq !== this.discoverSeq) return;
+			this.discoverResult = result;
 			this.discoveredFolder = folder;
 			void this.loadSourceThumbs();
 		} catch (e) {
+			if (seq !== this.discoverSeq) return;
 			this.discoverError = e instanceof api.ApiError ? e.describe() : String(e);
 		} finally {
-			this.discovering = false;
+			if (seq === this.discoverSeq) {
+				this.discovering = false;
+				this.discoverAbort = null;
+			}
 		}
+	}
+
+	/** Drop a scan that is waiting or running: its answer won't land,
+	 *  and the browser lets go of the request. */
+	private cancelDiscover() {
+		if (this.discoverTimer !== null) clearTimeout(this.discoverTimer);
+		this.discoverTimer = null;
+		this.discoverAbort?.abort();
+		this.discoverAbort = null;
+		this.discoverSeq++;
+		this.discovering = false;
+		this.discoverError = null;
 	}
 
 	// ---------- Vibes ----------

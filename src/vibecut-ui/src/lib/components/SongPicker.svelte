@@ -3,11 +3,13 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { musicFileUrl, type Track } from '$lib/api';
 	import { clock } from '$lib/vibes';
+	import { radiogroup } from '$lib/radiogroup';
 	import EnergyBars from './EnergyBars.svelte';
 	import MusicImport from './MusicImport.svelte';
 	import { collectionLabel, licenceBadge } from '$lib/music';
 
 	let { compact = false }: { compact?: boolean } = $props();
+	const uid = $props.id();
 
 	const MOODS: { key: Track['mood'] | 'all'; label: string }[] = [
 		{ key: 'all', label: 'All' },
@@ -116,26 +118,7 @@
 		</div>
 		<MusicImport />
 	{:else}
-		<button
-			type="button"
-			class="auto"
-			class:on={s.selectedTrackPath === null}
-			aria-pressed={s.selectedTrackPath === null}
-			onclick={() => choose(null)}
-		>
-			<span class="auto-icon" aria-hidden="true">✦</span>
-			<span class="auto-text">
-				<strong>Let Vibecut pick</strong>
-				<span
-					>{#if auto && s.effectiveVibe}Picked for you: <em>{auto.title}</em>{#if autoTrack}{` · ${Math.round(
-								autoTrack.bpm
-							)} BPM`}{/if}{:else}Matched to the vibe you choose{/if}</span
-				>
-				{#if auto && s.effectiveVibe}<span class="why">{auto.reason}</span>{/if}
-			</span>
-		</button>
-
-		<div class="moods" role="radiogroup" aria-label="Filter by mood">
+		<div class="moods" role="radiogroup" aria-label="Filter by mood" use:radiogroup>
 			{#each MOODS as m (m.key)}
 				<button
 					type="button"
@@ -148,12 +131,38 @@
 			{/each}
 		</div>
 
-		<ul class="list" aria-label="Songs">
+		<!-- In the Studio a pick re-renders, so arrows only move focus there
+		     and Space / Enter picks. "Let Vibecut pick" is the first choice
+		     of the same group, so exactly one choice is always checked. -->
+		<ul class="list" role="radiogroup" aria-label="Song" use:radiogroup={{ selectOnMove: !inStudio }}>
+			<li class="auto-row" role="none">
+				<button
+					type="button"
+					class="auto"
+					class:on={s.selectedTrackPath === null}
+					role="radio"
+					aria-checked={s.selectedTrackPath === null}
+					aria-labelledby="{uid}-auto"
+					aria-describedby="{uid}-auto-why {uid}-auto-reason"
+					onclick={() => choose(null)}
+				>
+					<span class="auto-icon" aria-hidden="true">✦</span>
+					<span class="auto-text">
+						<strong id="{uid}-auto">Let Vibecut pick</strong>
+						<span id="{uid}-auto-why"
+							>{#if auto && s.effectiveVibe}Picked for you: <em>{auto.title}</em>{#if autoTrack}{` · ${Math.round(
+										autoTrack.bpm
+									)} BPM`}{/if}{:else}Matched to the vibe you choose{/if}</span
+						>
+						{#if auto && s.effectiveVibe}<span class="why" id="{uid}-auto-reason">{auto.reason}</span>{/if}
+					</span>
+				</button>
+			</li>
 			{#each shown as t, i (t.path)}
 				{@const isOn = s.selectedTrackPath === t.path}
 				{@const isPlaying = playing === t.path}
 				{@const lic = licenceBadge(t)}
-				<li class="row" class:on={isOn} class:playing={isPlaying} style="--i: {i}">
+				<li class="row" role="none" class:on={isOn} class:playing={isPlaying} style="--i: {i}">
 					<button
 						type="button"
 						class="play"
@@ -177,7 +186,7 @@
 							>
 						{/if}
 					</button>
-					<button type="button" class="pick" aria-pressed={isOn} onclick={() => choose(t.path)}>
+					<button type="button" class="pick" role="radio" aria-checked={isOn} onclick={() => choose(t.path)}>
 						<span class="title">{t.title}</span>
 						<span class="facts">
 							<span class="mood {t.mood}">{t.mood}</span>
@@ -239,6 +248,16 @@
 	.hint {
 		color: var(--text-faint);
 		font-size: var(--fs-sm);
+	}
+
+	.auto-row {
+		display: flex;
+		flex-direction: column;
+	}
+
+	/* The list scrolls, which would clip an outside focus ring. */
+	.auto:focus-visible {
+		outline-offset: -2px;
 	}
 
 	.auto {

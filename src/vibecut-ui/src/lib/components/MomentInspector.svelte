@@ -2,6 +2,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { sourceColor } from '$lib/colors';
 	import { clock } from '$lib/vibes';
+	import { keepFocus } from '$lib/focus';
 
 	const sel = $derived(
 		s.selectedSegmentIndex !== null ? (s.segmentLayout[s.selectedSegmentIndex] ?? null) : null
@@ -28,9 +29,29 @@
 		return 'Picked to keep the story moving between the big moments.';
 	}
 
+	/** Close, handing the keyboard focus back to the moment's block on
+	 *  the timeline rather than dropping it on the page. */
+	function close() {
+		const i = s.selectedSegmentIndex;
+		s.selectedSegmentIndex = null;
+		if (i !== null) document.querySelectorAll<HTMLElement>('.timeline .seg')[i]?.focus();
+	}
+
+	// An action re-renders, which closes this panel and clears the
+	// timeline: the focus waits at the top of the page and comes back to
+	// the moment in the same place once the new timeline is drawn.
+	let lastIndex = 0;
+	$effect(() => {
+		if (s.selectedSegmentIndex !== null) lastIndex = s.selectedSegmentIndex;
+	});
+	function sameMoment(): HTMLElement | null {
+		const segs = document.querySelectorAll<HTMLElement>('.timeline .seg');
+		return segs.length > 0 ? segs[Math.min(lastIndex, segs.length - 1)] : null;
+	}
+
 	async function act(kind: 'more' | 'less' | 'drop') {
 		const g = sel;
-		if (!g) return;
+		if (!g || busy) return;
 		const label =
 			kind === 'drop' ? `Dropped moment ${g.index + 1}` : kind === 'more' ? `More of clip ${sourceId}` : `Less of clip ${sourceId}`;
 		await s.withUndo(label, async () => {
@@ -42,30 +63,38 @@
 </script>
 
 {#if sel}
-	<aside class="inspector glass" aria-label="Selected moment">
+	<aside class="inspector glass" aria-label="Selected moment" use:keepFocus={sameMoment}>
 		<div class="top">
-			<span class="swatch" style="--c: {sourceColor(sourceId, sourceIds)}"></span>
+			<span class="swatch" style="--c: {sourceColor(sourceId, sourceIds)}" aria-hidden="true"></span>
 			<div class="title">
 				<strong>{burst ? 'Beat burst' : `Moment ${sel.index + 1}`}</strong>
 				<span class="mono">
 					{clock(sel.startSecs, true)}–{clock(sel.endSecs, true)} · clip {sourceId}
 				</span>
 			</div>
-			<button class="btn ghost close" type="button" aria-label="Close" onclick={() => (s.selectedSegmentIndex = null)}
-				>✕</button
-			>
+			<button class="btn ghost close" type="button" aria-label="Close moment details" onclick={close}>✕</button>
 		</div>
 		<p class="why serif">{why(sel.segment.reason, sel.segment.score)}</p>
 		{#if sel.segment.score !== null && !burst}
+			{@const strength = Math.round(Math.min(100, ((sel.segment.score ?? 0) / maxScore) * 100))}
 			<div class="score" title="How strongly the picker rated this moment">
-				<span class="eyebrow">Moment strength</span>
-				<span class="meter"><span style="width: {Math.min(100, ((sel.segment.score ?? 0) / maxScore) * 100)}%"></span></span>
+				<span class="eyebrow" id="strength-h">Moment strength</span>
+				<span
+					class="meter"
+					role="meter"
+					aria-labelledby="strength-h"
+					aria-valuemin="0"
+					aria-valuemax="100"
+					aria-valuenow={strength}
+					aria-valuetext="{strength}% of the strongest moment"><span style="width: {strength}%"></span></span
+				>
 			</div>
 		{/if}
 		<div class="actions">
-			<button class="btn" type="button" disabled={busy || burst} onclick={() => act('more')}>More of this clip</button>
-			<button class="btn" type="button" disabled={busy || burst} onclick={() => act('less')}>Less of this clip</button>
-			<button class="btn danger" type="button" disabled={busy} onclick={() => act('drop')}>Drop this moment</button>
+			<!-- aria-disabled while busy: a disabled button drops the focus. -->
+			<button class="btn" type="button" disabled={burst} aria-disabled={busy} onclick={() => act('more')}>More of this clip</button>
+			<button class="btn" type="button" disabled={burst} aria-disabled={busy} onclick={() => act('less')}>Less of this clip</button>
+			<button class="btn danger" type="button" aria-disabled={busy} onclick={() => act('drop')}>Drop this moment</button>
 		</div>
 		<details class="tech">
 			<summary>Details</summary>

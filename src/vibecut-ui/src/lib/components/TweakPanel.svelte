@@ -15,11 +15,14 @@
 
 	// Tweaks stay live during a render: picking one offers to stop it.
 	// The offer is shared: keyboard shortcuts and song picks made
-	// mid-render show up here too.
+	// mid-render show up here too. Busy buttons (a change being written,
+	// a stop in flight) are aria-disabled, not disabled: a disabled button
+	// drops the keyboard focus onto the page the moment it's pressed.
 	const busy = $derived(s.feedbackBusy || s.stopping);
 	const offer = $derived(s.pendingChange?.from === 'tweaks' ? s.pendingChange : null);
 
 	function tryRun(t: (typeof TWEAKS)[number] | 'mix') {
+		if (busy) return;
 		if (t === 'mix') s.requestChange('Another mix', () => s.anotherMix());
 		else s.requestChange(t.label, () => run(t));
 	}
@@ -67,9 +70,9 @@
 	}
 </script>
 
-<div class="tweaks">
-	<p class="eyebrow">Make it…</p>
-	<button class="mix" type="button" disabled={busy} onclick={() => tryRun('mix')}>
+<div class="tweaks" role="group" aria-labelledby="tweaks-h">
+	<p class="eyebrow" id="tweaks-h">Make it…</p>
+	<button class="mix" type="button" aria-disabled={busy} onclick={() => tryRun('mix')}>
 		<span class="mix-icon" aria-hidden="true">⤨</span>
 		<span><strong>Try another mix</strong><small>A different vibe with its own best song</small></span>
 	</button>
@@ -78,7 +81,8 @@
 			<button
 				type="button"
 				class="tweak"
-				disabled={busy || (t.action === 'song' && s.tracks.length < 2)}
+				disabled={t.action === 'song' && s.tracks.length < 2}
+				aria-disabled={busy}
 				title={t.hint}
 				onclick={() => tryRun(t)}
 			>
@@ -151,11 +155,12 @@
 		transition: transform var(--dur-1) var(--ease-out);
 	}
 
-	.mix:hover:not(:disabled) {
+	.mix:hover:not(:disabled):not([aria-disabled='true']) {
 		transform: translateY(-2px);
 	}
 
-	.mix:disabled {
+	.mix:disabled,
+	.mix[aria-disabled='true'] {
 		opacity: 0.45;
 		cursor: not-allowed;
 	}
@@ -198,17 +203,18 @@
 			border-color var(--dur-1);
 	}
 
-	.tweak:hover:not(:disabled) {
+	.tweak:hover:not(:disabled):not([aria-disabled='true']) {
 		background: rgba(255, 255, 255, 0.08);
 		border-color: rgba(255, 61, 129, 0.5);
 		transform: translateY(-2px);
 	}
 
-	.tweak:active:not(:disabled) {
+	.tweak:active:not(:disabled):not([aria-disabled='true']) {
 		transform: scale(0.96);
 	}
 
-	.tweak:disabled {
+	.tweak:disabled,
+	.tweak[aria-disabled='true'] {
 		opacity: 0.4;
 		cursor: not-allowed;
 	}

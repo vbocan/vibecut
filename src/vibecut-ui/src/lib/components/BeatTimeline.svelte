@@ -3,6 +3,8 @@
 	import { outputFileUrl, inspectAt } from '$lib/api';
 	import { sourceColor } from '$lib/colors';
 	import { clock } from '$lib/vibes';
+	import { radiogroup } from '$lib/radiogroup';
+	import { keepFocus } from '$lib/focus';
 
 	let {
 		currentTime = 0,
@@ -172,20 +174,19 @@
 		onSeek(layout[i].startSecs + 0.05);
 	}
 
-	function onKey(e: KeyboardEvent, i: number) {
-		if (e.key === 'ArrowRight' && i + 1 < layout.length) {
-			e.preventDefault();
-			selectSeg(i + 1);
-			(wrap?.querySelectorAll<HTMLButtonElement>('.seg')[i + 1])?.focus();
-		} else if (e.key === 'ArrowLeft' && i > 0) {
-			e.preventDefault();
-			selectSeg(i - 1);
-			(wrap?.querySelectorAll<HTMLButtonElement>('.seg')[i - 1])?.focus();
-		}
+	/** A re-render (Delete, "[" and the other shortcuts) clears the
+	 *  timeline under the keyboard focus: once it is drawn again, the
+	 *  focus goes back to the moment in the same place, or the seek bar. */
+	function samePlace(lost: HTMLElement | null): HTMLElement | null {
+		const old = lost?.closest('.segs');
+		const i = old ? Array.from(old.querySelectorAll('.seg')).indexOf(lost!) : -1;
+		if (i < 0) return document.querySelector<HTMLElement>('.timeline .wave');
+		const segs = document.querySelectorAll<HTMLElement>('.timeline .seg');
+		return segs.length > 0 ? segs[Math.min(i, segs.length - 1)] : null;
 	}
 </script>
 
-<div class="timeline">
+<div class="timeline" use:keepFocus={samePlace}>
 	<div class="head">
 		<span class="eyebrow">Timeline</span>
 		<span class="legend">
@@ -240,9 +241,10 @@
 			{/key}
 		</div>
 
-		<div class="segs" role="group" aria-label="Moments in your video">
+		<!-- One tab stop; arrows / Home / End pick a moment (radio group). -->
+		<div class="segs" role="radiogroup" aria-label="Moments in your video" use:radiogroup>
 			{#if introEnd > 0.2}
-				<span class="card-block" style="left: 0; width: {pctOf(introEnd)}%" title="Opening title card"
+				<span class="card-block" style="left: 0; width: {pctOf(introEnd)}%" title="Opening title card" aria-hidden="true"
 					>Title</span
 				>
 			{/if}
@@ -250,7 +252,8 @@
 				<span
 					class="card-block"
 					style="left: {pctOf(outroStart)}%; width: {pctOf(duration - outroStart)}%"
-					title="End card">End</span
+					title="End card"
+					aria-hidden="true">End</span
 				>
 			{/if}
 			{#if hero}
@@ -269,9 +272,9 @@
 					class:playing={currentTime >= g.startSecs && currentTime < g.endSecs}
 					style="left: {pctOf(g.startSecs)}%; width: {pctOf(g.endSecs - g.startSecs)}%; --c: {color}"
 					aria-label="{burst ? 'Beat burst' : `Moment ${g.index + 1}`}, {clock(g.startSecs)} to {clock(g.endSecs)}"
-					aria-pressed={s.selectedSegmentIndex === g.index}
+					role="radio"
+					aria-checked={s.selectedSegmentIndex === g.index}
 					onclick={() => selectSeg(g.index)}
-					onkeydown={(e) => onKey(e, g.index)}
 				>
 					{#if thumbs[g.index]}<img src={thumbs[g.index]} alt="" />{/if}
 					{#if burst}<span class="burst-tag">burst</span>{/if}
@@ -472,6 +475,11 @@
 		box-shadow:
 			inset 0 0 0 2px rgba(255, 255, 255, 0.85),
 			inset 0 -3px 0 var(--c);
+	}
+
+	/* Keep the focus ring above the neighbouring blocks. */
+	.seg:focus-visible {
+		z-index: 4;
 	}
 
 	.seg.sel {

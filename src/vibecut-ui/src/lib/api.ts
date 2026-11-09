@@ -33,8 +33,8 @@ async function toApiError(res: Response): Promise<ApiError> {
 	}
 }
 
-async function getJson<T>(path: string): Promise<T> {
-	const res = await fetch(`${BASE}${path}`);
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+	const res = await fetch(`${BASE}${path}`, { signal });
 	if (!res.ok) throw await toApiError(res);
 	return res.json() as Promise<T>;
 }
@@ -101,8 +101,10 @@ export function listFootage(): Promise<{ folders: FootageFolder[] }> {
 	return getJson('/footage');
 }
 
-export function discoverSources(folder: string): Promise<DiscoverResult> {
-	return getJson(`/sources?folder=${encodeURIComponent(folder)}`);
+/** `signal` drops a scan the UI no longer wants (the server may still
+ *  finish it). */
+export function discoverSources(folder: string, signal?: AbortSignal): Promise<DiscoverResult> {
+	return getJson(`/sources?folder=${encodeURIComponent(folder)}`, signal);
 }
 
 // ---------- vibes ----------

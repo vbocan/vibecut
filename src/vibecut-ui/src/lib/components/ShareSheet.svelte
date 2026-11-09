@@ -159,7 +159,7 @@
 			</button>
 		{/if}
 	</div>
-	{#if shareError}<p class="error">{shareError}</p>{/if}
+	{#if shareError}<p class="error" role="alert">{shareError}</p>{/if}
 
 	<section class="formats" aria-labelledby="formats-h">
 		<span class="eyebrow" id="formats-h">Make a version for</span>
@@ -227,6 +227,7 @@
 		<div class="cap-head">
 			<span class="eyebrow">Caption</span>
 			<button class="btn ghost small" type="button" onclick={copyCaption}>{copied ? 'Copied ✓' : 'Copy'}</button>
+			<span class="sr-only" role="status">{copied ? 'Caption copied' : ''}</span>
 		</div>
 		<pre>{caption}</pre>
 	</div>
