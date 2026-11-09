@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
-	import { ApiError, outputFileUrl, reformat, reformatStatus } from '$lib/api';
+	import { ApiError, inspectAt, outputFileUrl, reformat, reformatStatus } from '$lib/api';
 	import type { PlatformPreset, ReformatResult } from '$lib/api';
 	import { clock } from '$lib/vibes';
 	import { radiogroup } from '$lib/radiogroup';
+	import { cropBoxAt, fitFor, previewTime, progressLabel, reframes } from '$lib/reframe';
+	import type { Framing } from '$lib/reframe';
 
 	// Decision 2: get the video out. Download, the phone's own share sheet
 	// where the browser supports sharing files, and a ready-to-paste caption
@@ -72,42 +74,65 @@
 	}
 
 	// Platform versions: one fast server-side pass over this render
-	// (POST /api/reformat), reframed to the platform's shape — a blurred
-	// fill of the same frame behind it when the aspect differs.
-	const PLATFORMS: { preset: PlatformPreset; label: string; shape: string; w: number; h: number }[] = [
+	// (POST /api/reformat), reframed to the platform's shape. A different
+	// shape is framed one of two ways: a crop that follows the action
+	// (the default), or the whole frame over a blurred fill of itself.
+	type Platform = { preset: PlatformPreset; label: string; shape: string; w: number; h: number };
+	const PLATFORMS: Platform[] = [
 		{ preset: 'youtube', label: 'YouTube', shape: '16:9', w: 16, h: 9 },
 		{ preset: 'reels', label: 'Reels / TikTok / Shorts', shape: '9:16', w: 9, h: 16 },
 		{ preset: 'square', label: 'Square', shape: '1:1', w: 1, h: 1 },
+		{ preset: 'portrait', label: 'Portrait', shape: '4:5', w: 4, h: 5 },
 		{ preset: 'whatsapp', label: 'WhatsApp', shape: '9:16 · small', w: 9, h: 16 }
 	];
 	type Version =
 		| { state: 'working'; progress: number }
 		| { state: 'done'; result: ReformatResult }
 		| { state: 'failed'; error: string };
-	/** Keyed by render + preset, so a new render starts with no versions. */
+	/** Keyed by render + preset + framing, so a new render starts with no
+	 *  versions and each framing is its own file. */
 	let versions = $state<Record<string, Version>>({});
 	let chosen = $state<PlatformPreset | null>(null);
-	const versionKey = (source: string, preset: PlatformPreset) => `${source}|${preset}`;
+	let framing = $state<Framing>('smart');
+	const versionKey = (source: string, preset: PlatformPreset, fit: Framing | undefined) =>
+		`${source}|${preset}|${fit ?? ''}`;
 	const chosenPlatform = $derived(PLATFORMS.find((p) => p.preset === chosen) ?? null);
-	const current = $derived(chosen && s.outputPath ? versions[versionKey(s.outputPath, chosen)] : undefined);
-	const versionFileName = $derived(chosen ? `${fileName.replace(/\.mp4$/i, '')}.${chosen}.mp4` : fileName);
+	/** The platform changes the render's shape, so its framing matters. */
+	const reshapes = (p: Platform) => reframes(s.manifest?.resolution, p.w, p.h);
+	const fitOf = (p: Platform) => fitFor(framing, reshapes(p));
+	const chosenFit = $derived(chosenPlatform ? fitOf(chosenPlatform) : undefined);
+	const currentKey = $derived(chosen && s.outputPath ? versionKey(s.outputPath, chosen, chosenFit) : null);
+	const current = $derived(currentKey ? versions[currentKey] : undefined);
+	/** The framing choice is offered until a same-shape platform is picked. */
+	const showFraming = $derived(!chosenPlatform || reshapes(chosenPlatform));
+	const versionFileName = $derived(
+		current?.state === 'done' ? (current.result.output_path.split('/').pop() ?? fileName) : fileName
+	);
+
+	function setFraming(f: Framing) {
+		framing = f;
+		if (chosen) makeVersion(chosen);
+	}
 
 	async function makeVersion(preset: PlatformPreset) {
 		const source = s.outputPath;
-		if (!source) return;
+		const platform = PLATFORMS.find((p) => p.preset === preset);
+		if (!source || !platform) return;
 		chosen = preset;
-		const key = versionKey(source, preset);
+		const fit = fitOf(platform);
+		const key = versionKey(source, preset, fit);
 		const existing = versions[key];
 		if (existing && existing.state !== 'failed') return;
 		versions[key] = { state: 'working', progress: 0 };
 		try {
 			// A version already being made (another tab, a reopened sheet)
 			// comes back as that same job (`reused`): this just follows it.
-			const job = await reformat(source, preset);
+			const job = await reformat(source, preset, fit);
 			for (;;) {
 				const st = await reformatStatus(job.job_id);
 				if (st.state === 'done') {
 					versions[key] = { state: 'done', result: st };
+					if (fit) loadPreview(key, source, st);
 					return;
 				}
 				if (st.state === 'failed') {
@@ -129,13 +154,46 @@
 		}
 	}
 
+	// Before / after: the render and the version at one moment (two frames
+	// from GET /api/frames/at), with the window a smart crop kept marked
+	// on the render — at the moment it sat furthest from the centre.
+	type Preview = {
+		t: number;
+		box: { left: number; top: number; width: number; height: number } | null;
+		before?: string;
+		after?: string;
+		failed?: boolean;
+	};
+	let previews = $state<Record<string, Preview>>({});
+	const preview = $derived(current?.state === 'done' && currentKey ? previews[currentKey] : undefined);
+	const sourceAspect = $derived((s.manifest?.resolution ?? '16x9').replace(/[x×]/, ' / '));
+
+	async function loadPreview(key: string, source: string, r: ReformatResult) {
+		const t = previewTime(r.smart, r.duration_secs);
+		previews[key] = { t, box: r.smart ? cropBoxAt(r.smart, t) : null };
+		try {
+			const [before, after] = await Promise.all([inspectAt(source, [t]), inspectAt(r.output_path, [t])]);
+			previews[key] = {
+				...previews[key],
+				before: before.frames_inline[0]?.data_uri,
+				after: after.frames_inline[0]?.data_uri
+			};
+		} catch {
+			// Only a nicety: the version itself is ready either way.
+			previews[key] = { ...previews[key], failed: true };
+		}
+	}
+
 	const versionNote = $derived.by(() => {
 		if (!chosenPlatform || !current) return '';
 		const label = chosenPlatform.label;
-		if (current.state === 'working') return `Making the ${label} version…`;
+		if (current.state === 'working') {
+			return chosenFit === 'smart' ? `Making the ${label} version, following the action…` : `Making the ${label} version…`;
+		}
 		if (current.state === 'done') {
 			const r = current.result;
-			return `${label} version ready: ${r.width} by ${r.height}, ${megabytes(r.size_bytes)}.`;
+			const how = r.fit === 'smart' ? ', following the action' : r.fit === 'blur' ? ', over a blurred fill' : '';
+			return `${label} version ready${how}: ${r.width} by ${r.height}, ${megabytes(r.size_bytes)}.`;
 		}
 		return `Couldn’t make the ${label} version: ${current.error}`;
 	});
@@ -200,6 +258,56 @@
 				</button>
 			{/each}
 		</div>
+		{#if showFraming}
+			<!-- How a vertical, square or 4:5 version fills its new shape. -->
+			<div class="framing">
+				<span class="f-label" id="framing-h">Framing</span>
+				<div class="seg" role="radiogroup" aria-labelledby="framing-h" use:radiogroup={{ selectOnMove: false }}>
+					<button
+						type="button"
+						role="radio"
+						aria-checked={framing === 'smart'}
+						aria-describedby="framing-hint"
+						onclick={() => setFraming('smart')}
+					>
+						<svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"
+							><path
+								d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+								stroke-linecap="round"
+							/><circle cx="13.5" cy="12" r="3" fill="currentColor" /></svg
+						>
+						Follow the action
+					</button>
+					<button
+						type="button"
+						role="radio"
+						aria-checked={framing === 'blur'}
+						aria-describedby="framing-hint"
+						onclick={() => setFraming('blur')}
+					>
+						<svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"
+							><rect x="3" y="4" width="18" height="16" rx="2" fill="currentColor" opacity="0.3" /><rect
+								x="7"
+								y="8"
+								width="10"
+								height="8"
+								rx="1"
+								fill="currentColor"
+							/></svg
+						>
+						Blur fill
+					</button>
+				</div>
+				<span class="f-hint" id="framing-hint"
+					>{framing === 'smart'
+						? 'Crops in and moves with whatever is moving.'
+						: 'Keeps the whole frame, over a soft fill of itself.'}</span
+				>
+			</div>
+		{/if}
 		<!-- Always on the page, so the outcome is read; not every percent. -->
 		<p class="sr-only" role="status">{versionNote}</p>
 		{#if chosenPlatform && current}
@@ -216,7 +324,7 @@
 					>
 						<span style:width="{Math.max(pct, 3)}%"></span>
 					</div>
-					<p class="v-note">Making the {chosenPlatform.label} version… {pct}%</p>
+					<p class="v-note">{progressLabel(chosenFit, current.progress, chosenPlatform.label)}</p>
 				{:else if current.state === 'done'}
 					{@const r = current.result}
 					<p class="v-note">
@@ -224,6 +332,55 @@
 							>· {r.width}×{r.height} · {clock(r.duration_secs)} · {megabytes(r.size_bytes)}</span
 						>
 					</p>
+					{#if preview && !preview.failed}
+						{@const box = preview.box}
+						<figure class="compare">
+							<div class="shot" style:aspect-ratio={sourceAspect}>
+								{#if preview.before}
+									<img src={preview.before} alt="Your video at {clock(preview.t)}" />
+								{/if}
+								{#if box}
+									<span
+										class="window"
+										style:left="{box.left}%"
+										style:top="{box.top}%"
+										style:width="{box.width}%"
+										style:height="{box.height}%"
+									></span>
+								{/if}
+								<span class="tag">Before</span>
+							</div>
+							<svg class="arrow" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"
+								><path
+									d="M5 12h13m0 0-5-5m5 5-5 5"
+									fill="none"
+									stroke="currentColor"
+									stroke-width="2"
+									stroke-linecap="round"
+									stroke-linejoin="round"
+								/></svg
+							>
+							<div class="shot" style:aspect-ratio="{r.width} / {r.height}">
+								{#if preview.after}
+									<img src={preview.after} alt="The {chosenPlatform.label} version at {clock(preview.t)}" />
+								{/if}
+								<span class="tag">After</span>
+							</div>
+							<figcaption>
+								{#if r.fit === 'smart' && r.smart && r.smart.followed_shots === 0}
+									At {clock(preview.t)}: nothing moved clearly enough to follow, so it keeps the middle of the frame.
+								{:else if r.fit === 'smart' && box && r.smart}
+									At {clock(preview.t)}: the lit window is what the {chosenPlatform.label} version keeps. It follows
+									the action in {r.smart.followed_shots} of {r.smart.shots}
+									{r.smart.shots === 1 ? 'shot' : 'shots'}.
+								{:else if r.fit === 'smart'}
+									At {clock(preview.t)}, cropped to follow the action.
+								{:else}
+									At {clock(preview.t)}: the whole frame, over a blurred fill of itself.
+								{/if}
+							</figcaption>
+						</figure>
+					{/if}
 					<div class="v-actions">
 						<a class="btn primary" href={outputFileUrl(r.output_path)} download={versionFileName}
 							>Save {chosenPlatform.label} version</a
@@ -386,9 +543,135 @@
 
 	.platforms {
 		display: grid;
-		grid-template-columns: repeat(4, minmax(0, 1fr));
+		grid-template-columns: repeat(5, minmax(0, 1fr));
 		gap: 8px;
 		margin-top: 8px;
+	}
+
+	.framing {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px 10px;
+		margin-top: 10px;
+	}
+
+	.f-label {
+		font-size: var(--fs-xs);
+		font-weight: 600;
+		color: var(--text-faint);
+	}
+
+	.seg {
+		display: inline-flex;
+		padding: 3px;
+		gap: 2px;
+		border-radius: 999px;
+		border: 1px solid var(--line);
+		background: rgba(255, 255, 255, 0.03);
+	}
+
+	.seg button {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 5px 12px;
+		border: 0;
+		border-radius: 999px;
+		background: transparent;
+		color: var(--text-dim);
+		font: inherit;
+		font-size: var(--fs-xs);
+		font-weight: 600;
+		cursor: pointer;
+		transition:
+			background var(--dur-1) var(--ease-out),
+			color var(--dur-1) var(--ease-out);
+	}
+
+	.seg button:hover {
+		color: var(--text);
+	}
+
+	.seg button[aria-checked='true'] {
+		color: var(--ink);
+		background: var(--text);
+	}
+
+	.f-hint {
+		flex-basis: 100%;
+		font-size: var(--fs-xs);
+		color: var(--text-faint);
+	}
+
+	.compare {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px 10px;
+		margin: 12px 0 0;
+	}
+
+	.shot {
+		position: relative;
+		flex: none;
+		height: 120px;
+		border-radius: var(--r-sm);
+		border: 1px solid var(--line);
+		background: rgba(255, 255, 255, 0.04);
+		overflow: hidden;
+	}
+
+	.shot:not(:has(img)) {
+		animation: pulse 1.4s var(--ease-in-out) infinite alternate;
+	}
+
+	.shot img {
+		display: block;
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+	}
+
+	/* The window the smart crop keeps; the rest of the frame is dimmed. */
+	.window {
+		position: absolute;
+		border: 2px solid var(--accent);
+		border-radius: 3px;
+		box-shadow: 0 0 0 999px rgba(7, 8, 12, 0.62);
+		pointer-events: none;
+	}
+
+	.tag {
+		position: absolute;
+		left: 6px;
+		bottom: 6px;
+		padding: 1px 7px;
+		border-radius: 999px;
+		background: rgba(7, 8, 12, 0.72);
+		color: var(--text);
+		font-size: 11px;
+		font-weight: 600;
+		letter-spacing: 0.02em;
+	}
+
+	.arrow {
+		color: var(--text-faint);
+	}
+
+	.compare figcaption {
+		flex-basis: 100%;
+		font-size: var(--fs-xs);
+		color: var(--text-faint);
+	}
+
+	@keyframes pulse {
+		from {
+			opacity: 0.5;
+		}
+		to {
+			opacity: 1;
+		}
 	}
 
 	.platform {
@@ -481,6 +764,21 @@
 	@media (max-width: 480px) {
 		.platforms {
 			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+
+		/* Five platforms in two columns: the last one takes the full row. */
+		.platform:last-child:nth-child(odd) {
+			grid-column: 1 / -1;
+		}
+
+		.shot {
+			height: 96px;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.shot:not(:has(img)) {
+			animation: none;
 		}
 	}
 

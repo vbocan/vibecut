@@ -45,6 +45,7 @@
 		tiktok: 'TikTok',
 		shorts: 'Shorts',
 		square: 'Square',
+		portrait: 'Portrait',
 		whatsapp: 'WhatsApp',
 		master: 'Master'
 	};
@@ -64,7 +65,8 @@
 	function jobTitle(j: JobListEntry): string {
 		if (j.kind === 'reformat') {
 			const from = j.source_path.split('/').pop() ?? j.source_path;
-			return `${PRESET_LABEL[j.preset] ?? j.preset}${j.fit ? ` (${j.fit})` : ''} version of ${from}`;
+			const fit = j.fit === 'smart' ? 'follows the action' : j.fit;
+			return `${PRESET_LABEL[j.preset] ?? j.preset}${fit ? ` (${fit})` : ''} version of ${from}`;
 		}
 		return projectName(j.config_path);
 	}

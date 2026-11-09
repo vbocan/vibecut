@@ -1898,6 +1898,13 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         vec![outputs[0].path.clone()]
     } else {
         let mut paths = Vec::with_capacity(outputs.len());
+        // A `smart` fit follows the action: the muxed body is analysed once
+        // (on the first smart output) and snaps at the timeline's cuts.
+        let mut follower = crate::smart_reframe::Follower::new(
+            &muxed_body,
+            (width, height),
+            crate::smart_reframe::timeline_cuts(&timeline),
+        );
         println!("\ntranscoding to {} output{}...", outputs.len(), plural(outputs.len()));
         for (i, o) in outputs.iter().enumerate() {
             progress(
@@ -1921,13 +1928,21 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 o.crf,
                 o.audio_bitrate
             );
-            let graph = crate::output_format::reframe_graph(
+            let path = match fit {
+                Some(crate::output_format::Fit::Smart) => follower.path_for((ow, oh), &mut |_| {})?,
+                _ => None,
+            };
+            if let Some(p) = &path {
+                println!("    smart reframe: {}", p.describe());
+            }
+            let graph = crate::output_format::reframe_graph_with_path(
                 (width, height),
                 ow,
                 oh,
                 fit,
                 &card_windows,
                 cfg.project.fps as f64,
+                path.as_ref(),
             );
             let video_args = crate::output_format::output_encode_args(
                 &out_hw,

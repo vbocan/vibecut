@@ -131,9 +131,9 @@ pub struct InspectAtArgs {
 pub struct ReformatArgs {
     /// Path to a rendered mp4 (the `output_path` of a `render`).
     pub output_path: String,
-    /// `youtube`, `reels`, `tiktok`, `shorts`, `square` or `whatsapp`.
+    /// `youtube`, `reels`, `tiktok`, `shorts`, `square`, `portrait` (4:5) or `whatsapp`.
     pub preset: String,
-    /// `blur` (default), `crop` or `pad`.
+    /// `blur` (default), `crop`, `pad` or `smart` (a crop that follows the action).
     #[serde(default)]
     pub fit: Option<String>,
 }
@@ -391,7 +391,7 @@ impl VibecutMcpServer {
 
     /// A platform version of a finished render (vertical Reel, square,
     /// WhatsApp) in one fast ffmpeg pass — no re-render.
-    #[tool(description = "Make a platform version of a finished render in one fast pass (seconds, no re-render): preset youtube (16:9 1920x1080), reels / tiktok / shorts (9:16 1080x1920), square (1080x1080) or whatsapp (9:16 720x1280, size-capped). A different aspect gets a blurred fill of the same frame behind it (fit: blur, default), a centre crop (crop) or black bars (pad). Writes <stem>.<preset>.mp4 next to the render and returns its path.")]
+    #[tool(description = "Make a platform version of a finished render in one fast pass (seconds, no re-render): preset youtube (16:9 1920x1080), reels / tiktok / shorts (9:16 1080x1920), square (1080x1080), portrait (4:5 1080x1350) or whatsapp (9:16 720x1280, size-capped). A different aspect gets a blurred fill of the same frame behind it (fit: blur, default), a crop that follows the action (smart), a centre crop (crop) or black bars (pad). Writes <stem>.<preset>.mp4 next to the render and returns its path.")]
     async fn reformat(&self, Parameters(args): Parameters<ReformatArgs>) -> Result<String, ErrorData> {
         let started = std::time::Instant::now();
         let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);

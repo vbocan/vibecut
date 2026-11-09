@@ -18,6 +18,11 @@
 //! JSON is [`reformat_sync`]'s. The version is written under a staging
 //! name and renamed into place when complete (`vibecut::staging`), the
 //! same as a render's `[[outputs]]`.
+//!
+//! `fit = "smart"` follows the action instead of cropping the middle
+//! (`vibecut::smart_reframe`): the pass first measures where things move
+//! (the first quarter of the progress bar) and the result carries the
+//! camera path it followed as `smart`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -58,7 +63,7 @@ pub fn parse_fit(s: Option<&str>) -> Result<Option<Fit>, OpsError> {
         None => Ok(None),
         Some(f) => Fit::parse(f)
             .map(Some)
-            .ok_or_else(|| OpsError::invalid_with_hint(format!("unknown fit {f:?}"), "use blur, crop or pad")),
+            .ok_or_else(|| OpsError::invalid_with_hint(format!("unknown fit {f:?}"), format!("use {}", Fit::NAMES))),
     }
 }
 
@@ -126,12 +131,12 @@ fn run_blocking(t: &ReformatTarget, on_progress: &mut dyn FnMut(f32)) -> anyhow:
     vibecut::cancel::check()?;
     let src = vibecut::output_format::probe_source(&source)?;
     let plan = vibecut::output_format::plan_reformat(&src, &opts);
-    let (cached, encoder) = if t.source == t.target || is_fresh(&t.source, &t.target) {
+    let (cached, encoder, path) = if t.source == t.target || is_fresh(&t.source, &t.target) {
         on_progress(1.0);
-        (true, None)
+        (true, None, None)
     } else {
         let o = vibecut::output_format::reformat_video(&source, &target, &opts, on_progress)?;
-        (false, Some(o.encoder))
+        (false, Some(o.encoder), o.path)
     };
     let made = vibecut::output_format::probe_source(Utf8Path::new(&target))?;
     Ok(serde_json::json!({
@@ -148,6 +153,9 @@ fn run_blocking(t: &ReformatTarget, on_progress: &mut dyn FnMut(f32)) -> anyhow:
         "duration_secs": made.duration_secs,
         "source_duration_secs": src.duration_secs,
         "size_bytes": std::fs::metadata(&t.target).map(|m| m.len()).unwrap_or(0),
+        // The camera path a smart fit followed (null when the version was
+        // reused): where the crop window sat, as shares of the source frame.
+        "smart": path.as_ref().map(|p| p.to_json()),
     }))
 }
 
@@ -174,7 +182,10 @@ fn progress_report(t: &ReformatTarget, fraction: f32) -> Progress {
         label: Stage::Encoding.label(),
         stage_fraction: fraction,
         overall: fraction,
-        detail: Some(format!("{} · {}×{}", t.preset.name(), spec.width, spec.height)),
+        detail: Some(match t.fit {
+            Some(Fit::Smart) => format!("{} · {}×{} · following the action", t.preset.name(), spec.width, spec.height),
+            _ => format!("{} · {}×{}", t.preset.name(), spec.width, spec.height),
+        }),
     }
 }
 
@@ -310,6 +321,10 @@ mod tests {
         assert!(matches!(prepare(&v, "reel", None), Err(OpsError::InvalidInput { .. })));
         assert!(matches!(prepare(&v, "reels", Some("zoom")), Err(OpsError::InvalidInput { .. })));
         assert_eq!(prepare(&v, "square", Some("crop")).unwrap().fit, Some(Fit::Crop));
+        // Follow the action into 4:5: its own version, next to the blur one.
+        let s = prepare(&v, "portrait", Some("smart")).unwrap();
+        assert_eq!((s.fit, &s.target), (Some(Fit::Smart), &d.join("reel.portrait-smart.mp4")));
+        assert_eq!(progress_report(&s, 0.5).detail.as_deref(), Some("portrait · 1080×1350 · following the action"));
         let missing = d.join("gone.mp4");
         assert!(matches!(prepare(&missing.to_string_lossy(), "reels", None), Err(OpsError::NotFound { .. })));
         let manifest = d.join("reel.manifest.json");
@@ -448,6 +463,31 @@ mod tests {
             }
             other => panic!("expected done, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_smart_version_reports_the_path_it_followed() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        }
+        let d = tmp("smart");
+        let clip = render_clip(&d, 2);
+        let src = clip.to_string_lossy().into_owned();
+        let r = reformat_sync(&src, "portrait", Some("smart")).await.unwrap();
+        assert_eq!((r["width"].as_u64(), r["height"].as_u64()), (Some(1080), Some(1350)));
+        assert_eq!(r["fit"], "smart");
+        assert_eq!(r["output_path"], d.join("coast.portrait-smart.mp4").to_string_lossy().as_ref());
+        let smart = &r["smart"];
+        assert_eq!(smart["axis"], "x");
+        assert!((smart["window"].as_f64().unwrap() - 0.45).abs() < 1e-3, "{smart}");
+        let pieces = smart["pieces"].as_array().unwrap();
+        assert!(!pieces.is_empty());
+        assert_eq!(pieces[0][0].as_f64(), Some(0.0));
+        // Asked again: the fresh version is reused, and there is no new path.
+        let again = reformat_sync(&src, "portrait", Some("smart")).await.unwrap();
+        assert_eq!((again["cached"].as_bool(), again["smart"].is_null()), (Some(true), true));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

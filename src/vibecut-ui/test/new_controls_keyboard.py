@@ -198,7 +198,7 @@ def main() -> int:
         n_reformats = len([j for j in jobs() if j["kind"] == "reformat"])
         radios = page.locator("dialog.sheet .platforms [role=radio]")
         check(page.get_attribute("dialog.sheet .platforms", "role") == "radiogroup", "the platform row is a radio group")
-        check(radios.count() == 4, f"…of four platforms ({radios.count()})")
+        check(radios.count() == 5, f"…of five platforms ({radios.count()})")
         stops = page.evaluate("[...document.querySelectorAll('dialog.sheet .platforms [role=radio]')].filter((r) => r.tabIndex === 0).length")
         check(stops == 1, f"…with one tab stop ({stops})")
         radios.nth(0).focus()
@@ -217,7 +217,10 @@ def main() -> int:
             timeout=180000,
         )
         st = status_texts(page, "dialog.sheet .formats")
-        check(any("Reels / TikTok / Shorts version ready: 1080 by 1920" in t for t in st), f"…and so is its outcome ({st})")
+        check(
+            any(t.startswith("Reels / TikTok / Shorts version ready") and ": 1080 by 1920" in t for t in st),
+            f"…and so is its outcome ({st})",
+        )
         reels = [
             j for j in jobs()
             if j["kind"] == "reformat" and j.get("preset") == "reels" and j.get("source_path") in (shown, source)

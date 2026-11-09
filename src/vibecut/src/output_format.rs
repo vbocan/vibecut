@@ -10,9 +10,13 @@
 //! * `blur` (the default): the whole frame, fitted, over a blurred and
 //!   slightly darkened fill made from the same frame;
 //! * `crop`: a centre crop that fills the output;
-//! * `pad`: the whole frame, fitted, with black bars.
+//! * `pad`: the whole frame, fitted, with black bars;
+//! * `smart`: a crop that follows the action along a camera path measured
+//!   on the video ([`crate::smart_reframe`]), the centre crop where
+//!   nothing clearly moves.
 //!
-//! [`reframe_graph`] builds that filter graph. The same graph drives the
+//! [`reframe_graph`] builds that filter graph ([`reframe_graph_with_path`]
+//! with the path a `smart` fit follows). The same graph drives the
 //! render's per-output pass and [`reformat_video`], the fast one-pass
 //! reformat of a finished render (the Share sheet's "make a vertical
 //! version").
@@ -40,6 +44,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::project_config::{Encoder, RenderOutput};
+use crate::smart_reframe::{CameraPath, PanAxis};
 use crate::video_renderer::{EncoderChoice, EncoderPref, HwConfig, HwSupport};
 
 /// How a frame of one aspect fills an output of another. Only applies when
@@ -56,6 +61,9 @@ pub enum Fit {
     Crop,
     /// The whole frame, fitted, with black bars.
     Pad,
+    /// A crop that follows the action ([`crate::smart_reframe`]); the
+    /// centre crop where nothing clearly moves.
+    Smart,
 }
 
 impl Fit {
@@ -64,6 +72,7 @@ impl Fit {
             Fit::Blur => "blur",
             Fit::Crop => "crop",
             Fit::Pad => "pad",
+            Fit::Smart => "smart",
         }
     }
 
@@ -72,9 +81,13 @@ impl Fit {
             "blur" => Some(Fit::Blur),
             "crop" => Some(Fit::Crop),
             "pad" => Some(Fit::Pad),
+            "smart" => Some(Fit::Smart),
             _ => None,
         }
     }
+
+    /// Every fit name, for error messages.
+    pub const NAMES: &'static str = "blur, crop, pad or smart";
 }
 
 /// A platform preset for one output.
@@ -88,6 +101,8 @@ pub enum OutputPreset {
     Shorts,
     Square,
     Whatsapp,
+    /// 4:5, 1080×1350: the tallest a feed post shows uncropped.
+    Portrait,
 }
 
 /// What a preset fills in for keys the output doesn't set.
@@ -105,7 +120,7 @@ pub struct PresetSpec {
 }
 
 impl OutputPreset {
-    pub const ALL: [OutputPreset; 7] = [
+    pub const ALL: [OutputPreset; 8] = [
         OutputPreset::Master,
         OutputPreset::Youtube,
         OutputPreset::Reels,
@@ -113,6 +128,7 @@ impl OutputPreset {
         OutputPreset::Shorts,
         OutputPreset::Square,
         OutputPreset::Whatsapp,
+        OutputPreset::Portrait,
     ];
 
     pub fn name(self) -> &'static str {
@@ -124,6 +140,7 @@ impl OutputPreset {
             OutputPreset::Shorts => "shorts",
             OutputPreset::Square => "square",
             OutputPreset::Whatsapp => "whatsapp",
+            OutputPreset::Portrait => "portrait",
         }
     }
 
@@ -166,6 +183,7 @@ impl OutputPreset {
             },
             OutputPreset::Reels | OutputPreset::Tiktok | OutputPreset::Shorts => vertical,
             OutputPreset::Square => PresetSpec { width: 1080, height: 1080, ..vertical },
+            OutputPreset::Portrait => PresetSpec { width: 1080, height: 1350, ..vertical },
             // WhatsApp's video limit is 16 MB. A 3 Mbit/s video peak plus
             // 128 kbit/s audio keeps 30 s at or under ~11.7 MB.
             OutputPreset::Whatsapp => PresetSpec {
@@ -446,6 +464,27 @@ fn crop_chain(w: u32, h: u32) -> String {
     format!("scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1")
 }
 
+/// [`crop_chain`] with the window following `path` over `[from, to)` of
+/// it, in a clock that starts at `from` (the chain resets its input's
+/// timestamps to 0). The crop is positioned per frame by
+/// [`crate::smart_reframe::offset_expr`], on the frame already scaled to
+/// cover the output, so a slow pan moves in output pixels, not in steps
+/// of the source's. The plain centre crop where the path stays centred.
+fn follow_chain(w: u32, h: u32, path: &CameraPath, from: f64, to: Option<f64>) -> String {
+    if path.is_centred(from, to) {
+        return crop_chain(w, h);
+    }
+    let e = crate::smart_reframe::offset_expr(path, from, to);
+    let (x, y) = match path.axis {
+        PanAxis::X => (format!("'(in_w-out_w)*({e})'"), "(in_h-out_h)/2".to_string()),
+        PanAxis::Y => ("(in_w-out_w)/2".to_string(), format!("'(in_h-out_h)*({e})'")),
+    };
+    format!(
+        "setpts=PTS-STARTPTS,scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=increase,\
+         crop={w}:{h}:{x}:{y},setsar=1"
+    )
+}
+
 /// The fill: the frame scaled to cover `w × h`, blurred and darkened (both
 /// at the small size, where they cost next to nothing), then scaled up.
 fn blur_fill(w: u32, h: u32) -> String {
@@ -631,7 +670,8 @@ pub fn fps_literal(fps: f64) -> String {
 ///   shows the blur fit instead (title-safe in portrait).
 ///
 /// Only the stretches around the titles get that treatment; the rest of
-/// the video runs through the plain, fast chain.
+/// the video runs through the plain, fast chain. A `smart` fit here has no
+/// camera path, so it is the centre crop; see [`reframe_graph_with_path`].
 pub fn reframe_graph(
     src: (u32, u32),
     w: u32,
@@ -640,6 +680,28 @@ pub fn reframe_graph(
     titles: &[[f64; 2]],
     fps: f64,
 ) -> String {
+    reframe_graph_with_path(src, w, h, fit, titles, fps, None)
+}
+
+/// [`reframe_graph`], with the camera `path` a `smart` fit follows
+/// ([`crate::smart_reframe::Follower`], in the video's own seconds). A
+/// smart fit is a crop that moves: during the title spans it shows the
+/// title-safe blur fit like `crop` does, and elsewhere the window follows
+/// `path`.
+pub fn reframe_graph_with_path(
+    src: (u32, u32),
+    w: u32,
+    h: u32,
+    fit: Option<Fit>,
+    titles: &[[f64; 2]],
+    fps: f64,
+    path: Option<&CameraPath>,
+) -> String {
+    // The crop of an untitled stretch `[from, to)`.
+    let cropped = |f: Fit, from: f64, to: Option<f64>| match (f, path) {
+        (Fit::Smart, Some(p)) => follow_chain(w, h, p, from, to),
+        _ => crop_chain(w, h),
+    };
     let narrower = (w as f64 / h.max(1) as f64) < (src.0 as f64 / src.1.max(1) as f64) * 0.99;
     let portrait = h > w;
     let titles: Vec<[f64; 2]> = if narrower {
@@ -653,7 +715,7 @@ pub fn reframe_graph(
         None => format!("[0:v]{}[v]", pad_chain(w, h)),
         Some(Fit::Pad) if !shrink => format!("[0:v]{}[v]", pad_chain(w, h)),
         Some(Fit::Blur) if !shrink => blur_chain("0:v", "v", w, h, "", &fitted(w, h, 1.0), false),
-        Some(Fit::Crop) if titles.is_empty() => format!("[0:v]{}[v]", crop_chain(w, h)),
+        Some(f @ (Fit::Crop | Fit::Smart)) if titles.is_empty() => format!("[0:v]{}[v]", cropped(f, 0.0, None)),
         // Each piece is composited on its own fill: the fitted frame sized
         // per frame around the titles, the plain fit elsewhere.
         Some(Fit::Blur) => {
@@ -681,14 +743,14 @@ pub fn reframe_graph(
             });
             format!("[0:v]setpts=PTS-STARTPTS[src];{body}")
         }
-        Some(Fit::Crop) => {
+        Some(f @ (Fit::Crop | Fit::Smart)) => {
             let pieces = pieces(&merged_spans(&titles, 0.0));
             let share = if portrait { TITLE_SAFE_SCALE } else { 1.0 };
             let body = piecewise("src", "v", "c", &pieces, &fps, |k, piece, i, o| {
                 if piece.titled {
                     blur_chain(i, o, w, h, &format!("g{k}"), &fitted(w, h, share), false)
                 } else {
-                    format!("[{i}]{}[{o}]", crop_chain(w, h))
+                    format!("[{i}]{}[{o}]", cropped(f, piece.start, piece.end))
                 }
             });
             format!("[0:v]setpts=PTS-STARTPTS[src];{body}")
@@ -961,7 +1023,13 @@ pub struct ReformatOutcome {
     pub plan: ReformatPlan,
     pub encoder: &'static str,
     pub source_duration_secs: f64,
+    /// The camera path a `smart` fit followed.
+    pub path: Option<CameraPath>,
 }
+
+/// Share of a smart reformat's progress bar the motion analysis takes
+/// (it decodes the video once, small; the encode is the rest).
+pub const SMART_ANALYSIS_SHARE: f32 = 0.25;
 
 /// Where a platform version of `source` goes: `<stem>.<preset>.mp4` next
 /// to it, `<stem>.<preset>-<fit>.mp4` for a non-default fit. Callers pass
@@ -1025,6 +1093,16 @@ pub fn version_base_stem(source: &Path) -> Option<String> {
 /// `reel.square.reels.mp4`) has the same timeline as its render, so it
 /// reads that render's manifest. Empty when there's no manifest.
 pub fn manifest_card_windows(source: &Path) -> Vec<[f64; 2]> {
+    let Some(m) = read_manifest(source) else {
+        return Vec::new();
+    };
+    m.get("card_windows")
+        .and_then(|w| serde_json::from_value::<Vec<[f64; 2]>>(w.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// `source`'s manifest (a version reads its render's), parsed.
+fn read_manifest(source: &Path) -> Option<serde_json::Value> {
     let mut manifest = source.with_extension("manifest.json");
     let mut at = source.to_path_buf();
     while !manifest.is_file() {
@@ -1032,14 +1110,19 @@ pub fn manifest_card_windows(source: &Path) -> Vec<[f64; 2]> {
         at = at.with_file_name(format!("{base}.mp4"));
         manifest = at.with_extension("manifest.json");
     }
-    let Ok(text) = std::fs::read_to_string(manifest) else {
-        return Vec::new();
-    };
-    let Ok(m) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    m.get("card_windows")
-        .and_then(|w| serde_json::from_value::<Vec<[f64; 2]>>(w.clone()).ok())
+    let text = std::fs::read_to_string(manifest).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text).ok()
+}
+
+/// Every cut of `source`, output seconds, from its manifest's exact
+/// `timeline` (a version reads its render's): where a smart reframe snaps
+/// instead of panning. Empty without a manifest or a timeline (older
+/// renders); the smart reframe then finds the hard cuts in the pictures.
+pub fn manifest_cuts(source: &Path) -> Vec<f64> {
+    read_manifest(source)
+        .and_then(|m| m.get("timeline").cloned())
+        .and_then(|t| serde_json::from_value::<crate::output_timeline::OutputTimeline>(t).ok())
+        .map(|t| crate::smart_reframe::timeline_cuts(&t))
         .unwrap_or_default()
 }
 
@@ -1079,24 +1162,36 @@ fn write_reformat(
     opts: &ReformatOptions,
     on_progress: &mut dyn FnMut(f32),
 ) -> Result<ReformatOutcome> {
+    // A smart fit first measures where the action is (the first part of
+    // the progress bar), with the render's cuts to snap at.
+    let path = match plan.fit {
+        Some(Fit::Smart) if !plan.copy => {
+            let cuts = manifest_cuts(input.as_std_path());
+            let mut follower = crate::smart_reframe::Follower::new(input, (src.width, src.height), cuts);
+            follower.path_for((plan.width, plan.height), &mut |f| on_progress(f * SMART_ANALYSIS_SHARE))?
+        }
+        _ => None,
+    };
     let (args, encoder) = if plan.copy {
         (copy_args(input, output), "copy")
     } else {
         let hw = HwConfig::resolve(hw_support(), EncoderPref::Auto);
-        let graph = reframe_graph(
+        let graph = reframe_graph_with_path(
             (src.width, src.height),
             plan.width,
             plan.height,
             plan.fit,
             &opts.card_windows,
             src.fps,
+            path.as_ref(),
         );
         let video = output_encode_args(&hw, plan.crf, None, plan.max_bitrate);
         (transcode_args(input, output, &graph, &video, &plan.audio_bitrate), hw.encoder.name())
     };
     tracing::debug!(?args, "reformat");
-    run_ffmpeg_with_progress(&args, src.duration_secs, on_progress)?;
-    Ok(ReformatOutcome { plan, encoder, source_duration_secs: src.duration_secs })
+    let done = if path.is_some() { SMART_ANALYSIS_SHARE } else { 0.0 };
+    run_ffmpeg_with_progress(&args, src.duration_secs, &mut |f| on_progress(done + (1.0 - done) * f))?;
+    Ok(ReformatOutcome { plan, encoder, source_duration_secs: src.duration_secs, path })
 }
 
 #[cfg(test)]
@@ -1406,6 +1501,120 @@ mod tests {
         // A square crop guards titles too (it would cut them), at the full fit.
         let sq = reframe_graph(HD, 1080, 1080, Some(Fit::Crop), &[[0.0, 3.0]], 30.0);
         assert!(sq.contains("[g0fg0]scale=1080:1080:flags=lanczos:force_original_aspect_ratio=decrease"), "{sq}");
+    }
+
+    /// A 9:16 camera path over 30 s: left of centre, a pan to the right
+    /// from 10 to 14 s, then held there.
+    fn panning_path() -> CameraPath {
+        use crate::smart_reframe::PathPiece;
+        let w = (9.0 / 16.0) / (16.0 / 9.0);
+        let p = |t0, t1, c0, c1| PathPiece { t0, t1, c0, c1 };
+        CameraPath {
+            axis: PanAxis::X,
+            window: w,
+            duration_secs: 30.0,
+            pieces: vec![p(0.0, 10.0, 0.3, 0.3), p(10.0, 14.0, 0.3, 0.7), p(14.0, 30.0, 0.7, 0.7)],
+            shots: 1,
+            followed_shots: 1,
+        }
+    }
+
+    #[test]
+    fn smart_graph_crops_along_the_path_and_guards_titles() {
+        let crop = reframe_graph(HD, 1080, 1920, Some(Fit::Crop), &[], 30.0);
+        // No path (or one that never leaves the centre): the centre crop.
+        assert_eq!(reframe_graph(HD, 1080, 1920, Some(Fit::Smart), &[], 30.0), crop);
+        let mut centred = panning_path();
+        centred.pieces = vec![crate::smart_reframe::PathPiece { t0: 0.0, t1: 30.0, c0: 0.5, c1: 0.5 }];
+        assert_eq!(reframe_graph_with_path(HD, 1080, 1920, Some(Fit::Smart), &[], 30.0, Some(&centred)), crop);
+        // A crop / blur fit ignores a path.
+        let path = panning_path();
+        assert_eq!(reframe_graph_with_path(HD, 1080, 1920, Some(Fit::Crop), &[], 30.0, Some(&path)), crop);
+        // The window slides along x over the frame scaled to cover 1080x1920.
+        let g = reframe_graph_with_path(HD, 1080, 1920, Some(Fit::Smart), &[], 30.0, Some(&path));
+        let e = crate::smart_reframe::offset_expr(&path, 0.0, None);
+        assert_eq!(
+            g,
+            format!(
+                "[0:v]setpts=PTS-STARTPTS,scale=1080:1920:flags=lanczos:force_original_aspect_ratio=increase,\
+                 crop=1080:1920:'(in_w-out_w)*({e})':(in_h-out_h)/2,setsar=1[v]"
+            )
+        );
+        assert!(e.starts_with("lt(t,10.000)*0.2074+gte(t,10.000)*lt(t,14.000)*(0.2074+0.146"), "{e}");
+        // Titles: the guard (title-safe blur) during them, the following
+        // crop elsewhere, on each piece's own clock.
+        let g = reframe_graph_with_path(HD, 1080, 1920, Some(Fit::Smart), &[[0.0, 3.0], [27.5, 30.0]], 30.0, Some(&path));
+        assert!(g.contains("[cs0]trim=start=0.000:end=3.000,setpts=PTS-STARTPTS[ct0];[ct0]split=2[g0fg0][g0bg0]"), "{g}");
+        let body = crate::smart_reframe::offset_expr(&path, 3.0, Some(27.5));
+        assert!(body.starts_with("lt(t,7.000)*0.2074+gte(t,7.000)*lt(t,11.000)*"), "{body}");
+        assert!(g.contains(&format!("[ct1]setpts=PTS-STARTPTS,scale=1080:1920:flags=lanczos:force_original_aspect_ratio=increase,crop=1080:1920:'(in_w-out_w)*({body})':(in_h-out_h)/2,setsar=1[cq1]")), "{g}");
+        assert!(g.contains("[cs2]trim=start=27.500:end=30.000,setpts=PTS-STARTPTS[ct2];[ct2]split=2[g2fg0][g2bg0]"), "{g}");
+        // Past the end of the path (no frames left): the plain crop.
+        assert!(g.ends_with("[cq0][cq1][cq2][cq3]concat=n=4:v=1:a=0,fps=30[v]"), "{g}");
+        // A wider shape slides along y.
+        let mut tall = panning_path();
+        tall.axis = PanAxis::Y;
+        let g = reframe_graph_with_path((1080, 1920), 1920, 1080, Some(Fit::Smart), &[], 30.0, Some(&tall));
+        assert!(g.contains("crop=1920:1080:(in_w-out_w)/2:'(in_h-out_h)*("), "{g}");
+    }
+
+    #[test]
+    fn portrait_is_four_by_five_and_smart_is_a_fit() {
+        let s = OutputPreset::Portrait.spec();
+        assert_eq!((s.width, s.height, s.derived), (1080, 1350, true));
+        assert_eq!(OutputPreset::parse("portrait"), Some(OutputPreset::Portrait));
+        assert!(OutputPreset::names().contains("portrait"));
+        let r = resolve_output(&out("preset = \"portrait\"\nfit = \"smart\"")).unwrap();
+        assert_eq!((r.width, r.height, r.fit), (1080, 1350, Fit::Smart));
+        assert_eq!(Fit::parse(" Smart "), Some(Fit::Smart));
+        assert_eq!(Fit::Smart.name(), "smart");
+        // A portrait-only project still renders a 1080p master.
+        assert_eq!(body_resolution(&[r]), (1920, 1080));
+        assert_eq!(
+            version_path(Path::new("/projects/out/reel.mp4"), OutputPreset::Portrait, Some(Fit::Smart)),
+            PathBuf::from("/projects/out/reel.portrait-smart.mp4")
+        );
+        let master = SourceVideo { width: 1920, height: 1080, codec: "h264".into(), duration_secs: 30.0, fps: 30.0 };
+        let plan = plan_reformat(
+            &master,
+            &ReformatOptions { preset: OutputPreset::Portrait, fit: Some(Fit::Smart), card_windows: vec![] },
+        );
+        assert_eq!((plan.width, plan.height, plan.fit), (1080, 1350, Some(Fit::Smart)));
+    }
+
+    #[test]
+    fn cuts_come_from_the_manifest_timeline() {
+        use crate::output_timeline::{ChainItem, ChainLayout, ClipSource, OutputTimeline};
+        let d = std::env::temp_dir().join(format!("vibecut_output_format_cuts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let video = d.join("reel.mp4");
+        assert!(manifest_cuts(&video).is_empty());
+        let clip = |k: usize| {
+            ChainItem::Clip(ClipSource {
+                segment_index: k,
+                source_id: format!("GX01000{k}"),
+                source_path: format!("/footage/GX01000{k}.MP4").into(),
+                source_in_secs: 1.0,
+                duration_secs: 2.0,
+                ramp: None,
+            })
+        };
+        let layout = ChainLayout::new(&[3.0, 2.0, 2.0, 2.0], &[0.5, 0.0, 0.3], 30);
+        let timeline = OutputTimeline::build(&layout, &[ChainItem::IntroCard, clip(0), clip(1), clip(2)]);
+        let manifest = serde_json::json!({ "card_windows": [[0.0, 2.75]], "timeline": timeline });
+        std::fs::write(d.join("reel.manifest.json"), manifest.to_string()).unwrap();
+        let cuts = manifest_cuts(&video);
+        let want: Vec<f64> = timeline.cuts().iter().map(|c| c.output_secs as f64).collect();
+        assert_eq!(cuts.len(), 3);
+        assert!(cuts.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-5), "{cuts:?} vs {want:?}");
+        // The intro's crossfade cut, then a hard cut on a frame boundary.
+        assert!((cuts[0] - 2.75).abs() < 1e-9 && (cuts[1] - 4.5).abs() < 1e-9, "{cuts:?}");
+        // A version reads its render's; a manifest without a timeline has none.
+        assert_eq!(manifest_cuts(&d.join("reel.reels-smart.mp4")), cuts);
+        std::fs::write(d.join("reel.manifest.json"), br#"{"card_windows": []}"#).unwrap();
+        assert!(manifest_cuts(&video).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1733,6 +1942,99 @@ mod reformat_job_tests {
             run_ffmpeg_with_progress(&["-version".to_string()], 1.0, &mut |_| {})
         });
         assert!(r.is_err_and(|e| is_cancelled(&e)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Box speed (source px/s) and start of the synthetic subject.
+    const BOX_SPEED: f64 = 95.0;
+    const BOX_X0: f64 = 20.0;
+    const BOX: f64 = 48.0;
+
+    /// A 16:9 640×360 clip, 6 s: a yellow box crossing a static, textured
+    /// grey background (desaturated SMPTE bars) left to right.
+    fn moving_subject_clip(d: &Utf8Path) -> Utf8PathBuf {
+        let clip = d.join("ride.mp4");
+        let graph = format!(
+            "smptebars=s=640x360:r=30:d=6,hue=s=0[bg];color=c=yellow:s=48x48:r=30:d=6[box];\
+             [bg][box]overlay=x='{BOX_X0}+{BOX_SPEED}*t':y=156:shortest=1,format=yuv420p[v]"
+        );
+        let ok = Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-nostdin", "-filter_complex", &graph, "-map", "[v]"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", clip.as_str()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "generating {clip}");
+        clip
+    }
+
+    /// One frame of `video` at `t`, as `w × h` RGB.
+    fn grab_rgb(video: &Utf8Path, t: f64, w: u32, h: u32) -> Vec<u8> {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-ss", &format!("{t:.3}"), "-i", video.as_str()])
+            .args(["-frames:v", "1", "-vf", &format!("scale={w}:{h}"), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .expect("ffmpeg frame grab");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout.len(), (w * h * 3) as usize);
+        out.stdout
+    }
+
+    /// The yellow box in an RGB frame: its pixel count and bounding box.
+    fn find_box(rgb: &[u8], w: u32) -> (usize, [u32; 4]) {
+        let mut n = 0;
+        let mut bb = [u32::MAX, u32::MAX, 0, 0];
+        for (i, px) in rgb.chunks(3).enumerate() {
+            if px[0] > 170 && px[1] > 170 && px[2] < 90 {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                n += 1;
+                bb = [bb[0].min(x), bb[1].min(y), bb[2].max(x), bb[3].max(y)];
+            }
+        }
+        (n, bb)
+    }
+
+    #[test]
+    fn a_smart_vertical_version_keeps_the_moving_subject_in_frame() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        }
+        let (d, _) = render_clip("smart", 1);
+        let clip = moving_subject_clip(&d);
+        let target = d.join("ride.reels-smart.mp4");
+        let opts = ReformatOptions { preset: OutputPreset::Reels, fit: Some(Fit::Smart), card_windows: Vec::new() };
+        let mut last = 0.0f32;
+        let mut monotonic = true;
+        let done = reformat_video(&clip, &target, &opts, &mut |f| {
+            monotonic &= f >= last;
+            last = f;
+        })
+        .expect("smart reformat");
+        assert!(monotonic && last == 1.0, "progress went backwards or never finished");
+        let path = done.path.expect("a smart fit follows a path");
+        assert_eq!((path.shots, path.followed_shots), (1, 1), "{}", path.describe());
+        let src = probe_source(&clip).unwrap();
+        let made = probe_source(&target).unwrap();
+        assert_eq!((made.width, made.height), (1080, 1920));
+        assert!((made.duration_secs - src.duration_secs).abs() <= 1.0 / 30.0 + 1e-3, "{made:?} vs {src:?}");
+        // The crop is 9:16 of the 360-px-tall source: 202.5 px of 640.
+        let crop_w = 360.0 * 9.0 / 16.0;
+        // Grab at a quarter of the output size; the box is 48 × 1920/360
+        // × 1/4 = 64 px square there.
+        let (gw, gh) = (270, 480);
+        let side = BOX * 1920.0 / 360.0 / 4.0;
+        for t in [0.5, 1.5, 2.5, 3.5, 4.5, 5.5] {
+            let (n, [x0, y0, x1, y1]) = find_box(&grab_rgb(&target, t, gw, gh), gw);
+            // All of it, away from the edges: never cut by the crop.
+            assert!(n as f64 >= 0.85 * side * side, "t={t}: only {n} px of the box in frame");
+            assert!(x0 > 1 && x1 < gw - 2 && y0 > 1 && y1 < gh - 2, "t={t}: box at {x0}..{x1} x {y0}..{y1}");
+            // The centre crop would have lost it at the start and the end.
+            let bx = BOX_X0 + BOX_SPEED * t;
+            let centre_crop = (320.0 - crop_w / 2.0, 320.0 + crop_w / 2.0);
+            if t < 1.0 || t > 5.0 {
+                assert!(bx + BOX < centre_crop.0 || bx > centre_crop.1, "t={t}: the centre crop holds it too");
+            }
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -166,7 +166,7 @@ crf           = 22
 [[outputs]]
 path   = "out/edit.reels.mp4"
 preset = "reels"                          # platform preset, see the table below
-fit    = "blur"                           # blur (default) | crop | pad; only used when the aspect differs
+fit    = "blur"                           # blur (default) | smart | crop | pad; only used when the aspect differs
 ```
 
 `encoder = "auto"` picks the best available hardware encoder
@@ -193,6 +193,7 @@ yourself (`resolution`, `crf`, `audio_bitrate`, `max_bitrate`) always win.
 | `youtube`                   | 16:9          | 1920x1080  | 18  | 192k  | none              |
 | `reels`, `tiktok`, `shorts` | 9:16          | 1080x1920  | 20  | 192k  | none              |
 | `square`                    | 1:1           | 1080x1080  | 20  | 192k  | none              |
+| `portrait`                  | 4:5           | 1080x1350  | 20  | 192k  | none              |
 | `whatsapp`                  | 9:16          | 720x1280   | 23  | 128k  | 3M peak: 30 s stays at or under ~12 MB, inside WhatsApp's 16 MB |
 
 Vertical and square presets never set the body's shape. The body is the
@@ -216,9 +217,36 @@ encoder that runs doesn't take it.
 
 - `blur` (default): the whole frame, fitted, over a blurred and darkened
   fill made from the same frame — no black bars, nothing cut off.
+- `smart` ("Follow the action"): a crop that fills the output and moves
+  to keep the action in shot — see below.
 - `crop`: a centre crop that fills the output (a 9:16 crop of a 16:9
   frame keeps its middle third).
 - `pad`: the whole frame with black bars.
+
+**`fit = "smart"`** measures where things move in the finished video and
+slides the crop window along with it; no model, no download. The video is
+decoded once more, small (192 px wide, 10 frames a second, about 2–3 s for
+a 30 s 1080p render). For each pair of frames the camera's own movement
+is estimated and taken out, and what still moves — above the frame's
+motion floor — decides where the window goes (detail breaks ties). The
+window then follows like a camera operator would:
+
+- it snaps at every cut (the manifest's exact `timeline`, plus hard cuts
+  it sees in the pictures) instead of panning across one;
+- a shot with no clear subject (clear in under 30 % of its frames)
+  keeps the centre crop, and one whose subject stays within a dead zone
+  (15 % of the window) of one place is locked off;
+- otherwise it holds until the subject leaves the dead zone, pans after
+  it on a critically damped spring — never faster than 0.6 windows a
+  second, looking 0.4 s ahead so it doesn't trail — and holds again once
+  the subject settles; moments without motion hold the last position.
+
+The path is drawn by the crop filter's per-frame position (a few linear
+pieces, at most 200 however long the video, so the ffmpeg command stays
+small). A 9:16, 1:1 or 4:5 output from a 16:9 master slides left and
+right; a wider output from a vertical master slides up and down. Titles
+are treated as with `crop` (below). The render log says how many shots
+it followed (`smart reframe: followed the action in 10 of 21 shots`).
 
 **Titles in vertical outputs.** Intro/outro cards are rendered once, at
 the body's resolution (their `size` and offsets are master pixels), and
@@ -226,15 +254,29 @@ reach other shapes through the reframe. In a portrait output narrower
 than the master, the frame is shown at 76 % of its fitted width during
 the intro and outro — so a title as wide as the master frame stays inside
 the 9:16 safe area, clear of the platform's side buttons — and eases back
-to full width over 0.4 s after the title. A `crop` output shows the blur
-fit during those spans instead, so a title is never cut. The spans are
-recorded in the manifest as `card_windows`.
+to full width over 0.4 s after the title. A `crop` or `smart` output shows
+the blur fit during those spans instead, so a title is never cut. The
+spans are recorded in the manifest as `card_windows`.
 
 **A platform version of a finished render**, without re-rendering: `vibecut
-reformat out/edit.mp4 --preset reels` (optionally `--fit crop|pad`, `--out
-<path>`) writes `out/edit.reels.mp4` in one ffmpeg pass with the same
-reframe, reading `card_windows` from the render's manifest. The web UI's
-Share sheet (`POST /api/reformat`) and the MCP `reformat` tool do the same.
+reformat out/edit.mp4 --preset reels` (optionally `--fit smart|crop|pad`,
+`--out <path>`) writes `out/edit.reels.mp4` in one ffmpeg pass with the same
+reframe, reading `card_windows` (and, for `smart`, the cuts in `timeline`)
+from the render's manifest. A fit other than the default is part of the
+name: `out/edit.reels-smart.mp4`. `--show-path` prints where a smart crop
+sits every half second and how steady it is (cuts snapped, largest move
+between frames, pan reversals). The web UI's Share sheet (`POST
+/api/reformat`, body `{ "output_path", "preset", "fit"?, "wait"? }`) and
+the MCP `reformat` tool do the same; the Share sheet asks for `smart`
+("Follow the action") for its vertical, square and 4:5 versions, with
+"Blur fill" one click away, and shows the render and the version side by
+side at the moment the crop sat furthest from the centre. A smart
+version's result carries the path it followed as `smart`: `{ "axis": "x",
+"window": 0.3164, "shots", "followed_shots", "pieces": [[t0, t1, c0, c1],
+…] }`, the window's centre as a share of the render's frame, linear from
+`t0` to `t1` (seconds); it is `null` when an up-to-date version was reused.
+A smart version spends the first quarter of its progress finding the
+action.
 Given a version instead (`out/edit.square.mp4`), it works from the render
 next to it (`out/edit.mp4`), so a vertical version of the square one is
 still one reframe of the master; if the render is gone, the result keeps
