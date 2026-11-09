@@ -63,3 +63,17 @@ test('the tab stop is the checked item, else the first enabled one', () => {
 	assert.equal(tabStopIndex([], []), -1);
 	assert.equal(tabStopIndex([false], [false]), -1);
 });
+
+test('while focus is inside the group the tab stop follows it', () => {
+	// Manual selection: ArrowUp from the checked last item moves focus to
+	// the one before it; Tab must then leave the group, not land on the
+	// checked item again.
+	assert.equal(tabStopIndex([false, true], all(2), 0), 0);
+	assert.equal(tabStopIndex([false, false, true], all(3), 1), 1);
+	assert.equal(tabStopIndex([true, false, false], all(3), 2), 2);
+	// Focus outside the group (−1): back to the checked item.
+	assert.equal(tabStopIndex([false, true], all(2), -1), 1);
+	assert.equal(tabStopIndex([false, false], all(2), -1), 0);
+	// A focused item that is disabled doesn't take the stop.
+	assert.equal(tabStopIndex([false, true, false], [false, true, true], 0), 1);
+});

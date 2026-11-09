@@ -107,10 +107,11 @@
 		placeholder={studio ? `Tell it — e.g. “${examples[1]}”` : `Or just say it — e.g. “${examples[0]}”`}
 		bind:value={s.briefText}
 		readonly={s.briefBusy}
-		aria-keyshortcuts="Control+K"
+		aria-keyshortcuts={studio ? 'Control+K Meta+K' : undefined}
 		autocomplete="off"
 	/>
-	<kbd class="hint" aria-hidden="true">Ctrl K</kbd>
+	<!-- Only the Studio has the Ctrl / Cmd K shortcut. -->
+	{#if studio}<kbd class="hint" aria-hidden="true">Ctrl K</kbd>{/if}
 	<button class="btn primary" type="submit" disabled={s.briefBusy || !s.briefText.trim()}>
 		{s.briefBusy ? 'Thinking…' : studio ? 'Apply' : 'Make it'}
 	</button>

@@ -6,7 +6,9 @@ import type { Action } from 'svelte/action';
  * different attributes):
  *
  *  - one tab stop per group: the checked item, or the first enabled one
- *    when nothing is checked (roving tabindex);
+ *    when nothing is checked (roving tabindex). While focus is inside,
+ *    the stop follows it, so Tab leaves the group in one step even
+ *    where arrows only move the focus;
  *  - Arrow keys move to the next / previous enabled item, wrapping
  *    around, and select it; Home / End go to the first / last;
  *  - Space selects the focused item.
@@ -57,12 +59,31 @@ export function rovingTarget(
 }
 
 /**
- * The group's single tab stop: the checked item when it is enabled,
+ * The group's single tab stop: the focused item while focus is inside
+ * the group (`focused` ≥ 0), else the checked item when it is enabled,
  * else the first enabled item; −1 when nothing is enabled.
  */
-export function tabStopIndex(checked: readonly boolean[], enabled: readonly boolean[]): number {
+export function tabStopIndex(
+	checked: readonly boolean[],
+	enabled: readonly boolean[],
+	focused = -1
+): number {
+	if (focused >= 0 && enabled[focused]) return focused;
 	const c = checked.findIndex((x, i) => x && enabled[i]);
 	return c >= 0 ? c : enabled.findIndex(Boolean);
+}
+
+/** Clicks the action sends when an arrow key moves the selection. */
+const arrowClicks = new WeakSet<Event>();
+
+/**
+ * True for the click `use:radiogroup` sends when an arrow key (or Home /
+ * End) moves the selection, as opposed to a pointer click, Space or
+ * Enter. A group whose pick starts slow work can let that work wait
+ * until the arrows stop.
+ */
+export function selectedByArrow(e: Event): boolean {
+	return arrowClicks.has(e);
 }
 
 export interface RovingOptions {
@@ -99,9 +120,9 @@ export const radiogroup: Action<HTMLElement, RovingOptions | undefined> = (node,
 		!(el as HTMLButtonElement).disabled && el.getAttribute('aria-disabled') !== 'true';
 	const checked = (el: HTMLElement) => el.getAttribute(stateAttr) === 'true';
 
-	function sync() {
+	function sync(focus: Element | null = document.activeElement) {
 		const list = items();
-		const stop = tabStopIndex(list.map(checked), list.map(enabled));
+		const stop = tabStopIndex(list.map(checked), list.map(enabled), list.indexOf(focus as HTMLElement));
 		list.forEach((el, i) => {
 			const want = i === stop ? '0' : '-1';
 			if (el.getAttribute('tabindex') !== want) el.setAttribute('tabindex', want);
@@ -125,12 +146,24 @@ export const radiogroup: Action<HTMLElement, RovingOptions | undefined> = (node,
 		e.preventDefault();
 		const target = list[next];
 		target.focus();
-		if (opts.selectOnMove !== false && !checked(target)) target.click();
+		if (opts.selectOnMove !== false && !checked(target)) {
+			const click = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+			arrowClicks.add(click);
+			target.dispatchEvent(click);
+		}
 	}
+
+	// The stop follows the focus inside the group and goes back to the
+	// checked item when the focus leaves it.
+	const onFocusIn = (e: FocusEvent) => sync(e.target as Element);
+	const onFocusOut = (e: FocusEvent) => {
+		const to = e.relatedTarget as Element | null;
+		sync(to && node.contains(to) ? to : null);
+	};
 
 	// Svelte updates aria-checked / the item list; keep the tab stop on
 	// whatever is checked now.
-	const observer = new MutationObserver(sync);
+	const observer = new MutationObserver(() => sync());
 	observer.observe(node, {
 		subtree: true,
 		childList: true,
@@ -138,6 +171,8 @@ export const radiogroup: Action<HTMLElement, RovingOptions | undefined> = (node,
 		attributeFilter: [stateAttr, 'disabled', 'aria-disabled']
 	});
 	node.addEventListener('keydown', onKeydown);
+	node.addEventListener('focusin', onFocusIn);
+	node.addEventListener('focusout', onFocusOut);
 	sync();
 
 	return {
@@ -148,6 +183,8 @@ export const radiogroup: Action<HTMLElement, RovingOptions | undefined> = (node,
 		destroy() {
 			observer.disconnect();
 			node.removeEventListener('keydown', onKeydown);
+			node.removeEventListener('focusin', onFocusIn);
+			node.removeEventListener('focusout', onFocusOut);
 		}
 	};
 };

@@ -2,13 +2,14 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { prettyBytes } from '$lib/vibes';
 	import { sourceColor } from '$lib/colors';
-	import { radiogroup } from '$lib/radiogroup';
+	import { radiogroup, selectedByArrow } from '$lib/radiogroup';
 
 	let manual = $state('');
 	let showManual = $state(false);
 
-	function pick(folder: string) {
-		s.selectFolder(folder);
+	/** `defer`: arrowed onto, so the scan waits until the arrows stop. */
+	function pick(folder: string, defer = false) {
+		s.selectFolder(folder, { defer });
 		s.persist();
 	}
 
@@ -85,7 +86,7 @@
 					class="trip"
 					class:selected={s.folder === f.folder}
 					style="--i: {i}"
-					onclick={() => pick(f.folder)}
+					onclick={(e) => pick(f.folder, selectedByArrow(e))}
 				>
 					<span class="poster" class:loaded={!!poster}>
 						{#if poster}<img src={poster} alt="" />{/if}

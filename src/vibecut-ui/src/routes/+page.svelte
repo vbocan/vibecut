@@ -8,6 +8,7 @@
 	import ProDrawer from '$lib/components/ProDrawer.svelte';
 	import UndoToast from '$lib/components/UndoToast.svelte';
 	import { prefersReducedMotion } from '$lib/motion';
+	import { focusTransient } from '$lib/focus';
 
 	let proOpen = $state(false);
 	// A render that finishes while the tab is in the background flags the
@@ -56,15 +57,17 @@
 	// ("Make my video", the cutting room's buttons): start the new
 	// screen's reading order at its top instead of dropping focus on the
 	// page. Only once someone has used the page, so restoring a session
-	// on load doesn't move anything.
+	// on load doesn't move anything. <main> is focusable only for that
+	// visit: a lasting tabindex would restart the Tab order at its top
+	// after every click on its text.
 	let mainEl: HTMLElement | undefined = $state();
 	let interacted = false;
 	let lastScreen: string | null = null;
 	$effect(() => {
 		const now = screen;
 		const at = document.activeElement;
-		if (interacted && lastScreen !== null && lastScreen !== now && (!at || at === document.body))
-			mainEl?.focus({ preventScroll: true });
+		if (interacted && lastScreen !== null && lastScreen !== now && (!at || at === document.body) && mainEl)
+			focusTransient(mainEl);
 		lastScreen = now;
 	});
 
@@ -111,7 +114,7 @@
 
 <svelte:window onkeydown={() => (interacted = true)} onpointerdown={() => (interacted = true)} />
 
-<main id="main" tabindex="-1" bind:this={mainEl}>
+<main id="main" bind:this={mainEl}>
 	{#key screen}
 		<div class="screen">
 			{#if screen === 'create'}

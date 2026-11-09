@@ -2,6 +2,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { sourceColor } from '$lib/colors';
 	import { clock } from '$lib/vibes';
+	import { keepFocus } from '$lib/focus';
 
 	const sel = $derived(
 		s.selectedSegmentIndex !== null ? (s.segmentLayout[s.selectedSegmentIndex] ?? null) : null
@@ -36,9 +37,21 @@
 		if (i !== null) document.querySelectorAll<HTMLElement>('.timeline .seg')[i]?.focus();
 	}
 
+	// An action re-renders, which closes this panel and clears the
+	// timeline: the focus waits at the top of the page and comes back to
+	// the moment in the same place once the new timeline is drawn.
+	let lastIndex = 0;
+	$effect(() => {
+		if (s.selectedSegmentIndex !== null) lastIndex = s.selectedSegmentIndex;
+	});
+	function sameMoment(): HTMLElement | null {
+		const segs = document.querySelectorAll<HTMLElement>('.timeline .seg');
+		return segs.length > 0 ? segs[Math.min(lastIndex, segs.length - 1)] : null;
+	}
+
 	async function act(kind: 'more' | 'less' | 'drop') {
 		const g = sel;
-		if (!g) return;
+		if (!g || busy) return;
 		const label =
 			kind === 'drop' ? `Dropped moment ${g.index + 1}` : kind === 'more' ? `More of clip ${sourceId}` : `Less of clip ${sourceId}`;
 		await s.withUndo(label, async () => {
@@ -50,7 +63,7 @@
 </script>
 
 {#if sel}
-	<aside class="inspector glass" aria-label="Selected moment">
+	<aside class="inspector glass" aria-label="Selected moment" use:keepFocus={sameMoment}>
 		<div class="top">
 			<span class="swatch" style="--c: {sourceColor(sourceId, sourceIds)}" aria-hidden="true"></span>
 			<div class="title">
@@ -78,9 +91,10 @@
 			</div>
 		{/if}
 		<div class="actions">
-			<button class="btn" type="button" disabled={busy || burst} onclick={() => act('more')}>More of this clip</button>
-			<button class="btn" type="button" disabled={busy || burst} onclick={() => act('less')}>Less of this clip</button>
-			<button class="btn danger" type="button" disabled={busy} onclick={() => act('drop')}>Drop this moment</button>
+			<!-- aria-disabled while busy: a disabled button drops the focus. -->
+			<button class="btn" type="button" disabled={burst} aria-disabled={busy} onclick={() => act('more')}>More of this clip</button>
+			<button class="btn" type="button" disabled={burst} aria-disabled={busy} onclick={() => act('less')}>Less of this clip</button>
+			<button class="btn danger" type="button" aria-disabled={busy} onclick={() => act('drop')}>Drop this moment</button>
 		</div>
 		<details class="tech">
 			<summary>Details</summary>

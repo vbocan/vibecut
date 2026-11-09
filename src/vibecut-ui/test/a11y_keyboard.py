@@ -2,20 +2,24 @@
 
 Drives a running vibecut-web with the keyboard only: tabs through the
 Create screen, checks every radio group has one tab stop and that the
-arrow keys, Home and End move the selection (with wrap-around), makes a
-video (focus must land at the top of each new screen, not on the page),
-then in the Studio checks the moments radio group, the song list's
-manual selection, the shortcuts dialog, the Share and Pro settings
-dialogs (focus moves in, stays in, Escape closes, focus returns to the
-opener), the Pro tablists, the Undo toast, the versions radio group
-(manual selection) and Compare A/B. A rough contrast pass over the
-small text of both screens runs too.
+arrow keys, Home and End move the selection (with wrap-around), that
+arrowing across the footage scans only the folder it stops on, makes a
+video (focus must land at the top of each new screen, not on the page,
+and a click on text must not restart the Tab order there), then in the
+Studio checks the moments radio group, the song list's manual
+selection, the shortcuts dialog, the Share and Pro settings dialogs
+(focus moves in, stays in, Escape closes, focus returns to the opener),
+the Pro tablists, the Undo toast, the versions radio group (manual
+selection: Tab still leaves it in one step), Compare A/B, and that a
+tweak or the moment panel's Drop keeps the keyboard focus through the
+re-render. A rough contrast pass over the small text of both screens
+runs too.
 
     python test/a11y_keyboard.py --url http://localhost:8090
 
 Needs footage folders "Alps Ski Day" (3 clips), "Coastline Bike Ride"
 (4 clips) and "trip" (6 clips) and at least two songs — the demo set.
-It renders one ~30 s video and one re-render. Exits non-zero on any
+It renders one ~30 s video and three re-renders. Exits non-zero on any
 failed check.
 """
 
@@ -44,8 +48,10 @@ DELAY_FETCH = """
 (() => {
   const orig = window.fetch;
   window.__delay = {};
+  window.__aborted = [];
   window.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input.url;
+    init?.signal?.addEventListener('abort', () => window.__aborted.push(url));
     for (const [k, ms] of Object.entries(window.__delay))
       if (url.includes(k)) await new Promise((r) => setTimeout(r, ms));
     return orig(input, init);
@@ -205,6 +211,10 @@ def focus_tag(page):
     return page.evaluate("document.activeElement?.tagName.toLowerCase() ?? null")
 
 
+def main_tabindex(page):
+    return page.evaluate("document.getElementById('main').getAttribute('tabindex')")
+
+
 def arrows_cycle(page, name, label, vertical=True):
     """From the focused item of `name`: Right/Down, Left/Up, End, wrap, Home."""
     items = group(page, name)
@@ -275,30 +285,75 @@ def main() -> int:
             check(len(seen.get(g, ())) == 1, f"Tab passes '{g}' once (radios focused: {sorted(seen.get(g, ()))})")
         contrast(page, "Create")
 
-        print("Create: footage radios (and stale scans)")
+        print("Create: skip link, and clicks on text keep the Tab order")
+        check(main_tabindex(page) is None, "main: no lasting tabindex")
+        focus_top(page)
+        press(page, "Enter")
+        check(focus_tag(page) == "main", f"skip link: focus moves to main ({focus_tag(page)!r})")
+        a = press(page, "Tab")
+        check(a is not None and a["name"] == "Type a folder", f"skip link: the next Tab reaches main's first control ({a and a['name']!r})")
+        check(main_tabindex(page) is None, "skip link: main is focusable only while it has the focus")
+        page.click("#vibe-h")
+        check(focus_tag(page) != "main", f"click on the 'Choose a vibe' heading doesn't focus main ({focus_tag(page)!r})")
+        a = press(page, "Tab")
+        check(
+            a is not None and a["group"] == "Choose a vibe",
+            f"click on the 'Choose a vibe' heading, then Tab: the vibe group, not main's first control ({a and a['name']!r})",
+        )
+        check(
+            page.get_attribute("#cmd-input", "aria-keyshortcuts") is None and page.locator(".cmd kbd.hint").count() == 0,
+            "command bar: Create doesn't advertise Ctrl+K (only the Studio handles it)",
+        )
+
+        print("Create: footage radios (deferred and stale scans)")
+        scans: list[str] = []
+        page.on("request", lambda r: scans.append(r.url.split("folder=", 1)[1]) if "/api/sources?folder=" in r.url else None)
+        clips = "document.querySelector('.sources .hint strong')?.textContent.includes('%s')"
         focus_top(page)
         tab_to(page, lambda a: a["group"] == "Pick your footage", "the footage group")
         check(active(page)["name"].startswith("Coastline"), "footage: Tab lands on the checked folder")
-        # A slow scan of Alps must not win over a later pick.
+        # Arrowing across the folders scans only the one it stops on.
+        scans.clear()
+        for _ in range(4):  # trip, Alps, Coastline, trip
+            page.keyboard.press("ArrowRight")
+            page.wait_for_timeout(60)
+        page.wait_for_function(clips % "6 clips")
+        page.wait_for_timeout(500)
+        check(str(checked_name(page, "Pick your footage")).startswith("trip"), "footage: four quick ArrowRights land on 'trip'")
+        check(scans == ["trip"], f"footage: ...and scan only that folder ({scans})")
+        # Enter (or a click) on a folder the arrows only passed scans it at once.
+        scans.clear()
+        page.keyboard.press("ArrowLeft")  # Coastline: the scan waits
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(150)
+        check(len(scans) == 1 and scans[0].startswith("Coastline"), f"footage: Enter scans the folder straight away ({scans})")
+        page.wait_for_function(clips % "4 clips")
+        page.wait_for_timeout(500)
+        check(len(scans) == 1, f"footage: ...once ({scans})")
+        # A slow scan of Alps already under way must not win over a later pick.
         page.evaluate("window.__delay = {'folder=Alps': 2500}")
         press(page, "ArrowLeft")  # Alps (slow)
+        page.wait_for_timeout(500)  # its scan has started
         press(page, "ArrowRight")  # back to Coastline (already scanned)
-        page.wait_for_timeout(3500)
+        page.wait_for_timeout(3000)
         a = active(page)
         check(
             a["name"].startswith("Coastline") and str(checked_name(page, "Pick your footage")).startswith("Coastline"),
-            "footage: quick A → B → A keeps A checked",
+            "footage: A → B → A keeps A checked",
         )
         check(
             "4 clips" in page.inner_text(".sources .hint"),
             "footage: the clips shown are A's after B's slow scan returns",
         )
+        aborted = page.evaluate("window.__aborted")
+        check(any("folder=Alps" in u for u in aborted), f"footage: B's superseded scan is aborted ({aborted})")
         # Two folders not scanned yet, the first one slow: the later wins.
         page.evaluate("window.__delay = {'folder=trip': 2500}")
         press(page, "ArrowRight")  # trip (slow)
+        page.wait_for_timeout(500)
         press(page, "ArrowRight")  # wraps to Alps (fast)
-        page.wait_for_function("document.querySelector('.sources .hint strong')?.textContent.includes('3 clips')")
-        page.wait_for_timeout(3500)
+        page.wait_for_function(clips % "3 clips")
+        page.wait_for_timeout(3000)
         check(str(checked_name(page, "Pick your footage")).startswith("Alps"), "footage: ArrowRight wraps to the first folder")
         check(
             "3 clips" in page.inner_text(".sources .hint"),
@@ -306,7 +361,7 @@ def main() -> int:
         )
         page.evaluate("window.__delay = {}")
         press(page, "ArrowRight")  # Coastline for the render
-        page.wait_for_function("document.querySelector('.sources .hint strong')?.textContent.includes('4 clips')")
+        page.wait_for_function(clips % "4 clips")
         one_tab_stop(page, "Pick your footage", "footage")
 
         print("Create: vibe radios")
@@ -335,9 +390,17 @@ def main() -> int:
         check(n_chill < len(group(page, "Song")), f"mood: the filter changes the song list ({n_chill} chill songs)")
         tab_to(page, lambda a: a["group"] == "Song" and a["role"] == "radio", "the song group")
         one_tab_stop(page, "Song", "song")
+        a = active(page)
+        check(
+            a["name"].startswith("Let Vibecut pick") and a["checked"] == "true",
+            f"song: 'Let Vibecut pick' is the group's checked radio by default ({a['name'][:30]!r})",
+        )
         arrows_cycle(page, "Song", "song")
-        auto = page.get_by_role("button", name="Let Vibecut pick")
-        check(auto.get_attribute("aria-pressed") == "false", "song: picking a song releases 'Let Vibecut pick'")
+        on = [i["name"] for i in group(page, "Song") if i["checked"]]
+        check(len(on) == 1 and on[0].startswith("Let Vibecut pick"), f"song: Home goes back to 'Let Vibecut pick', the one checked choice ({on})")
+        press(page, "ArrowDown")  # the first song, for the render
+        on = [i["name"] for i in group(page, "Song") if i["checked"]]
+        check(len(on) == 1 and not on[0].startswith("Let Vibecut pick"), f"song: picking a song unchecks 'Let Vibecut pick' ({on})")
 
         if args.create_only:
             browser.close()
@@ -360,6 +423,13 @@ def main() -> int:
             a is not None and a["name"].startswith("Shortcuts"),
             f"studio: Tab from there reaches the screen's first control ({a and a['name']!r})",
         )
+        check(main_tabindex(page) is None, "studio: main is focusable only while it has the focus")
+        check(
+            page.get_attribute("#cmd-input", "aria-keyshortcuts") == "Control+K Meta+K",
+            "command bar: the Studio advertises Ctrl / Cmd+K",
+        )
+        a = press(page, "Control+k")
+        check(a is not None and a["tag"] == "input", f"command bar: Ctrl+K focuses it in the Studio ({a and a['tag']!r})")
         contrast(page, "Studio")
         paused = page.evaluate("document.querySelector('.player-wrap video')?.paused")
         if args.full_motion:
@@ -524,6 +594,15 @@ def main() -> int:
             checked_name(page, vers) == latest and page.get_attribute(player, "src") == src0,
             "versions: …without opening it",
         )
+        a = press(page, "Tab")
+        check(a is None or a["group"] != vers, f"versions: after ArrowUp, Tab leaves the group in one step ({a and a['name']!r})")
+        one_tab_stop(page, vers, "versions, focus gone")
+        a = press(page, "Shift+Tab")
+        check(
+            a is not None and a["group"] == vers and a["name"] == latest,
+            f"versions: Shift+Tab comes back to the checked version ({a and a['name']!r})",
+        )
+        a = press(page, "ArrowUp")
         a = press(page, " ", settle=1500)
         now = checked_name(page, vers)
         check(
@@ -556,6 +635,53 @@ def main() -> int:
         check(
             a is not None and a["name"].startswith("Compare A/B") and not page.is_visible("#compare-ab"),
             "compare: Enter again collapses it, focus stays on the button",
+        )
+
+        print("Studio: a click on text keeps the Tab order")
+        page.click(".versions .eyebrow")
+        check(focus_tag(page) != "main", f"click on the 'Versions' label doesn't focus main ({focus_tag(page)!r})")
+        a = press(page, "Tab")
+        check(
+            a is not None and a["name"].startswith("Compare A/B"),
+            f"click on 'Versions', then Tab: the next control there, not the top of the Studio ({a and a['name']!r})",
+        )
+
+        def rerender_done():
+            page.wait_for_selector(".overlay", timeout=30000)
+            page.wait_for_selector(".overlay", state="detached", timeout=args.render_timeout * 1000)
+            page.wait_for_selector("[role=radiogroup][aria-label='Moments in your video'] [role=radio]", timeout=60000)
+            page.wait_for_timeout(1500)
+
+        print("Studio: a tweak keeps the keyboard focus through its re-render")
+        focus_top(page)
+        tab_to(page, lambda a: a["tag"] == "button" and a["name"].endswith("Calmer"), "'Calmer'")
+        a = press(page, "Enter", settle=800)
+        check(a is not None and a["name"].endswith("Calmer"), f"tweak: focus stays on 'Calmer' while it works ({a and a['name']!r})")
+        busy = page.evaluate("document.activeElement.getAttribute('aria-disabled')")
+        check(busy == "true", f"tweak: ...which reports itself unavailable meanwhile (aria-disabled {busy!r})")
+        rerender_done()
+        a = active(page)
+        check(a is not None and a["name"].endswith("Calmer"), f"tweak: ...and after the re-render ({a and a['name']!r})")
+
+        print("Studio: the moment panel's Drop keeps the keyboard on the page")
+        focus_top(page)
+        tab_to(page, lambda a: a["group"] == moments, "the moments group")
+        press(page, "ArrowRight")
+        items = group(page, moments)
+        idx = [i["checked"] for i in items].index(True)
+        tab_to(page, lambda a: a["name"] == "Drop this moment", "'Drop this moment'")
+        press(page, "Enter", settle=200)
+        page.wait_for_selector(".overlay", timeout=30000)
+        page.wait_for_timeout(300)
+        tag = focus_tag(page)
+        check(tag == "main", f"drop: while it re-renders, focus waits at the top of the screen, not on the page ({tag!r})")
+        rerender_done()
+        a = active(page)
+        items = group(page, moments)
+        want = items[min(idx, len(items) - 1)]["name"] if items else None
+        check(
+            a is not None and a["group"] == moments and a["name"] == want,
+            f"drop: after the re-render, focus is back on the moment in the same place ({a and a['name']!r}, want {want!r})",
         )
 
         browser.close()

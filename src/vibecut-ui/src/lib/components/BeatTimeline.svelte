@@ -4,6 +4,7 @@
 	import { sourceColor } from '$lib/colors';
 	import { clock } from '$lib/vibes';
 	import { radiogroup } from '$lib/radiogroup';
+	import { keepFocus } from '$lib/focus';
 
 	let {
 		currentTime = 0,
@@ -164,9 +165,20 @@
 		s.selectedSegmentIndex = i;
 		onSeek(layout[i].startSecs + 0.05);
 	}
+
+	/** A re-render (Delete, "[" and the other shortcuts) clears the
+	 *  timeline under the keyboard focus: once it is drawn again, the
+	 *  focus goes back to the moment in the same place, or the seek bar. */
+	function samePlace(lost: HTMLElement | null): HTMLElement | null {
+		const old = lost?.closest('.segs');
+		const i = old ? Array.from(old.querySelectorAll('.seg')).indexOf(lost!) : -1;
+		if (i < 0) return document.querySelector<HTMLElement>('.timeline .wave');
+		const segs = document.querySelectorAll<HTMLElement>('.timeline .seg');
+		return segs.length > 0 ? segs[Math.min(i, segs.length - 1)] : null;
+	}
 </script>
 
-<div class="timeline">
+<div class="timeline" use:keepFocus={samePlace}>
 	<div class="head">
 		<span class="eyebrow">Timeline</span>
 		<span class="legend">

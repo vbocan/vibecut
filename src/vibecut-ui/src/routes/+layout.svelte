@@ -9,10 +9,19 @@
 	import '@fontsource/ibm-plex-mono/500.css';
 	import '@fontsource/ibm-plex-mono/600.css';
 	import '../app.css';
+	import { focusTransient } from '$lib/focus';
 	let { children } = $props();
+
+	// <main> has no lasting tabindex: focus it for this visit so screen
+	// readers land there too (the link itself still scrolls and moves the
+	// Tab starting point).
+	function skip() {
+		const main = document.getElementById('main');
+		if (main) focusTransient(main);
+	}
 </script>
 
-<a class="skip" href="#main">Skip to content</a>
+<a class="skip" href="#main" onclick={skip}>Skip to content</a>
 {@render children()}
 
 <style>
