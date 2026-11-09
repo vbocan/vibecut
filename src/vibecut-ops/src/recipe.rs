@@ -767,7 +767,7 @@ fn parse_canonical_ms(s: &str) -> Option<u64> {
 
 /// The config sections a recipe covers, each with the keys it leaves out.
 const SECTIONS: &[(&str, &[&str])] = &[
-    ("project", &["name", "temp_dir", "models_dir"]),
+    ("project", &["name", "temp_dir", "models_dir", "quality"]),
     ("soundtrack", &["files"]),
     ("intro", &[]),
     ("outro", &[]),
@@ -1640,6 +1640,11 @@ fn chips(r: &Recipe, vibe: &Vibe, style: &Value) -> Vec<Chip> {
         let first = c.pointer("/layers/0/content").and_then(Value::as_str);
         let words = match first {
             None | Some("{title}") => String::new(),
+            // Placeholder text reads as what fills it in, not as braces.
+            Some(t) if t.contains("{title}") || t.contains("{trip}") || t.contains("{date}") => format!(
+                " · {}",
+                t.replace("{title}", "your title").replace("{trip}", "trip name").replace("{date}", "date")
+            ),
             Some(t) => format!(" · \u{201c}{t}\u{201d}"),
         };
         Some(match c.get("mode").and_then(Value::as_str) {
@@ -1966,12 +1971,19 @@ pub struct SavedStyles {
 
 /// File name for a style name: its slug, plus a short hash when the slug
 /// drops characters (so "Été" and "Ete" don't overwrite each other).
+/// The file a saved style's name goes in. Names are matched without
+/// regard to case, so the stem is too. A name the slug spells back
+/// exactly (lower-case letters, digits, `-` and single spaces, which
+/// become `_`) is its slug; any other name (`"my_style"`, `"my  style"`,
+/// `"Été"`) gets a hash of the name after its slug, so two names that
+/// slug the same never share a file.
 fn file_stem_for(name: &str) -> String {
-    let slug = slugify(name);
-    if name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ')) {
+    let key = name.to_lowercase();
+    let slug = slugify(&key);
+    if slug.replace('_', " ") == key {
         return slug;
     }
-    let h = fingerprint(name.len() as u64, name.as_bytes());
+    let h = fingerprint(key.len() as u64, key.as_bytes());
     format!("{slug}_{:06x}", h & 0xFF_FFFF)
 }
 
@@ -1985,6 +1997,18 @@ fn save_in(dir: &Path, name: &str, code: &str) -> Result<SavedStyle, OpsError> {
     let style = summarize(&recipe)?;
     std::fs::create_dir_all(dir).map_err(|e| OpsError::internal(format!("could not create {}: {e}", dir.display())))?;
     let path = dir.join(format!("{}.json", file_stem_for(name)));
+    // Replacing is for the same name only; a different name in this file
+    // (a hash clash) is never overwritten.
+    if let Some(other) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<SavedFile>(&t).ok())
+        .filter(|f| f.name.trim().to_lowercase() != name.to_lowercase())
+    {
+        return Err(OpsError::invalid(format!(
+            "a style saved as {:?} is stored where {name:?} would go; pick another name",
+            other.name
+        )));
+    }
     let created_at = Some(chrono::Utc::now().to_rfc3339());
     let saved = SavedFile { name: name.to_string(), code: code.clone(), created_at: created_at.clone() };
     let text = serde_json::to_string_pretty(&saved).map_err(|e| OpsError::internal(e.to_string()))?;

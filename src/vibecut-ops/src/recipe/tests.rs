@@ -1053,6 +1053,21 @@ fn saved_styles_round_trip_and_skip_bad_files() {
     // Saving under the same name replaces it.
     save_in(&dir, "summer reel", &code).unwrap();
     assert_eq!(list_in(&dir).styles.len(), 2);
+    // Names that slug the same are different styles in different files.
+    let underscored = save_in(&dir, "summer_reel", &code).unwrap();
+    let spaced = save_in(&dir, "Summer  reel", &code).unwrap();
+    assert_ne!(underscored.file, saved.file);
+    assert_ne!(spaced.file, saved.file);
+    assert_ne!(spaced.file, underscored.file);
+    let names: BTreeSet<String> = list_in(&dir).styles.into_iter().map(|s| s.name).collect();
+    assert_eq!(names.len(), 4, "{names:?}");
+    // A file holding another name is never overwritten.
+    std::fs::write(dir.join("winter.json"), format!(r#"{{"name":"Something else","code":"{code}"}}"#)).unwrap();
+    let e = save_in(&dir, "Winter", &code).unwrap_err().to_string();
+    assert!(e.contains("Something else"), "{e}");
+    std::fs::remove_file(dir.join("winter.json")).unwrap();
+    std::fs::remove_file(&underscored.file).unwrap();
+    std::fs::remove_file(&spaced.file).unwrap();
     // A name finds its code; a code is itself.
     assert_eq!(resolve_code_in(&dir, "SUMMER REEL").unwrap(), code);
     assert_eq!(resolve_code_in(&dir, &code).unwrap(), code);
@@ -1170,6 +1185,44 @@ fn chips_read_like_a_summary() {
     assert_eq!(json["settings"][2], serde_json::json!({"path": "transition.default", "value": "cut"}));
     assert_eq!(json["music"]["kind"], "songs");
     assert!(json["music"]["songs"][0]["id"].is_null());
+}
+
+/// Card text with placeholders reads as what fills them in, not braces;
+/// literal text is quoted as written.
+#[test]
+fn card_chips_describe_placeholders() {
+    let chip_for = |content: &str| {
+        let mut cfg = proposal("action_highlight", "/footage/x", "x", Some("/m/a.mp3"));
+        if let Some(CardLayer::Text(t)) = cfg.intro.as_mut().and_then(|c| c.layers.first_mut()) {
+            t.content = content.into();
+        }
+        let r = recipe_from_config(&cfg, Some("action_highlight"), Music::Auto).unwrap();
+        let s = summarize(&r).unwrap();
+        s.chips.into_iter().find(|c| c.label == "Title card").unwrap().value
+    };
+    assert_eq!(chip_for("{trip} · {date}"), "#0a0a0a · 3 s · trip name · date");
+    assert_eq!(chip_for("{title} — part 2"), "#0a0a0a · 3 s · your title — part 2");
+    assert_eq!(chip_for("Made with Vibecut"), "#0a0a0a · 3 s · \u{201c}Made with Vibecut\u{201d}");
+    assert!(!chip_for("{trip}").contains('{'));
+}
+
+/// Draft or final is how this render is made, not the style: a code
+/// doesn't carry `project.quality`, and applying one keeps the config's.
+#[test]
+fn codes_do_not_carry_render_quality() {
+    let mut cfg = proposal("action_highlight", "/footage/x", "x", Some("/m/a.mp3"));
+    cfg.project.quality = Some(vibecut::project_config::Quality::Draft);
+    let style = style_of(&cfg).unwrap();
+    assert!(style["project"].get("quality").is_none(), "{}", style["project"]);
+    let r = recipe_from_config(&cfg, Some("action_highlight"), Music::Auto).unwrap();
+    assert!(r.settings.iter().all(|s| path_string(&s.path) != "project.quality"), "{:?}", r.settings);
+    let quality = Setting {
+        path: vec![Seg::Key("project".into()), Seg::Key("quality".into())],
+        op: Op::Set("draft".into()),
+    };
+    let r = Recipe { vibe: "action_highlight".into(), music: Music::Auto, settings: vec![quality] };
+    let cfg = build_config(&decode(&encode(&r)).unwrap(), &dest("/footage/x", "T", "x"), &["/m/a.mp3".into()]).unwrap();
+    assert!(cfg.project.quality.is_none());
 }
 
 /// Every key the vibe templates render today is in the frozen file
