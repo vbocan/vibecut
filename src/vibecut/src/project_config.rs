@@ -210,7 +210,7 @@ pub struct RenderOutput {
     #[serde(default)]
     pub crf: Option<u32>,
     /// Platform preset: `master`, `youtube`, `reels`, `tiktok`, `shorts`,
-    /// `square` or `whatsapp` (see [`crate::output_format::OutputPreset`]).
+    /// `square`, `portrait` (4:5) or `whatsapp` (see [`crate::output_format::OutputPreset`]).
     /// An encoder preset name here (`"p5"`, `"veryfast"`) is still read as
     /// `encoder_preset`, for configs written before platform presets.
     #[serde(default)]
@@ -219,7 +219,8 @@ pub struct RenderOutput {
     #[serde(default)]
     pub audio_bitrate: Option<String>,
     /// How a frame fills this output when its aspect differs from the
-    /// body's: `blur` (default), `crop` or `pad`.
+    /// body's: `blur` (default), `crop`, `pad` or `smart` (a crop that
+    /// follows the action, [`crate::smart_reframe`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub fit: Option<crate::output_format::Fit>,

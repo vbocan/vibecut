@@ -33,6 +33,7 @@ pub mod progress;
 pub mod project_config;
 pub mod selection_planner;
 pub mod selection_scoring;
+pub mod smart_reframe;
 pub mod staging;
 pub mod track_meta;
 pub mod user_settings;

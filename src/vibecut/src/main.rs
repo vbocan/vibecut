@@ -190,15 +190,19 @@ enum Cmd {
     Reformat {
         /// The finished render (its manifest, if next to it, keeps titles safe).
         input: Utf8PathBuf,
-        /// youtube | reels | tiktok | shorts | square | whatsapp | master
+        /// youtube | reels | tiktok | shorts | square | portrait | whatsapp | master
         #[arg(long)]
         preset: String,
-        /// blur (default) | crop | pad — how a different aspect is filled.
+        /// blur (default) | crop | pad | smart — how a different aspect is
+        /// filled; smart follows the action.
         #[arg(long)]
         fit: Option<String>,
         /// Where to write it. Default: `<stem>.<preset>.mp4` next to the input.
         #[arg(long)]
         out: Option<Utf8PathBuf>,
+        /// With `--fit smart`: print where the crop sits over time.
+        #[arg(long)]
+        show_path: bool,
     },
 }
 
@@ -242,7 +246,9 @@ fn main() -> Result<()> {
         Cmd::Sync { file_a, file_b, start_a, start_b, window, max_lag } => {
             sync_cmd(&file_a, &file_b, start_a, start_b, window, max_lag)
         }
-        Cmd::Reformat { input, preset, fit, out } => reformat_cmd(&input, &preset, fit.as_deref(), out),
+        Cmd::Reformat { input, preset, fit, out, show_path } => {
+            reformat_cmd(&input, &preset, fit.as_deref(), out, show_path)
+        }
         Cmd::Benchmark {
             threads, repeats, num_files, duration_secs, resolution, codec, apply, force,
         } => vibecut::benchmark::run(vibecut::benchmark::BenchmarkArgs {
@@ -258,7 +264,13 @@ fn main() -> Result<()> {
     }
 }
 
-fn reformat_cmd(input: &Utf8Path, preset: &str, fit: Option<&str>, out: Option<Utf8PathBuf>) -> Result<()> {
+fn reformat_cmd(
+    input: &Utf8Path,
+    preset: &str,
+    fit: Option<&str>,
+    out: Option<Utf8PathBuf>,
+    show_path: bool,
+) -> Result<()> {
     use vibecut::output_format::{self as of, Fit, OutputPreset};
     if !input.is_file() {
         anyhow::bail!("file does not exist: {input}");
@@ -266,7 +278,7 @@ fn reformat_cmd(input: &Utf8Path, preset: &str, fit: Option<&str>, out: Option<U
     let preset = OutputPreset::parse(preset)
         .with_context(|| format!("unknown preset {preset:?} (one of: {})", OutputPreset::names()))?;
     let fit = fit
-        .map(|f| Fit::parse(f).with_context(|| format!("unknown fit {f:?} (blur, crop or pad)")))
+        .map(|f| Fit::parse(f).with_context(|| format!("unknown fit {f:?} ({})", Fit::NAMES)))
         .transpose()?;
     let utf8 = |p: std::path::PathBuf| {
         Utf8PathBuf::from_path_buf(p).map_err(|p| anyhow::anyhow!("non-UTF-8 path: {}", p.display()))
@@ -302,7 +314,42 @@ fn reformat_cmd(input: &Utf8Path, preset: &str, fit: Option<&str>, out: Option<U
         done.encoder,
         started.elapsed().as_secs_f32()
     );
+    if let Some(path) = &done.path {
+        println!("  smart reframe: {}", path.describe());
+        if show_path {
+            print_crop_path(path, (spec.width, spec.height), done.source_duration_secs);
+        }
+    }
     Ok(())
+}
+
+/// The crop's left (or top) edge every half second, in pixels of the frame
+/// scaled to cover the output (what the crop filter positions it in).
+fn print_crop_path(path: &vibecut::smart_reframe::CameraPath, out: (u32, u32), secs: f64) {
+    use vibecut::smart_reframe::PanAxis;
+    let (span, size) = match path.axis {
+        PanAxis::X => (out.0 as f64 / path.window, out.0 as f64),
+        PanAxis::Y => (out.1 as f64 / path.window, out.1 as f64),
+    };
+    let axis = match path.axis {
+        PanAxis::X => "x",
+        PanAxis::Y => "y",
+    };
+    println!("  crop {axis} (px of a {span:.0}-px frame; centre {:.0}):", (span - size) / 2.0);
+    let mut t = 0.0;
+    while t < secs {
+        println!("    {t:6.2}s  {:7.1}", path.offset_at(t) * (span - size));
+        t += 0.5;
+    }
+    let s = path.smoothness(30.0);
+    println!(
+        "  steadiness at 30 fps: {} cut{} snapped, largest move between frames {:.1} px, {} pan reversal{}",
+        s.jumps.len(),
+        if s.jumps.len() == 1 { "" } else { "s" },
+        s.max_step * span,
+        s.reversals,
+        if s.reversals == 1 { "" } else { "s" },
+    );
 }
 
 fn sync_cmd(

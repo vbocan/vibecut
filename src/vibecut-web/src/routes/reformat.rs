@@ -23,9 +23,9 @@ use crate::state::AppState;
 pub struct ReformatBody {
     /// The finished render (`output_path` or `version_path` of a render).
     pub output_path: String,
-    /// `youtube`, `reels`, `tiktok`, `shorts`, `square`, `whatsapp`, `master`.
+    /// `youtube`, `reels`, `tiktok`, `shorts`, `square`, `portrait`, `whatsapp`, `master`.
     pub preset: String,
-    /// `blur` (default), `crop` or `pad`.
+    /// `blur` (default), `crop`, `pad` or `smart` (follow the action).
     #[serde(default)]
     pub fit: Option<String>,
     #[serde(default)]

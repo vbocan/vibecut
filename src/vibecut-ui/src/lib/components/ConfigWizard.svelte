@@ -472,6 +472,7 @@
 									<option value="youtube">YouTube 16:9</option>
 									<option value="reels">Reels / TikTok / Shorts 9:16</option>
 									<option value="square">Square 1:1</option>
+									<option value="portrait">Portrait 4:5</option>
 									<option value="whatsapp">WhatsApp 9:16 small</option>
 								</select>
 							</label>
@@ -479,6 +480,7 @@
 								<span>Fit</span>
 								<select class="text-input" bind:value={out.fit}>
 									<option value={undefined}>Blur fill</option>
+									<option value="smart">Follow the action</option>
 									<option value="crop">Crop</option>
 									<option value="pad">Black bars</option>
 								</select>

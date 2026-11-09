@@ -8,6 +8,7 @@ import type { ChangeNote } from './types/generated/ChangeNote';
 import type { Config } from './types/generated/Config';
 import type { OutputTimeline } from './types/generated/OutputTimeline';
 import type { Segment } from './types/generated/Segment';
+import type { SmartPath } from './reframe';
 
 const BASE = '/api';
 
@@ -346,7 +347,7 @@ export type ReformatJobEntry = ReformatStatus &
 		kind: 'reformat';
 		source_path: string;
 		preset: PlatformPreset;
-		fit: 'blur' | 'crop' | 'pad' | null;
+		fit: ReframeFit | null;
 		output_path: string;
 	};
 
@@ -411,7 +412,11 @@ export function inspectAt(videoPath: string, times: number[]): Promise<FrameSumm
 // ---------- reformat (platform versions) ----------
 
 /** Platform presets `POST /reformat` (and `[[outputs]].preset`) accept. */
-export type PlatformPreset = 'youtube' | 'reels' | 'tiktok' | 'shorts' | 'square' | 'whatsapp' | 'master';
+export type PlatformPreset = 'youtube' | 'reels' | 'tiktok' | 'shorts' | 'square' | 'portrait' | 'whatsapp' | 'master';
+
+/** How a version of another shape is filled: blurred fill, centre crop,
+ *  black bars, or a crop that follows the action. */
+export type ReframeFit = 'blur' | 'crop' | 'pad' | 'smart';
 
 export interface ReformatResult {
 	ok: boolean;
@@ -422,7 +427,7 @@ export interface ReformatResult {
 	width: number;
 	height: number;
 	/** `null` when the source already has the preset's aspect. */
-	fit: 'blur' | 'crop' | 'pad' | null;
+	fit: ReframeFit | null;
 	/** Stream-copied: the source already was this shape. */
 	copied: boolean;
 	/** An up-to-date version already existed. */
@@ -431,6 +436,9 @@ export interface ReformatResult {
 	duration_secs: number;
 	source_duration_secs: number;
 	size_bytes: number;
+	/** The camera path a `smart` version followed; null when it was
+	 *  reused rather than made. */
+	smart?: SmartPath | null;
 }
 
 /** Start a platform version of a finished render; poll `reformatStatus`.
@@ -438,7 +446,7 @@ export interface ReformatResult {
 export function reformat(
 	outputPath: string,
 	preset: PlatformPreset,
-	fit?: 'blur' | 'crop' | 'pad'
+	fit?: ReframeFit
 ): Promise<{
 	job_id: string;
 	kind: 'reformat';
