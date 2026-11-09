@@ -126,6 +126,8 @@ export interface ProposeArgs {
 	title?: string;
 	target_duration?: string;
 	seed?: number;
+	/** Song file; omit to let the server pick one for the vibe, 'none' for no music. */
+	soundtrack?: string;
 }
 
 export interface ProposeResult {
@@ -135,6 +137,19 @@ export interface ProposeResult {
 	config_path: string;
 	config_toml: string;
 	output_path: string;
+	/** The song the proposed config uses (absent on proposals saved by older builds). */
+	soundtrack?: ProposedSoundtrack | null;
+	/** The server's pick for this vibe, length and seed: what "Let Vibecut pick" means. */
+	auto_pick?: MusicPick | null;
+	/** Why there's no music, when there isn't. */
+	music_note?: string | null;
+}
+
+export interface ProposedSoundtrack {
+	path: string;
+	title: string;
+	picked_by: 'vibecut' | 'you';
+	reason: string | null;
 }
 
 export function proposeVibe(args: ProposeArgs): Promise<ProposeResult> {
@@ -307,7 +322,19 @@ export function inspectAt(videoPath: string, times: number[]): Promise<FrameSumm
 export interface Track {
 	path: string;
 	title: string;
-	collection: 'yours' | 'library';
+	collection: 'yours' | 'library' | 'starter';
+	artist: string | null;
+	licence: TrackLicence;
+	/** A public post must credit the track (CC BY and friends). */
+	attribution_required: boolean;
+	/** Ready-made credit line for captions. */
+	credit: string | null;
+	source_url: string | null;
+	declared_bpm: number | null;
+	/** Where the licence info came from: a `<track>.json` sidecar or the folder's library.json. */
+	metadata: 'sidecar' | 'library' | null;
+	/** Steady beat and a long loud section: repeats without an audible seam. */
+	loops_cleanly: boolean;
 	duration_secs: number;
 	bpm: number;
 	beat_interval_secs: number;
@@ -321,8 +348,53 @@ export interface Track {
 	loud_region: [number, number];
 }
 
-export function listMusic(): Promise<{ tracks: Track[]; dirs: { path: string; collection: string }[] }> {
+export interface TrackLicence {
+	/** Normalised id: 'CC0-1.0', 'CC-BY-4.0', 'Pixabay', 'YouTube-Audio-Library', 'unknown', … */
+	id: string;
+	label: string;
+	kind:
+		| 'unknown'
+		| 'cc0'
+		| 'cc_by'
+		| 'cc_by_sa'
+		| 'cc_by_nc'
+		| 'cc_by_nd'
+		| 'pixabay'
+		| 'youtube_audio_library'
+		| 'custom';
+	/** Plain-language advice for posting a video with it. */
+	note: string;
+}
+
+export interface MusicLibrary {
+	tracks: Track[];
+	/** Unreadable or invalid metadata files, unvetted starter-pack tracks. */
+	warnings: string[];
+	/** Where to put downloaded songs, as the server sees it. */
+	import_dir: string;
+	dirs: { path: string; collection: string; exists: boolean }[];
+}
+
+export function listMusic(): Promise<MusicLibrary> {
 	return getJson('/music');
+}
+
+/** The server's song choice for a vibe, with the reason. */
+export interface MusicPick {
+	path: string;
+	title: string;
+	reason: string;
+	score: number;
+	close_matches: number;
+	covers_length: boolean;
+	loops_cleanly: boolean;
+}
+
+/** The song a proposal with these settings would auto-pick (null: empty library). */
+export function pickMusic(args: { vibe: string; target_duration?: string; seed?: number }): Promise<{ pick: MusicPick | null }> {
+	const q = new URLSearchParams({ vibe: args.vibe, seed: String(args.seed ?? 42) });
+	if (args.target_duration) q.set('target_duration', args.target_duration);
+	return getJson(`/music/pick?${q}`);
 }
 
 /** Stream URL for previewing a library track (supports seeking). */

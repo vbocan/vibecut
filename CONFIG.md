@@ -153,6 +153,19 @@ beat_burst_max_beats  = 12               # cap on burst length (default: 12)
 pulse strength ≥ 1.8, and the loud region is ≥ 6 s long. Cuts every beat
 ≤ 140 BPM, every-other above. Placed in the middle 25–70% of the output.
 
+### Choosing the song
+
+Proposals (`POST /api/propose`, MCP `propose_vibe`) fill in `file`
+themselves: without a `soundtrack` in the request they pick a library song
+whose tempo, energy and length suit the vibe, write the vibe's own
+`[soundtrack]` settings around it, and explain the pick in a comment above
+the section. `soundtrack = "none"` in the request leaves the section out.
+A song's title, artist, licence and credit line come from an optional
+`<track>.json` or `library.json` next to it; every render writes them, with
+the file's SHA-256, to the manifest's `soundtrack` list. See
+[MUSIC.md](MUSIC.md) for the scoring, the metadata format, licences and
+the starter pack.
+
 ### Beat grid
 
 The soundtrack's beats come from a fitted grid, not just a tempo estimate.

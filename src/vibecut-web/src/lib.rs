@@ -107,6 +107,60 @@ mod tests {
         assert_eq!(body["vibes"].as_array().unwrap().len(), 6);
     }
 
+    /// The library listing tells the import view where downloads go and
+    /// what went wrong reading metadata, even when it is empty.
+    #[tokio::test]
+    async fn music_lists_tracks_import_dir_and_warnings() {
+        let app = router(AppState::default());
+        let res = app
+            .oneshot(Request::builder().uri("/api/music").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert!(body["tracks"].is_array());
+        assert!(body["warnings"].is_array());
+        assert_eq!(body["import_dir"], "/projects/music");
+        assert_eq!(body["dirs"][0]["collection"], "yours");
+        assert!(body["dirs"][0]["exists"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn music_pick_validates_the_vibe_and_answers_null_without_music() {
+        let app = router(AppState::default());
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/music/pick?vibe=nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/music/pick?vibe=kid_reel&target_duration=soon")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        // No /projects/music where tests run: a valid request picks nothing.
+        if !std::path::Path::new("/projects/music").is_dir() && std::env::var_os("VIBECUT_MUSIC_DIRS").is_none() {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/music/pick?vibe=kid_reel&target_duration=30s&seed=7")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert!(body_json(res).await["pick"].is_null());
+        }
+    }
+
     /// `/footage` won't exist on a host running `cargo test` (it's a
     /// container mount point) — that's exactly the deterministic
     /// not-found path this test exercises, proving the

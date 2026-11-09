@@ -57,6 +57,12 @@
 		document.documentElement.style.setProperty('--beat', `${beat && beat > 0.2 ? beat : 0.5}s`);
 	});
 
+	// Keep the server's "Picked for you" in step with the vibe, length and
+	// seed (it reads them before its first await, so they're tracked).
+	$effect(() => {
+		void s.refreshAutoPick();
+	});
+
 	function newVideo() {
 		if (s.renderMode === 'queued' || s.renderMode === 'running') return;
 		if (

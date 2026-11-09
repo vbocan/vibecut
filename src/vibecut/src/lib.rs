@@ -26,6 +26,7 @@ pub mod progress;
 pub mod project_config;
 pub mod selection_planner;
 pub mod selection_scoring;
+pub mod track_meta;
 pub mod user_settings;
 pub mod video_renderer;
 pub mod visual_analysis;

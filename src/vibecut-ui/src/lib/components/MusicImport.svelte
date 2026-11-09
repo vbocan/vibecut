@@ -1,0 +1,273 @@
+<script lang="ts">
+	import { appState as s } from '$lib/state.svelte';
+	import { licenceBadge } from '$lib/music';
+
+	// "Add music": where downloaded songs go, and what each track's licence
+	// means for posting. Vibecut can't ship most royalty-free music (the
+	// sites forbid redistribution), so the user brings their own.
+	let open = $state(false);
+
+	const importDir = $derived(s.musicImportDir ?? '/projects/music');
+	const importExists = $derived(s.musicDirs.find((d) => d.path === importDir)?.exists ?? true);
+	const otherDirs = $derived(s.musicDirs.filter((d) => d.path !== importDir));
+	const needCredit = $derived(s.tracks.filter((t) => t.attribution_required).length);
+	const unknown = $derived(s.tracks.filter((t) => t.licence.kind === 'unknown').length);
+
+	const example = `{
+  "title": "Night Drive",
+  "artist": "Ada Lovelace",
+  "licence": "CC-BY-4.0",
+  "source_url": "https://example.org/night-drive",
+  "credit": "Night Drive by Ada Lovelace (CC BY 4.0)"
+}`;
+</script>
+
+<div class="import">
+	<button
+		type="button"
+		class="toggle"
+		aria-expanded={open}
+		aria-controls="music-import"
+		onclick={() => (open = !open)}
+	>
+		<span class="plus" aria-hidden="true">{open ? '−' : '+'}</span>
+		<span>Add music <span class="dim">· import my downloads</span></span>
+		{#if !open && (needCredit > 0 || unknown > 0)}
+			<span class="summary">
+				{#if needCredit > 0}{needCredit} need credit{/if}{#if needCredit > 0 && unknown > 0} · {/if}{#if unknown > 0}{unknown}
+					with unknown licence{/if}
+			</span>
+		{/if}
+	</button>
+
+	{#if open}
+		<div id="music-import" class="panel">
+			<section>
+				<h3>Where to put your songs</h3>
+				<p>
+					Copy MP3, WAV, M4A, FLAC or OGG files into the <strong>music</strong> folder inside your Vibecut
+					projects folder. The server sees it as <code>{importDir}</code>{#if !importExists}
+						— it doesn't exist yet, so create it{/if}. Subfolders are fine; Vibecut works out each song's tempo,
+					beats and energy the first time it sees it.
+				</p>
+				{#if otherDirs.length > 0}
+					<p class="dim">
+						Also reading:
+						{#each otherDirs as d, i (d.path)}{#if i > 0}, {/if}<code>{d.path}</code>{/each}
+					</p>
+				{/if}
+				<button class="btn ghost" type="button" onclick={() => s.loadMusic()} disabled={s.loadingMusic}
+					>{s.loadingMusic ? 'Looking…' : 'Look again'}</button
+				>
+			</section>
+
+			<section>
+				<h3>Licences</h3>
+				<p class="dim">
+					Songs from royalty-free sites come with that site's terms. Tell Vibecut what they are with a
+					<code>song.json</code> next to <code>song.mp3</code>, or one <code>library.json</code> per folder:
+				</p>
+				<pre class="mono">{example}</pre>
+				{#if s.tracks.length > 0}
+					<ul class="tracks" aria-label="Licence of each song">
+						{#each s.tracks as t (t.path)}
+							{@const b = licenceBadge(t)}
+							<li>
+								<span class="name">
+									<strong>{t.title}</strong>{#if t.artist}<span class="dim">{` · ${t.artist}`}</span>{/if}
+								</span>
+								<span class="badges">
+									<span class="badge {b.tone}">{b.text}</span>
+									{#if t.collection === 'starter'}<span class="badge starter">Starter pack</span>{/if}
+								</span>
+								<span class="note">{t.licence.note}</span>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</section>
+
+			{#if s.musicWarnings.length > 0}
+				<section class="warn" aria-live="polite">
+					<h3>Couldn't use some of it</h3>
+					<ul>
+						{#each s.musicWarnings as w, i (i)}<li class="mono">{w}</li>{/each}
+					</ul>
+				</section>
+			{/if}
+		</div>
+	{/if}
+</div>
+
+<style>
+	.import {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+
+	.toggle {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex-wrap: wrap;
+		padding: 10px 14px;
+		border-radius: var(--r-md);
+		border: 1px dashed var(--line-strong);
+		background: transparent;
+		color: var(--text);
+		font-weight: 600;
+		text-align: left;
+		cursor: pointer;
+	}
+
+	.toggle:hover {
+		background: rgba(255, 255, 255, 0.04);
+	}
+
+	.plus {
+		display: grid;
+		place-items: center;
+		width: 22px;
+		height: 22px;
+		border-radius: 50%;
+		background: rgba(255, 255, 255, 0.08);
+	}
+
+	.summary {
+		margin-left: auto;
+		font-size: var(--fs-xs);
+		color: #ffc94a;
+		font-weight: 600;
+	}
+
+	.dim {
+		color: var(--text-faint);
+		font-weight: 400;
+	}
+
+	.panel {
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		padding: 14px 16px;
+		border-radius: var(--r-md);
+		border: 1px solid var(--line);
+		background: rgba(255, 255, 255, 0.025);
+	}
+
+	section {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 8px;
+	}
+
+	h3 {
+		margin: 0;
+		font-size: var(--fs-sm);
+		font-weight: 700;
+	}
+
+	p {
+		margin: 0;
+		font-size: var(--fs-sm);
+		color: var(--text-dim);
+		line-height: 1.5;
+	}
+
+	code {
+		word-break: break-all;
+	}
+
+	pre {
+		margin: 0;
+		padding: 10px 12px;
+		max-width: 100%;
+		overflow-x: auto;
+		border-radius: var(--r-sm, 8px);
+		background: rgba(0, 0, 0, 0.3);
+		font-size: var(--fs-xs);
+	}
+
+	.tracks {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		width: 100%;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		max-height: 260px;
+		overflow-y: auto;
+	}
+
+	.tracks li {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: 2px 10px;
+		padding: 8px 10px;
+		border-radius: var(--r-sm, 8px);
+		background: rgba(255, 255, 255, 0.03);
+	}
+
+	.name {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.badges {
+		display: flex;
+		gap: 6px;
+		justify-content: flex-end;
+	}
+
+	.note {
+		grid-column: 1 / -1;
+		font-size: var(--fs-xs);
+		color: var(--text-dim);
+	}
+
+	.badge {
+		font-size: var(--fs-xs);
+		font-weight: 700;
+		padding: 2px 8px;
+		border-radius: 999px;
+		border: 1px solid currentColor;
+		white-space: nowrap;
+	}
+
+	.badge.ok {
+		color: var(--good);
+	}
+	.badge.credit {
+		color: var(--cyan);
+	}
+	.badge.caution {
+		color: #ffc94a;
+	}
+	.badge.unknown {
+		color: var(--text-faint);
+	}
+	.badge.starter {
+		color: var(--lime);
+	}
+
+	.warn ul {
+		margin: 0;
+		padding-left: 18px;
+		font-size: var(--fs-xs);
+		color: #ffc94a;
+	}
+
+	@media (max-width: 640px) {
+		.tracks li {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.badges {
+			justify-content: flex-start;
+		}
+	}
+</style>
