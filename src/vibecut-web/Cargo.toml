@@ -60,3 +60,6 @@ tower = { workspace = true, features = ["util"] }
 # the extension trait for one-shot test requests does.
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+# Loading a config the way the share route does, in a recipes test.
+vibecut = { path = "../vibecut" }
+camino = "1"

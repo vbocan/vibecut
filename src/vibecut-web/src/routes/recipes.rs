@@ -186,13 +186,20 @@ audio_bitrate = "192k"
         )
         .unwrap();
 
-        let (status, shared) =
+        // The share route reads configs under /projects only; a test can't
+        // write there, so its refusal is checked and the code is made the
+        // way the route makes it.
+        let (status, err) =
             call(post("/api/recipes/code", serde_json::json!({ "config_path": path.to_string_lossy() }))).await;
-        assert_eq!(status, StatusCode::OK, "{shared}");
-        let code = shared["code"].as_str().unwrap();
-        assert!(code.starts_with("VC1-") && shared["chars"].as_u64().unwrap() < 40, "{shared}");
-        assert_eq!(shared["style"]["vibe"], "action_highlight");
-        assert_eq!(shared["style"]["music"]["kind"], "original");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        let cfg = vibecut::project_config::Config::load(camino::Utf8Path::from_path(&path).unwrap()).unwrap();
+        let recipe = vibecut_ops::recipe::recipe_from_config(&cfg, None, vibecut_ops::recipe::Music::Original).unwrap();
+        let code = vibecut_ops::recipe::encode(&recipe);
+        let code = code.as_str();
+        assert!(code.starts_with("VC1-") && code.len() < 40, "{code}");
+        let summary = serde_json::to_value(vibecut_ops::recipe::summarize(&recipe).unwrap()).unwrap();
+        assert_eq!(summary["vibe"], "action_highlight");
+        assert_eq!(summary["music"]["kind"], "original");
 
         let (status, preview) = call(get(&format!("/api/recipes/preview?code={code}"))).await;
         assert_eq!(status, StatusCode::OK, "{preview}");
@@ -217,13 +224,19 @@ audio_bitrate = "192k"
 
     #[tokio::test]
     async fn apply_and_save_report_bad_input() {
-        // No such footage folder.
+        // No such footage folder; one outside the mounts.
+        let (status, _) = call(post(
+            "/api/recipes/apply",
+            serde_json::json!({ "code": "VC1-Q1VCGg", "folder": "no/such/footage" }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = call(post(
             "/api/recipes/apply",
             serde_json::json!({ "code": "VC1-Q1VCGg", "folder": "/no/such/footage" }),
         ))
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         // A name that isn't a saved style.
         let (status, _) = call(post("/api/recipes/apply", serde_json::json!({ "code": "Winter", "folder": "/x" }))).await;
         assert_eq!(status, StatusCode::NOT_FOUND);

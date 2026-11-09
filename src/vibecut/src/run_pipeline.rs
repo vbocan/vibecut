@@ -87,10 +87,17 @@ pub struct RenderOutcome {
 /// [`run_cmd`] with every option: renders `config_path` and says what it
 /// wrote (`None` for a dry run or `print_effective_config`).
 pub fn run_with(config_path: &Utf8Path, opts: RunOptions) -> Result<Option<RenderOutcome>> {
-    let RunOptions { dry_run, print_effective_config, random_seed, .. } = opts;
-    let mut cfg = Config::load(config_path)
+    let cfg = Config::load(config_path)
         .with_context(|| format!("loading config {config_path}"))?;
+    run_config(cfg, opts)
+}
 
+/// [`run_with`] for a config the caller has already loaded. The server
+/// (`vibecut-ops`) checks every path in a config before rendering it,
+/// so it must run the value it checked rather than re-read a file that
+/// may have changed in between.
+pub fn run_config(mut cfg: Config, opts: RunOptions) -> Result<Option<RenderOutcome>> {
+    let RunOptions { dry_run, print_effective_config, random_seed, .. } = opts;
     // `--random-seed` overrides whatever seed the TOML had (or didn't have)
     // with a fresh value derived from the system clock + a SplitMix64 mix.
     // The seed lands in the manifest, so the user can lock it back in via
@@ -190,8 +197,14 @@ pub fn run_with(config_path: &Utf8Path, opts: RunOptions) -> Result<Option<Rende
 /// on analysed footage. The render plans the same config to the same edit.
 pub fn plan_cmd(config_path: &Utf8Path, no_visual: bool, no_cache: bool) -> Result<PlanSummary> {
     let cfg = Config::load(config_path).with_context(|| format!("loading config {config_path}"))?;
-    let plan = plan_edit(&cfg, no_visual, no_cache, PlanFor::Preview)?;
-    Ok(plan.summary(&cfg))
+    plan_config(&cfg, no_visual, no_cache)
+}
+
+/// [`plan_cmd`] for a config the caller has already loaded (and, in the
+/// server, checked: see [`run_config`]).
+pub fn plan_config(cfg: &Config, no_visual: bool, no_cache: bool) -> Result<PlanSummary> {
+    let plan = plan_edit(cfg, no_visual, no_cache, PlanFor::Preview)?;
+    Ok(plan.summary(cfg))
 }
 
 fn execute_pipeline(cfg: &Config, opts: RunOptions) -> Result<RenderOutcome> {
@@ -3110,7 +3123,8 @@ fn generate_random_seed() -> u64 {
     crate::rng::clock_seed()
 }
 
-/// `<dir>/<stem>.manifest.json` for an output `<dir>/<stem>.<ext>`.
+/// Where a render writes the manifest for `output` (its first
+/// `[[outputs]]` entry): `<stem>.manifest.json` beside it.
 pub fn manifest_path_for(output: &Utf8Path) -> Utf8PathBuf {
     let parent = output.parent().unwrap_or(Utf8Path::new("."));
     let stem = output.file_stem().unwrap_or("output");

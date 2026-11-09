@@ -13,7 +13,7 @@ use vibecut::project_config::Config;
 
 use crate::error::OpsError;
 use crate::music::{self, AutoPick, TrackInfo};
-use crate::paths::{resolve_footage, slugify, PROJECTS_ROOT};
+use crate::paths::{resolve_footage_checked, slugify, PROJECTS_ROOT};
 use crate::vibes;
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,7 +195,7 @@ pub async fn preview_pick(
 }
 
 pub async fn propose_vibe(args: ProposeArgs<'_>) -> Result<ProposeResult, OpsError> {
-    let target_folder = resolve_footage(args.folder);
+    let target_folder = resolve_footage_checked(args.folder)?;
     if !target_folder.exists() {
         return Err(OpsError::not_found_with(
             "footage folder",

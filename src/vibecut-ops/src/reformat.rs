@@ -35,7 +35,7 @@ use vibecut::progress::{Progress, Stage};
 
 use crate::error::OpsError;
 use crate::jobs::{JobRegistry, JobState, ReformatJob};
-use crate::paths::resolve_projects;
+use crate::paths::resolve_projects_checked;
 
 /// Containers a reformat reads.
 const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "mov"];
@@ -71,7 +71,7 @@ pub fn parse_fit(s: Option<&str>) -> Result<Option<Fit>, OpsError> {
 pub fn prepare(output_path: &str, preset: &str, fit: Option<&str>) -> Result<ReformatTarget, OpsError> {
     let preset = parse_preset(preset)?;
     let fit = parse_fit(fit)?;
-    let source = resolve_projects(output_path);
+    let source = resolve_projects_checked(output_path)?;
     let ext = source
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())

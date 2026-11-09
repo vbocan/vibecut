@@ -54,7 +54,7 @@ use vibecut::output_timeline::{OutputTimeline, TimelineClip, TimelineMusic};
 use vibecut::selection_planner::Manifest;
 
 use crate::error::OpsError;
-use crate::paths::{resolve_projects, FOOTAGE_ROOT, PROJECTS_ROOT};
+use crate::paths::{resolve_projects_checked, FOOTAGE_ROOT, PROJECTS_ROOT};
 
 // ---------- Exact time ----------
 
@@ -1783,7 +1783,7 @@ pub fn export_timeline(output_path: &str, format: &str, fps: Option<&str>) -> Re
         })?),
         None => None,
     };
-    let video = resolve_projects(output_path);
+    let video = resolve_projects_checked(output_path)?;
     let manifest_path = manifest_for(&video)
         .ok_or_else(|| OpsError::not_found_with("manifest", video.with_extension("manifest.json").to_string_lossy().into_owned()))?;
     let text = std::fs::read_to_string(&manifest_path)

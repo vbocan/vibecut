@@ -9,7 +9,7 @@ use serde::Serialize;
 use vibecut::media_probe;
 
 use crate::error::OpsError;
-use crate::paths::resolve_footage;
+use crate::paths::resolve_footage_checked;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoverResult {
@@ -22,11 +22,13 @@ pub struct DiscoverResult {
     pub hint: Option<String>,
 }
 
-/// Scan `folder` (relative to `/footage`, or an absolute container
-/// path) and group GoPro chapters (`GH010023.MP4`, `GH020023.MP4`, …;
-/// `GOPR0042.MP4`, `GP010042.MP4`, … on older cameras) into logical sources.
+/// Scan `folder` (relative to `/footage`, a browse display path, or an
+/// absolute path under `/footage`, `/projects` or a browse root; see
+/// [`resolve_footage_checked`]) and group GoPro chapters (`GH010023.MP4`,
+/// `GH020023.MP4`, …; `GOPR0042.MP4`, `GP010042.MP4`, … on older
+/// cameras) into logical sources.
 pub async fn discover_sources(folder: &str) -> Result<DiscoverResult, OpsError> {
-    let target = resolve_footage(folder);
+    let target = resolve_footage_checked(folder)?;
     if !target.exists() {
         return Err(OpsError::not_found_with(
             "footage folder",

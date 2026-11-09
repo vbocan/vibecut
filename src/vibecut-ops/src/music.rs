@@ -35,7 +35,7 @@ use vibecut::disk_cache::{Cache, Scope};
 use vibecut::track_meta::{FolderMeta, Licence, LicenceKind, MetaSource, TrackMeta};
 
 use crate::error::OpsError;
-use crate::paths::{resolve_projects, PROJECTS_ROOT};
+use crate::paths::PROJECTS_ROOT;
 use crate::vibes::Vibe;
 
 /// Audio file extensions the library picks up.
@@ -245,7 +245,13 @@ fn is_audio(p: &Path) -> bool {
 pub fn check_soundtrack_file(requested: &str) -> Result<PathBuf, OpsError> {
     let mut roots: Vec<PathBuf> = music_dirs().into_iter().map(|(d, _)| d).collect();
     roots.push(PathBuf::from(PROJECTS_ROOT));
-    soundtrack_file_in(&resolve_projects(requested.trim()), &roots)
+    let requested = requested.trim();
+    let path = if requested.starts_with('/') || Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        Path::new(PROJECTS_ROOT).join(requested)
+    };
+    soundtrack_file_in(&path, &roots)
 }
 
 fn soundtrack_file_in(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, OpsError> {

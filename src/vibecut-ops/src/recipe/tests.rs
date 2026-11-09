@@ -1118,10 +1118,15 @@ async fn applying_writes_a_proposal_like_propose() {
     assert_eq!(written.project.name, "Ski!");
     assert!(written.soundtrack.is_none());
 
-    // Missing footage, bad code.
+    // Missing footage, footage outside the mounts, bad code.
+    let missing = root.join("no-such-folder");
+    assert!(matches!(
+        apply_in(&root, ApplyArgs { code: &code, folder: &missing.to_string_lossy(), title: None }, vec![]).await,
+        Err(OpsError::NotFound { .. })
+    ));
     assert!(matches!(
         apply_in(&root, ApplyArgs { code: &code, folder: "/no/such/folder", title: None }, vec![]).await,
-        Err(OpsError::NotFound { .. })
+        Err(OpsError::InvalidInput { .. })
     ));
     assert!(matches!(
         apply_in(&root, ApplyArgs { code: "VC2-AAAA", folder: &footage.to_string_lossy(), title: None }, vec![]).await,
@@ -1147,9 +1152,14 @@ async fn sharing_a_config_file_makes_a_code() {
     assert!(!r.style.chips.iter().any(|c| c.label == "Ducking"), "no music, no ducking chip");
     let p = summarize(&decode(&r.code).unwrap()).unwrap();
     assert_eq!(p.chips, r.style.chips);
+    let missing = root.join("no-such.toml");
+    assert!(matches!(
+        share_style(ShareArgs { config_path: &missing.to_string_lossy(), manifest_path: None, vibe: None, let_vibecut_pick: false }).await,
+        Err(OpsError::NotFound { .. })
+    ));
     assert!(matches!(
         share_style(ShareArgs { config_path: "/no/such.toml", manifest_path: None, vibe: None, let_vibecut_pick: false }).await,
-        Err(OpsError::NotFound { .. })
+        Err(OpsError::InvalidInput { .. })
     ));
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -314,6 +314,22 @@ form: `http://localhost:8080/`.
 | `/projects` | Generated TOMLs, rendered outputs, conversation logs. |
 | `/cache` | Persisted visual-analysis cache; speeds up re-renders. |
 
+The servers keep every path inside these mounts. Paths passed to a
+tool or endpoint (config, output and manifest paths) must be under
+`/projects`. Footage folders may be relative to `/footage`, a folder from
+Browse your drives (`D:\GoPro\Alps`), or an absolute path under
+`/footage`, `/projects` or a browse root. A config rendered by the server
+must write under `/projects` (`[[outputs]].path`, `[project].temp_dir`)
+and read from `/footage`, `/projects`, a browse root, the music library
+(`VIBECUT_MUSIC_DIRS`) or a watched folder (`VIBECUT_WATCH_DIRS`): that
+covers the input folder and files, soundtrack, intro and outro images,
+LUT and `models_dir`. Fonts may also come from `/usr/share/fonts`.
+Anything else is refused with a 400 naming the setting. Use absolute
+paths inside a config: the pipeline opens a relative path against the
+server's working directory (`/` in the image), not the config's folder,
+so `out/final.mp4` would mean `/out/final.mp4` and is refused. The
+`vibecut` CLI is not restricted.
+
 A timeline export (Share → **Open in an editor**, `GET /api/export`; see
 CONFIG.md, "Open in another editor") points Final Cut / Resolve at the
 footage and music by path. Inside the container those are `/footage/…` and

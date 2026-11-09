@@ -22,7 +22,7 @@ use camino::Utf8PathBuf;
 use tokio::sync::watch;
 
 use crate::error::OpsError;
-use crate::paths::resolve_projects;
+use crate::paths::{check_config_paths, resolve_projects_checked};
 
 /// How long a finished plan answers later requests for the same config
 /// text. Footage added in the meantime shows up after this.
@@ -144,7 +144,7 @@ async fn reuse(mut rx: watch::Receiver<Slot>, text: &str) -> Option<(serde_json:
 /// `planned_by` (`render` — a render of this config planned it; `plan` —
 /// planned for this request, or an earlier one) and `elapsed_ms`.
 pub async fn plan(config_path: &str) -> Result<serde_json::Value, OpsError> {
-    let cfg = resolve_projects(config_path);
+    let cfg = resolve_projects_checked(config_path)?;
     if !cfg.exists() {
         return Err(OpsError::not_found_with("config", cfg.to_string_lossy().into_owned()));
     }
@@ -159,8 +159,14 @@ pub async fn plan(config_path: &str) -> Result<serde_json::Value, OpsError> {
     } {
         Some(found) => found,
         None => {
+            // Load once and plan what was checked: planning probes the
+            // footage and writes an analysis cache beside the output.
+            let config = vibecut::project_config::Config::load(&cfg_camino).map_err(|e| {
+                OpsError::invalid(crate::error::without_source_text(&format!("loading config {cfg_camino}: {e:#}")))
+            })?;
+            check_config_paths(&config)?;
             let summary = tokio::task::spawn_blocking(move || {
-                vibecut::run_pipeline::plan_cmd(&cfg_camino, /*no_visual*/ false, /*no_cache*/ false)
+                vibecut::run_pipeline::plan_config(&config, /*no_visual*/ false, /*no_cache*/ false)
             })
             .await
             .map_err(|e| OpsError::internal(format!("plan task panicked: {e}")))?
@@ -214,7 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_config_is_not_found() {
-        let e = plan("/nonexistent/vibecut/p.toml").await.unwrap_err();
+        let e = plan("nonexistent/vibecut/p.toml").await.unwrap_err();
         assert!(matches!(e, OpsError::NotFound { .. }), "{e:?}");
     }
 

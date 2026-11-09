@@ -315,7 +315,7 @@
 			</li>
 		{:else}
 			{#if !loading && !error}
-				<li class="empty" role="presentation">
+				<li class="no-folders" role="presentation">
 					{listing ? 'No folders in here.' : 'No drives to show. See DOCKER.md, “Browsing your drives”.'}
 				</li>
 			{/if}
@@ -535,7 +535,7 @@
 		color: var(--text-faint);
 	}
 
-	.empty {
+	.no-folders {
 		padding: 18px 12px;
 		color: var(--text-dim);
 	}

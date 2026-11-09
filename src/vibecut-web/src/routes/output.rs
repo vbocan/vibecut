@@ -13,7 +13,7 @@ use serde::Deserialize;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use vibecut_ops::error::OpsError;
-use vibecut_ops::paths::{resolve_projects, PROJECTS_ROOT};
+use vibecut_ops::paths::{resolve_projects_checked, PROJECTS_ROOT};
 
 use crate::error::ApiError;
 
@@ -33,7 +33,9 @@ pub async fn serve_output(
         ))
         .into());
     }
-    serve_file(resolve_projects(&q.path), req).await
+    // Then the shared resolver: absolute paths elsewhere and symlinks
+    // out of the mount are a 400 too.
+    serve_file(resolve_projects_checked(&q.path)?, req).await
 }
 
 /// Stream `path` with full HTTP file semantics via tower-http's
@@ -185,9 +187,41 @@ mod tests {
     }
 
     #[test]
-    fn accepts_relative_and_projects_rooted_paths() {
+    fn accepts_relative_and_projects_rooted_paths_lexically() {
         assert!(is_safe_projects_path("out/render.mp4"));
         assert!(is_safe_projects_path("render.mp4"));
         assert!(is_safe_projects_path("/projects/out/render.mp4"));
+    }
+
+    async fn status_for(path: &str) -> axum::http::StatusCode {
+        let req = Request::new(axum::body::Body::empty());
+        match serve_output(Query(OutputFileQuery { path: path.into() }), req).await {
+            Ok(resp) => resp.status(),
+            Err(e) => e.into_response().status(),
+        }
+    }
+
+    #[tokio::test]
+    async fn traversal_and_outside_paths_are_400() {
+        for p in [
+            "../../etc/passwd",
+            "out/../../etc/passwd",
+            r"..\..\Windows\System32",
+            "/etc/passwd",
+            "/proc/self/environ",
+            "/projects-evil/render.mp4",
+            "C:/Windows/System32",
+            "D:/anything",
+        ] {
+            assert_eq!(status_for(p).await, axum::http::StatusCode::BAD_REQUEST, "{p:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn projects_paths_get_past_the_guard() {
+        // Not on disk in a test environment, so a 404, not a 400.
+        for p in ["out/render.mp4", "render.mp4", "/projects/out/render.mp4"] {
+            assert_eq!(status_for(p).await, axum::http::StatusCode::NOT_FOUND, "{p:?}");
+        }
     }
 }

@@ -2399,6 +2399,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "camino",
  "futures-util",
  "http-body-util",
  "reqwest",
@@ -2409,6 +2410,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "vibecut",
  "vibecut-ops",
 ]
 

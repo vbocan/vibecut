@@ -7,12 +7,59 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use camino::Utf8PathBuf;
-use vibecut::project_config::Quality;
+use camino::{Utf8Path, Utf8PathBuf};
+use vibecut::project_config::{Config, Quality};
 
 use crate::error::OpsError;
 use crate::jobs::{JobInfo, JobRegistry, JobState};
-use crate::paths::resolve_projects;
+use crate::paths::{check_config_paths_in, resolve_projects_checked, ConfigRoots};
+
+/// What [`load_for_render`] found at a config path.
+#[derive(Debug)]
+enum Loaded {
+    /// Loaded, and every path inside it is within the mounts. The
+    /// pipeline runs this value rather than re-reading the file, so a
+    /// config swapped on disk after the check can't slip past it.
+    Ready(Box<Config>),
+    /// Didn't parse or validate. Reported as a failed render, the same
+    /// as when the pipeline loaded the file itself.
+    Unloadable(String),
+}
+
+/// Load the config and confine the paths written inside it (see
+/// [`crate::paths::check_config_paths`]). A path that escapes is an
+/// [`OpsError::InvalidInput`] (a 400), raised before any render starts.
+fn load_for_render(cfg_path: &Utf8Path) -> Result<Loaded, OpsError> {
+    load_for_render_in(cfg_path, &ConfigRoots::mounts()?)
+}
+
+fn load_for_render_in(cfg_path: &Utf8Path, roots: &ConfigRoots) -> Result<Loaded, OpsError> {
+    let cfg = match Config::load(cfg_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let e = anyhow::Error::new(e).context(format!("loading config {cfg_path}"));
+            return Ok(Loaded::Unloadable(format!("{e:#}")));
+        }
+    };
+    check_config_paths_in(&cfg, roots)?;
+    Ok(Loaded::Ready(Box::new(cfg)))
+}
+
+/// `config_path` resolved under `/projects`, required to exist.
+fn existing_config(config_path: &str) -> Result<(PathBuf, Utf8PathBuf), OpsError> {
+    let cfg = resolve_projects_checked(config_path)?;
+    if !cfg.exists() {
+        return Err(OpsError::not_found_with("config", cfg.to_string_lossy().into_owned()));
+    }
+    let cfg_camino = Utf8PathBuf::from_path_buf(cfg.clone())
+        .map_err(|_| OpsError::invalid(format!("non-UTF-8 config path: {}", cfg.display())))?;
+    Ok((cfg, cfg_camino))
+}
+
+/// The first `[[outputs]].path` of a checked config.
+fn primary_output(config: &Config) -> Option<PathBuf> {
+    config.outputs.first().map(|o| o.path.as_std_path().to_path_buf())
+}
 
 /// One lock per project config. Two renders of the same config share a
 /// workspace (intermediates with fixed names) and an output path, so the
@@ -61,23 +108,23 @@ pub async fn render_sync(config_path: &str) -> Result<serde_json::Value, OpsErro
 
 /// [`render_sync`] at the requested quality.
 pub async fn render_sync_with(config_path: &str, req: RenderRequest) -> Result<serde_json::Value, OpsError> {
-    let cfg = resolve_projects(config_path);
-    if !cfg.exists() {
-        return Err(OpsError::not_found_with(
-            "config",
-            cfg.to_string_lossy().into_owned(),
-        ));
-    }
-    let cfg_camino = Utf8PathBuf::from_path_buf(cfg.clone())
-        .map_err(|_| OpsError::invalid(format!("non-UTF-8 config path: {}", cfg.display())))?;
+    let (cfg, cfg_camino) = existing_config(config_path)?;
+    let config = match load_for_render(&cfg_camino)? {
+        Loaded::Ready(config) => config,
+        Loaded::Unloadable(msg) => {
+            let quality = req.quality.unwrap_or_default();
+            return Ok(build_render_result_json(&cfg, None, quality, false, Some(&msg)));
+        }
+    };
+    let quality = config.render_quality(req.quality);
+    let primary = primary_output(&config);
 
     let published = crate::plan::RenderPlan::begin(&cfg);
     let lock = project_lock(&cfg);
     let _guard = lock.lock().await;
-    let render_target = cfg_camino.clone();
     let join = tokio::task::spawn_blocking(move || -> Result<(), String> {
         published.started();
-        vibecut::run_pipeline::run_with(&render_target, run_options(req, published))
+        vibecut::run_pipeline::run_config(*config, run_options(req, published))
             .map(|_| ())
             .map_err(|e| format!("{e:#}"))
     })
@@ -88,7 +135,7 @@ pub async fn render_sync_with(config_path: &str, req: RenderRequest) -> Result<s
         Ok(()) => (true, None),
         Err(msg) => (false, Some(msg)),
     };
-    Ok(build_render_result_json(&cfg, ok, error_msg.as_deref(), req.quality))
+    Ok(build_render_result_json(&cfg, primary.as_deref(), quality, ok, error_msg.as_deref()))
 }
 
 /// How the pipeline runs a web / MCP render: everything at its default
@@ -115,16 +162,35 @@ pub async fn submit_async_with(
     config_path: &str,
     req: RenderRequest,
 ) -> Result<String, OpsError> {
-    let cfg = resolve_projects(config_path);
-    if !cfg.exists() {
-        return Err(OpsError::not_found_with(
-            "config",
-            cfg.to_string_lossy().into_owned(),
-        ));
+    let (cfg, cfg_camino) = existing_config(config_path)?;
+    match load_for_render(&cfg_camino)? {
+        Loaded::Ready(config) => submit_loaded(jobs, cfg, *config, req).await,
+        Loaded::Unloadable(msg) => {
+            // Same contract as when the job loaded the file itself: a
+            // job is issued, and it fails.
+            let job_id = jobs.submit_for(&cfg.to_string_lossy()).await;
+            let now = chrono::Utc::now().to_rfc3339();
+            let failed = JobState::Failed {
+                started_at: now.clone(),
+                finished_at: now,
+                elapsed_ms: 0,
+                error: msg,
+            };
+            jobs.set(&job_id, failed).await;
+            Ok(job_id)
+        }
     }
-    let cfg_camino = Utf8PathBuf::from_path_buf(cfg.clone())
-        .map_err(|_| OpsError::invalid(format!("non-UTF-8 config path: {}", cfg.display())))?;
+}
 
+/// Queue the render of `config`, already loaded from `cfg` and checked.
+async fn submit_loaded(
+    jobs: &JobRegistry,
+    cfg: PathBuf,
+    config: Config,
+    req: RenderRequest,
+) -> Result<String, OpsError> {
+    let quality = config.render_quality(req.quality);
+    let primary = primary_output(&config);
     let job_id = jobs.submit_for(&cfg.to_string_lossy()).await;
     // From now on a storyboard request waits for this render's plan.
     let published = crate::plan::RenderPlan::begin(&cfg);
@@ -137,7 +203,7 @@ pub async fn submit_async_with(
 
     tokio::spawn(async move {
         // Stays "queued" while another render of this project finishes.
-        let lock = project_lock(cfg_camino.as_std_path());
+        let lock = project_lock(&cfg);
         let _guard = lock.lock().await;
         let started_at = chrono::Utc::now().to_rfc3339();
         // Cancelled while it waited: it never starts.
@@ -145,7 +211,6 @@ pub async fn submit_async_with(
             return;
         }
         let t0 = std::time::Instant::now();
-        let cfg_for_blocking = cfg_camino.clone();
         let progress_jobs = jobs_handle.clone();
         let progress_id = job_id_for_task.clone();
         let render_cancel = cancel.clone();
@@ -160,7 +225,7 @@ pub async fn submit_async_with(
                     // Stopped between `begin` and here.
                     vibecut::cancel::check()?;
                     published.started();
-                    vibecut::run_pipeline::run_with(&cfg_for_blocking, run_options(req, published)).map(|_| ())
+                    vibecut::run_pipeline::run_config(config, run_options(req, published)).map(|_| ())
                 },
             )
             .map_err(|e| RenderStop::classify(&e, &render_cancel))
@@ -169,10 +234,10 @@ pub async fn submit_async_with(
         let elapsed_ms = t0.elapsed().as_millis() as u64;
         let finished_at = chrono::Utc::now().to_rfc3339();
 
-        let cfg_std = cfg_camino.as_std_path().to_path_buf();
         let final_state = match inner {
             Ok(Ok(())) => {
-                let mut result_json = build_render_result_json(&cfg_std, true, None, req.quality);
+                let mut result_json =
+                    build_render_result_json(&cfg, primary.as_deref(), quality, true, None);
                 // Each async render also keeps its own copy, so a UI can
                 // compare and restore earlier versions.
                 let tag = format!(
@@ -180,8 +245,7 @@ pub async fn submit_async_with(
                     chrono::Utc::now().format("%Y%m%dT%H%M%S"),
                     job_id_for_task
                 );
-                let out = output_path_from_toml(&cfg_std)
-                    .map(|o| quality_output_path(&o, effective_quality(&cfg_std, req.quality)));
+                let out = primary.as_deref().map(|o| quality_output_path(o, quality));
                 let kept = tokio::task::spawn_blocking(move || {
                     out.as_deref().and_then(|o| keep_version(o, &tag))
                 })
@@ -354,15 +418,20 @@ pub fn job_state_json(job_id: &str, state: JobState) -> serde_json::Value {
 /// Build the JSON body returned by a sync render and (after
 /// completion) by an async one. Same shape either way so callers see
 /// one contract regardless of how the call was made.
+///
+/// `primary` is the first `[[outputs]].path` of the config that was
+/// checked and rendered, not a re-read of the file, so the manifest
+/// summarised here is one [`crate::paths::check_config_paths`] confined.
+/// `None` when the config didn't load.
 fn build_render_result_json(
     cfg_std: &Path,
+    primary: Option<&Path>,
+    quality: Quality,
     ok: bool,
     error_msg: Option<&str>,
-    requested: Option<Quality>,
 ) -> serde_json::Value {
-    let quality = effective_quality(cfg_std, requested);
     // A draft's output and manifest sit beside the final's.
-    let output_path = output_path_from_toml(cfg_std).map(|o| quality_output_path(&o, quality));
+    let output_path = primary.map(|o| quality_output_path(o, quality));
     let manifest_path = output_path.as_ref().map(manifest_for_output);
     let manifest = manifest_path.as_deref().and_then(load_json);
 
@@ -399,33 +468,6 @@ fn build_render_result_json(
         });
     }
     result
-}
-
-/// The primary output (`[[outputs]][0].path`). Parsed as TOML: a
-/// first-`path =`-line scan picked up `[[input.images]]` or soundtrack
-/// paths whenever those came first in the file.
-fn output_path_from_toml(cfg_path: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(cfg_path).ok()?;
-    let doc: toml::Value = toml::from_str(&text).ok()?;
-    doc.get("outputs")?
-        .as_array()?
-        .first()?
-        .get("path")?
-        .as_str()
-        .map(PathBuf::from)
-}
-
-/// The quality a render of `cfg_path` runs at: the request's, else the
-/// config's `[project].quality`, else final (see
-/// `vibecut::project_config::Config::render_quality`).
-fn effective_quality(cfg_path: &Path, requested: Option<Quality>) -> Quality {
-    requested
-        .or_else(|| {
-            let text = std::fs::read_to_string(cfg_path).ok()?;
-            let doc: toml::Value = toml::from_str(&text).ok()?;
-            Quality::parse(doc.get("project")?.get("quality")?.as_str()?)
-        })
-        .unwrap_or_default()
 }
 
 /// Where a render at `quality` writes the configured output `out`.
@@ -482,20 +524,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
-    }
-
-    #[test]
-    fn output_path_is_the_first_output_not_the_first_path_line() {
-        let d = tmp("toml");
-        let cfg = d.join("p.toml");
-        std::fs::write(
-            &cfg,
-            "schema_version = 1\n[input]\nfolder = \"f\"\n[[input.images]]\npath = \"photo.jpg\"\nduration = \"3s\"\n\
-             [[outputs]]\npath = \"/projects/out/reel.mp4\"\nresolution = \"1920x1080\"\n",
-        )
-        .unwrap();
-        assert_eq!(output_path_from_toml(&cfg), Some(PathBuf::from("/projects/out/reel.mp4")));
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -564,16 +592,18 @@ mod tests {
     }
 
     /// A job cancelled while it waits for the project lock never runs:
-    /// the config here isn't even valid, so running it would end `failed`.
+    /// its footage folder doesn't exist, so running it would end `failed`.
     #[tokio::test]
     async fn a_cancelled_queued_render_never_starts() {
-        let d = tmp("queued");
-        let cfg = d.join("p.toml");
-        std::fs::write(&cfg, "this is not a vibecut config").unwrap();
+        let (roots, cfg_camino) = roots_and_config("queued", "{projects}/out/x.mp4");
+        let cfg = cfg_camino.as_std_path().to_path_buf();
+        let Ok(Loaded::Ready(config)) = load_for_render_in(&cfg_camino, &roots) else {
+            panic!("the test config should load");
+        };
         let jobs = JobRegistry::new();
         let lock = project_lock(&cfg);
         let held = lock.lock().await; // another render of this project
-        let id = submit_async(&jobs, &cfg.to_string_lossy()).await.unwrap();
+        let id = submit_loaded(&jobs, cfg.clone(), *config, RenderRequest::default()).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(matches!(jobs.get(&id).await.unwrap(), JobState::Queued));
         let after = cancel(&jobs, &id).await.unwrap();
@@ -587,8 +617,8 @@ mod tests {
         }
         let listed = list_jobs(&jobs).await;
         assert_eq!(listed["jobs"][0]["job_id"], id.as_str());
-        assert!(listed["jobs"][0]["config_path"].as_str().unwrap().ends_with("p.toml"));
-        let _ = std::fs::remove_dir_all(&d);
+        assert!(listed["jobs"][0]["config_path"].as_str().unwrap().ends_with("cfg.toml"));
+        let _ = std::fs::remove_dir_all(roots.footage.parent().unwrap());
     }
 
     #[test]
@@ -618,24 +648,29 @@ mod tests {
         let cfg = d.join("p.toml");
         std::fs::write(&cfg, toml("")).unwrap();
         std::fs::write(out.join("reel.draft.manifest.json"), r#"{"segments":[1,2,3],"beat_sync":{"n_cuts":2}}"#).unwrap();
+        let result = |requested: Option<Quality>| {
+            let config = Config::load(Utf8Path::from_path(&cfg).unwrap()).unwrap();
+            let quality = config.render_quality(requested);
+            build_render_result_json(&cfg, primary_output(&config).as_deref(), quality, true, None)
+        };
         let name = |v: &serde_json::Value, k: &str| {
             Path::new(v[k].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned()
         };
 
-        let r = build_render_result_json(&cfg, true, None, Some(Quality::Draft));
+        let r = result(Some(Quality::Draft));
         assert_eq!(r["quality"], "draft");
         assert_eq!(name(&r, "output_path"), "reel.draft.mp4");
         assert_eq!(name(&r, "manifest_path"), "reel.draft.manifest.json");
         assert_eq!(r["manifest_summary"]["n_segments"], 3);
 
-        let r = build_render_result_json(&cfg, true, None, None);
+        let r = result(None);
         assert_eq!(r["quality"], "final");
         assert_eq!(name(&r, "output_path"), "reel.mp4");
         assert_eq!(name(&r, "manifest_path"), "reel.manifest.json");
 
         std::fs::write(&cfg, toml("quality = \"draft\"")).unwrap();
-        assert_eq!(build_render_result_json(&cfg, true, None, None)["quality"], "draft");
-        assert_eq!(build_render_result_json(&cfg, true, None, Some(Quality::Final))["quality"], "final");
+        assert_eq!(result(None)["quality"], "draft");
+        assert_eq!(result(Some(Quality::Final))["quality"], "final");
 
         // Its kept version is a draft too, never confused with the final's.
         std::fs::write(out.join("reel.draft.mp4"), b"draft").unwrap();
@@ -662,5 +697,89 @@ mod tests {
         assert_eq!(std::fs::read(&v2).unwrap(), b"render two");
         assert!(m1.ends_with("versions/reel__a.manifest.json"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn config_paths_outside_projects_are_rejected() {
+        let jobs = JobRegistry::new();
+        for p in ["/etc/passwd", "../etc/passwd", r"..\..\etc\passwd"] {
+            assert!(matches!(render_sync(p).await, Err(OpsError::InvalidInput { .. })), "{p}");
+            assert!(matches!(submit_async(&jobs, p).await, Err(OpsError::InvalidInput { .. })), "{p}");
+        }
+    }
+
+    /// Temp `footage/` and `projects/` mounts with the cwd in a third
+    /// dir, and a config written under `projects/` whose output is
+    /// `output` (`{projects}` stands for the temp projects dir).
+    fn roots_and_config(tag: &str, output: &str) -> (ConfigRoots, Utf8PathBuf) {
+        let base = std::env::temp_dir().join(format!("sv_render_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["footage", "projects", "elsewhere"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let base = base.canonicalize().unwrap();
+        let roots = ConfigRoots {
+            footage: base.join("footage"),
+            projects: base.join("projects"),
+            extra_read: Vec::new(),
+            extra_write: Vec::new(),
+            cwd: base.join("elsewhere"),
+        };
+        let output = output.replace("{projects}", &roots.projects.to_string_lossy());
+        let toml_text = format!(
+            r#"
+schema_version = 1
+[project]
+name = "x"
+target_duration = "10s"
+fps = 30
+[input]
+folder = '{}'
+[[outputs]]
+path = '{output}'
+resolution = "1920x1080"
+"#,
+            roots.footage.join("missing").display()
+        );
+        let cfg_path = roots.projects.join("cfg.toml");
+        std::fs::write(&cfg_path, toml_text).unwrap();
+        (roots, Utf8PathBuf::from_path_buf(cfg_path).unwrap())
+    }
+
+    #[test]
+    fn a_config_that_writes_outside_projects_is_refused_before_rendering() {
+        let (roots, cfg_path) = roots_and_config("escape", "/etc/whatever.mp4");
+        match load_for_render_in(&cfg_path, &roots) {
+            Err(OpsError::InvalidInput { message, .. }) => {
+                assert!(message.contains("outputs[0].path"), "{message}")
+            }
+            other => panic!("expected a 400, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(roots.footage.parent().unwrap());
+    }
+
+    #[test]
+    fn a_config_inside_the_mounts_loads_once_for_rendering() {
+        let (roots, cfg_path) = roots_and_config("ok", "{projects}/out/x.mp4");
+        let output = roots.projects.join("out").join("x.mp4");
+        match load_for_render_in(&cfg_path, &roots) {
+            Ok(Loaded::Ready(cfg)) => assert_eq!(cfg.primary_output_path().as_std_path(), output),
+            other => panic!("expected a loaded config, got {other:?}"),
+        }
+
+        // Unparseable stays a failed render (not a 400), as before.
+        std::fs::write(&cfg_path, "not = [valid").unwrap();
+        match load_for_render_in(&cfg_path, &roots) {
+            Ok(Loaded::Unloadable(msg)) => assert!(msg.contains("loading config"), "{msg}"),
+            other => panic!("expected an unloadable config, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(roots.footage.parent().unwrap());
+    }
+
+    #[test]
+    fn an_unloaded_config_has_no_output_in_its_result() {
+        let r = build_render_result_json(Path::new("/projects/cfg.toml"), None, Quality::Final, false, Some("boom"));
+        assert!(r.get("output_path").is_none() && r.get("manifest_path").is_none());
+        assert_eq!(r["error"], "boom");
     }
 }

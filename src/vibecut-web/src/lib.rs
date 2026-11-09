@@ -342,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn plan_of_a_missing_config_is_404() {
         let app = router(AppState::default());
-        let res = post_json(app, "/api/plan", serde_json::json!({ "config_path": "/nonexistent/vibecut/p.toml" })).await;
+        let res = post_json(app, "/api/plan", serde_json::json!({ "config_path": "nonexistent/vibecut/p.toml" })).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let body = body_json(res).await;
         assert!(body["error"].as_str().unwrap().contains("not found"), "{body}");
@@ -357,7 +357,7 @@ mod tests {
         let res = post_json(
             app.clone(),
             "/api/render/async",
-            serde_json::json!({ "config_path": "/nonexistent/vibecut/p.toml", "quality": "best" }),
+            serde_json::json!({ "config_path": "nonexistent/vibecut/p.toml", "quality": "best" }),
         )
         .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -368,10 +368,41 @@ mod tests {
         let res = post_json(
             app,
             "/api/render/async",
-            serde_json::json!({ "config_path": "/nonexistent/vibecut/p.toml", "quality": "draft" }),
+            serde_json::json!({ "config_path": "nonexistent/vibecut/p.toml", "quality": "draft" }),
         )
         .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `GET /api/sources?folder=/` used to list media files anywhere
+    /// in the container; footage folders now stay in the mounts.
+    #[tokio::test]
+    async fn footage_folders_outside_the_mounts_are_400() {
+        let app = router(AppState::default());
+        for folder in ["%2F", "%2Fetc", "..%2Fetc", "..%5Cetc", "%2Ffootage%2F..%2Fetc"] {
+            let uri = format!("/api/sources?folder={folder}");
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/propose")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "folder": "/etc", "vibe": "kid_reel" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -498,13 +529,15 @@ mod tests {
         assert!(res.status() == StatusCode::NOT_FOUND || res.status() == StatusCode::BAD_REQUEST);
     }
 
+    /// Relative, so it resolves under `/projects` — absent on a host or
+    /// test container, which is the deterministic not-found path.
     #[tokio::test]
     async fn config_structured_read_missing_is_404() {
         let app = router(AppState::default());
         let res = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/config/structured?config_path=/nonexistent/cfg.toml")
+                    .uri("/api/config/structured?config_path=nonexistent/cfg.toml")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -513,68 +546,96 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
-    /// PUT a config as JSON (no TOML anywhere in this test), then GET it
-    /// back — the guided editor's whole read/write path, exercised
-    /// through the actual router rather than the ops-layer functions
-    /// directly.
-    #[tokio::test]
-    async fn config_structured_write_then_read_round_trips() {
-        let dir = std::env::temp_dir().join(format!("sv_web_config_struct_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cfg.toml");
-
-        let cfg = serde_json::json!({
+    fn structured_config_json() -> serde_json::Value {
+        serde_json::json!({
             "schema_version": 1,
             "project": { "name": "structured edit", "target_duration": "10s", "fps": 30 },
             "input": { "folder": "." },
             "outputs": [{ "path": "out.mp4", "resolution": "1920x1080" }]
-        });
-
-        let app = router(AppState::default());
-        let put_res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/api/config/structured")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "config_path": path.to_string_lossy(), "config": cfg })
-                            .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(put_res.status(), StatusCode::OK);
-        let written = body_json(put_res).await;
-        assert_eq!(written["project"]["name"], "structured edit");
-
-        let get_res = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/api/config/structured?config_path={}",
-                        urlencoding_lite(&path.to_string_lossy())
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(get_res.status(), StatusCode::OK);
-        let read = body_json(get_res).await;
-        assert_eq!(read["project"]["name"], "structured edit");
-        assert_eq!(read["project"]["fps"], 30);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        })
     }
 
-    /// Minimal query-string escaping for the one character (`\`) a
-    /// Windows temp path can contain that isn't already URL-safe —
-    /// avoids pulling in a whole crate for one test's sake.
-    fn urlencoding_lite(s: &str) -> String {
-        s.replace('\\', "%5C")
+    async fn put_json(app: Router, uri: &str, body: serde_json::Value) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The config API is reachable without auth, so through the real
+    /// router it must refuse to read or write outside `/projects` —
+    /// `GET /api/config?config_path=/proc/self/environ` used to return
+    /// the server's environment, API keys included. (The structured
+    /// write/read round trip itself is covered in
+    /// `vibecut_ops::config_io`'s tests, where the root can point at a
+    /// temp dir; through the router every write lands in `/projects`.)
+    #[tokio::test]
+    async fn config_api_refuses_paths_outside_projects() {
+        let app = router(AppState::default());
+        for uri in [
+            "/api/config?config_path=/proc/self/environ",
+            "/api/config?config_path=../etc/passwd",
+            "/api/config?config_path=..%5C..%5Cetc%5Cpasswd",
+            "/api/config/structured?config_path=/etc/passwd",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = body_json(res).await;
+            assert!(body["error"].as_str().unwrap().contains("escapes"), "{uri}: {body}");
+        }
+
+        let outside = std::env::temp_dir().join(format!("sv_web_config_outside_{}.toml", std::process::id()));
+        let outside_str = outside.to_string_lossy().into_owned();
+        let attempts = [
+            (
+                "/api/config/structured",
+                serde_json::json!({ "config_path": outside_str, "config": structured_config_json() }),
+            ),
+            (
+                "/api/config/structured",
+                serde_json::json!({ "config_path": "out/render.mp4", "config": structured_config_json() }),
+            ),
+            (
+                "/api/config",
+                serde_json::json!({ "config_path": outside_str, "config_toml": "schema_version = 1" }),
+            ),
+        ];
+        for (uri, body) in attempts {
+            let res = put_json(app.clone(), uri, body.clone()).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
+        }
+        assert!(!outside.exists(), "a rejected write must not touch disk");
+    }
+
+    /// PUT a config as JSON (no TOML anywhere in this test): the guided
+    /// editor's write path parses the body into a typed `Config` and
+    /// validates it before anything touches disk.
+    #[tokio::test]
+    async fn config_structured_write_validates_json_body() {
+        let mut cfg = structured_config_json();
+        cfg["outputs"] = serde_json::json!([]);
+        let res = put_json(
+            router(AppState::default()),
+            "/api/config/structured",
+            serde_json::json!({ "config_path": "cfg.toml", "config": cfg }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(res).await;
+        assert!(
+            body["error"].as_str().unwrap().contains("does not validate"),
+            "{body}"
+        );
     }
 
     /// The watcher's routes: status, the toggle (JSON only, like every

@@ -60,7 +60,7 @@ use vibecut::project_config::Config;
 
 use crate::error::OpsError;
 use crate::music::{self, AutoPick, TrackInfo};
-use crate::paths::{resolve_footage, resolve_projects, slugify, PROJECTS_ROOT};
+use crate::paths::{resolve_footage_checked, resolve_projects_checked, slugify, PROJECTS_ROOT};
 use crate::propose::{self, ProposeResult, ProposedSoundtrack};
 use crate::vibes::{self, SoundtrackSub, Substitutions, Vibe};
 
@@ -1724,7 +1724,7 @@ pub struct ShareArgs<'a> {
 }
 
 fn read_manifest(path: &str) -> Result<Value, OpsError> {
-    let p = resolve_projects(path);
+    let p = resolve_projects_checked(path)?;
     let text = std::fs::read_to_string(&p).map_err(|_| OpsError::not_found_with("manifest", p.display().to_string()))?;
     serde_json::from_str(&text).map_err(|e| OpsError::invalid(format!("manifest {} isn't valid JSON: {e}", p.display())))
 }
@@ -1863,7 +1863,7 @@ async fn apply_in(projects_root: &Path, args: ApplyArgs<'_>, tracks: Vec<TrackIn
     let code = resolve_code(args.code)?;
     let recipe = decode(&code)?;
     let code = encode(&recipe);
-    let folder = resolve_footage(args.folder);
+    let folder = resolve_footage_checked(args.folder)?;
     if !folder.exists() {
         return Err(OpsError::not_found_with("footage folder", folder.to_string_lossy().into_owned()));
     }
