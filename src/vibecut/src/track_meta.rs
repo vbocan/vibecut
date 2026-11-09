@@ -955,6 +955,7 @@ mod tests {
             angle_groups: vec![],
             beat_sync: None,
             timeline: None,
+            quality: None,
             generator: "test".into(),
         };
         let v = serde_json::to_value(&m).unwrap();

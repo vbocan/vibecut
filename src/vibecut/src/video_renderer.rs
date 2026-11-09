@@ -480,6 +480,9 @@ pub struct HwConfig {
     pub encoder: EncoderChoice,
     /// Whether to add `-hwaccel cuda` to decode-side invocations on HEVC/H.264 input.
     pub use_cuda_decode: bool,
+    /// Draft renders: every encode uses the encoder's fastest preset (see
+    /// [`HwConfig::fast`]). Off for finals.
+    pub fast: bool,
 }
 
 impl HwConfig {
@@ -536,7 +539,14 @@ impl HwConfig {
             support,
             encoder,
             use_cuda_decode,
+            fast: false,
         }
+    }
+
+    /// The same encoder at its fastest preset — for draft renders, where
+    /// the time to a watchable preview matters more than bits per pixel.
+    pub fn fast(self) -> Self {
+        Self { fast: true, ..self }
     }
 
     /// Args to insert *before* `-i input` on the ffmpeg command line for
@@ -552,6 +562,18 @@ impl HwConfig {
     /// Encoder args (codec + preset + quality control). `crf` is mapped to `-cq`
     /// for NVENC, `-crf` for libx264/5, `-quality` for AMF/QSV.
     pub fn encode_args(&self, crf: u32) -> Vec<String> {
+        let mut a = self.quality_encode_args(crf);
+        if self.fast {
+            // Same rate control, fastest preset (see `fast_preset`).
+            let key = if self.encoder == EncoderChoice::H264Amf { "-quality" } else { "-preset" };
+            if let Some(i) = a.iter().position(|x| x == key) {
+                a[i + 1] = fast_preset(self.encoder).to_string();
+            }
+        }
+        a
+    }
+
+    fn quality_encode_args(&self, crf: u32) -> Vec<String> {
         let crf_s = crf.to_string();
         match self.encoder {
             EncoderChoice::Libx264 => vec![
@@ -593,6 +615,18 @@ impl HwConfig {
                 arg("-global_quality"), crf_s,
             ],
         }
+    }
+}
+
+/// Each encoder's fastest preset, used by [`HwConfig::fast`] (drafts).
+/// `superfast` rather than `ultrafast` for x264/x265: nearly as quick, and
+/// ultrafast drops CABAC, which bloats a 540p preview for no real gain.
+fn fast_preset(encoder: EncoderChoice) -> &'static str {
+    match encoder {
+        EncoderChoice::Libx264 | EncoderChoice::Libx265 => "superfast",
+        EncoderChoice::H264Nvenc | EncoderChoice::HevcNvenc => "p1",
+        EncoderChoice::H264Amf => "speed",
+        EncoderChoice::H264Qsv => "veryfast",
     }
 }
 
@@ -3305,6 +3339,31 @@ mod tests {
         assert!(!lists_filter(no_zimg, "zscale"));
         assert!(!lists_filter(no_zimg, "tonemap"));
         assert!(lists_filter(no_zimg, "colorspace"));
+    }
+
+    #[test]
+    fn fast_encodes_swap_in_the_fastest_preset_and_keep_the_rate_control() {
+        let sw = HwConfig::resolve(HwSupport::default(), EncoderPref::Libx264);
+        assert!(!sw.fast);
+        assert_eq!(sw.encode_args(20).join(" "), "-c:v libx264 -preset veryfast -crf 20");
+        assert_eq!(sw.clone().fast().encode_args(28).join(" "), "-c:v libx264 -preset superfast -crf 28");
+        let all = HwSupport { cuda_hwaccel: true, h264_nvenc: true, hevc_nvenc: true, h264_amf: true, h264_qsv: true, ..Default::default() };
+        for (pref, key, fast) in [
+            (EncoderPref::Nvenc, "-preset", "p1"),
+            (EncoderPref::HevcNvenc, "-preset", "p1"),
+            (EncoderPref::Amf, "-quality", "speed"),
+            (EncoderPref::Qsv, "-preset", "veryfast"),
+            (EncoderPref::Libx265, "-preset", "superfast"),
+        ] {
+            let hw = HwConfig::resolve(all.clone(), pref);
+            let (q, f) = (hw.encode_args(24), hw.clone().fast().encode_args(24));
+            assert_eq!(q.len(), f.len(), "{pref:?}");
+            let i = f.iter().position(|x| x == key).unwrap();
+            assert_eq!(f[i + 1], fast, "{pref:?}");
+            // Everything but the preset is unchanged.
+            let differ: Vec<usize> = (0..q.len()).filter(|&k| q[k] != f[k]).collect();
+            assert_eq!(differ, vec![i + 1], "{pref:?}: {q:?} vs {f:?}");
+        }
     }
 
     #[test]

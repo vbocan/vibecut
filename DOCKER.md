@@ -223,8 +223,9 @@ not the container's baked-in static build.
 | `discover_sources(folder)` | Walk a footage folder, group GoPro chapters, return per-source rollup. In-process — calls `vibecut::media_probe` directly. |
 | `list_vibes()` | Catalog of curated vibes (key, name, rationale, default target duration). |
 | `propose_vibe(folder, vibe, ...)` | Render a vibe template into a TOML, write it under `/projects`. Six vibes available: `kid_reel`, `family_chronicle`, `drone_cinematic`, `action_highlight`, `documentary`, `memory_keeper`. |
-| `render(config_path)` | Run the vibecut pipeline in-process. Blocking; takes 1–10 min. |
-| `render_async(config_path)` | Same as `render` but returns a `job_id` immediately. Pair with `render_status`. |
+| `plan_edit(config_path)` | The edit before the encode, in seconds: the exact output timeline (each clip's source window, output start/end, crossfades, ramps), the beats as they will play, the length, a source time per clip for thumbnails. While a render of the config runs, that render's own plan. (Web: `POST /api/plan`.) See CONFIG.md, "Drafts and the plan". |
+| `render(config_path, quality?)` | Run the vibecut pipeline in-process. Blocking; takes 1–10 min. `quality: "draft"` makes a fast 540p preview beside the final (`<stem>.draft.mp4`). |
+| `render_async(config_path, quality?)` | Same as `render` but returns a `job_id` immediately. Pair with `render_status`. |
 | `render_status(job_id)` | Poll a background render job: queued / running / done / failed / cancelled. |
 | `cancel_render(job_id)` | Stop a background render: a queued job never starts; a running one has its ffmpeg processes killed and reports `cancelled` within about a second. The previous output is left untouched. (Web: `POST /api/jobs/{job_id}/cancel` with a JSON body, `{}`; `GET /api/jobs` lists recent jobs, each with its `kind`: `render`, or `reformat` for a Share-sheet platform version, which stops the same way.) |
 | `apply_feedback(config_path, action)` | Mutate a TOML in response to user feedback (six action variants: scale_duration, calmer, punchier, different_music, reroll, drop_segment). |

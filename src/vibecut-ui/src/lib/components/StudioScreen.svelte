@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { appState as s } from '$lib/state.svelte';
 	import { outputFileUrl } from '$lib/api';
 	import { clock } from '$lib/vibes';
@@ -162,6 +163,44 @@
 		currentTime = t;
 	}
 
+	// ---- Drafts: the version on screen may be a quick 540p preview ----
+	const draftShown = $derived(s.shownQuality === 'draft' && !!s.outputPath);
+	/** "540p" from the manifest's "960x540" (the short side). */
+	const draftRes = $derived.by(() => {
+		const [w, h] = (s.manifest?.resolution ?? '').split('x').map(Number);
+		return w > 0 && h > 0 ? `${Math.min(w, h)}p` : '';
+	});
+
+	/** Download / Share: a final goes straight out; a draft is finished in
+	 *  full quality first, and goes out when that's done. */
+	function deliverOrFinish(e: Event | null, what: 'download' | 'share') {
+		if (!draftShown) {
+			if (what === 'share') shareOpen = true;
+			return;
+		}
+		e?.preventDefault();
+		if (s.rendering) {
+			s.showNotice('A render is running — finish in full quality once it’s done.');
+			return;
+		}
+		void s.finishFullQuality(what);
+	}
+
+	function finishNow() {
+		if (s.rendering) s.showNotice('A render is running — finish in full quality once it’s done.');
+		else void s.finishFullQuality();
+	}
+
+	// The final that "Finish in full quality" made for a Download / Share.
+	let autoDownload: HTMLAnchorElement | undefined = $state();
+	$effect(() => {
+		const d = s.deliver;
+		if (!d || s.shownQuality !== 'final' || !s.outputPath) return;
+		s.deliver = null;
+		if (d.what === 'share') shareOpen = true;
+		else void tick().then(() => autoDownload?.click());
+	});
+
 	// The shortcuts list is a small non-modal dialog: focus moves into it
 	// when it opens and, when it closes from inside, goes back to
 	// whatever had it before (the Shortcuts button, or wherever "?" was
@@ -219,7 +258,10 @@
 	<div class="main">
 		<header class="head">
 			<div>
-				<p class="eyebrow">{s.proposeResult?.vibe_name ?? 'Your video'} · {clock(seconds)}</p>
+				<p class="eyebrow">
+					{s.proposeResult?.vibe_name ?? 'Your video'} · {clock(seconds)}
+					{#if draftShown}<span class="draft-pill" title="A quick {draftRes || 'low-resolution'} preview of this edit">Draft</span>{/if}
+				</p>
 				<h1>{title}</h1>
 			</div>
 			<div class="head-actions">
@@ -227,8 +269,40 @@
 					>Shortcuts <kbd>?</kbd></button
 				>
 				{#if s.outputPath}
-					<a class="btn ghost" href={outputFileUrl(s.outputPath)} download={fileName}>Download</a>
-					<button class="btn primary download" type="button" onclick={() => (shareOpen = true)}>
+					{#if draftShown}
+						<button
+							class="btn finish"
+							type="button"
+							aria-disabled={rerendering}
+							aria-describedby="draft-note"
+							onclick={finishNow}
+						>
+							<span class="spark" aria-hidden="true">✦</span>
+							Finish in full quality
+						</button>
+						<span class="sr-only" id="draft-note">This version is a quick draft. Finishing renders it in full quality; Download and Share do that first.</span>
+					{/if}
+					<a
+						class="btn ghost"
+						href={outputFileUrl(s.outputPath)}
+						download={fileName}
+						aria-describedby={draftShown ? 'draft-note' : undefined}
+						onclick={(e) => deliverOrFinish(e, 'download')}>Download</a
+					>
+					<a
+						class="auto-download"
+						bind:this={autoDownload}
+						href={outputFileUrl(s.outputPath)}
+						download={fileName}
+						tabindex="-1"
+						aria-hidden="true">Download</a
+					>
+					<button
+						class="btn primary download"
+						type="button"
+						aria-describedby={draftShown ? 'draft-note' : undefined}
+						onclick={(e) => deliverOrFinish(e, 'share')}
+					>
 						<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"
 							><path
 								d="M12 15V4m0 0L7.5 8.5M12 4l4.5 4.5M5 13v6h14v-6"
@@ -247,6 +321,9 @@
 
 		<div class="player-wrap">
 			<Player bind:currentTime bind:video />
+			{#if draftShown && !rerendering}
+				<span class="draft-chip mono" aria-hidden="true">Draft{draftRes ? ` · ${draftRes}` : ''}</span>
+			{/if}
 			{#if beat && !rerendering && beat.n_cuts > 0}
 				{@const pctOn = Math.round((beat.within_tolerance / beat.n_cuts) * 100)}
 				<div class="stamp" role="img" aria-label="{pctOn}% of cuts on the beat at {Math.round(beat.tempo_bpm)} BPM">
@@ -370,6 +447,71 @@
 
 	.download {
 		padding: 12px 20px;
+	}
+
+	/* ---- drafts ---- */
+	.draft-pill {
+		display: inline-block;
+		margin-left: 6px;
+		padding: 1px 8px;
+		border-radius: 999px;
+		border: 1px solid rgba(56, 214, 255, 0.5);
+		background: rgba(56, 214, 255, 0.1);
+		color: var(--cyan);
+		font-size: 10.5px;
+		letter-spacing: 0.08em;
+		vertical-align: 1px;
+	}
+
+	.finish {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		padding: 11px 18px;
+		border: 1px solid transparent;
+		background:
+			linear-gradient(var(--panel-solid), var(--panel-solid)) padding-box,
+			var(--grad-brand) border-box;
+		color: var(--text);
+		font-weight: 650;
+	}
+
+	.finish:hover:not([aria-disabled='true']) {
+		box-shadow: var(--glow);
+	}
+
+	.finish[aria-disabled='true'] {
+		opacity: 0.55;
+		cursor: not-allowed;
+	}
+
+	.spark {
+		background: var(--grad-brand);
+		-webkit-background-clip: text;
+		background-clip: text;
+		color: transparent;
+	}
+
+	.auto-download {
+		display: none;
+	}
+
+	.draft-chip {
+		position: absolute;
+		top: 14px;
+		left: 14px;
+		z-index: 3;
+		padding: 4px 10px;
+		border-radius: 999px;
+		border: 1px solid rgba(56, 214, 255, 0.45);
+		background: rgba(7, 8, 12, 0.6);
+		backdrop-filter: blur(8px);
+		-webkit-backdrop-filter: blur(8px);
+		color: var(--cyan);
+		font-size: 11px;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		pointer-events: none;
 	}
 
 	.head-actions {

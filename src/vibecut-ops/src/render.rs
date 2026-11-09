@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use camino::Utf8PathBuf;
+use vibecut::project_config::Quality;
 
 use crate::error::OpsError;
 use crate::jobs::{JobInfo, JobRegistry, JobState};
@@ -24,12 +25,42 @@ fn project_lock(cfg: &Path) -> Arc<tokio::sync::Mutex<()>> {
     map.entry(key).or_default().clone()
 }
 
+/// What a render request asks for beyond its config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderRequest {
+    /// `Some(Draft)`: a fast 540p preview of the same edit, written to
+    /// `<stem>.draft.mp4` beside the final. `None`: the config's
+    /// `[project].quality`, final unless it says otherwise.
+    pub quality: Option<Quality>,
+}
+
+impl RenderRequest {
+    /// A request's `quality` field: absent, `"draft"` or `"final"`.
+    pub fn from_quality_field(quality: Option<&str>) -> Result<Self, OpsError> {
+        let quality = match quality.map(str::trim).filter(|q| !q.is_empty()) {
+            None => None,
+            Some(q) => Some(Quality::parse(q).ok_or_else(|| {
+                OpsError::invalid_with_hint(
+                    format!("quality must be \"draft\" or \"final\", got {q:?}"),
+                    "draft = a fast 540p preview beside the final; final = the full render",
+                )
+            })?),
+        };
+        Ok(RenderRequest { quality })
+    }
+}
+
 /// Render `config_path` to an mp4. Blocking under the hood — the
 /// pipeline is a sync, CPU/GPU-bound function that spawns ffmpeg — but
 /// wrapped in `spawn_blocking` so it doesn't tie up the async runtime.
 /// Takes 1–10 minutes. Returns the same result shape whether called
 /// here or polled via [`render_status`] after [`submit_async`].
 pub async fn render_sync(config_path: &str) -> Result<serde_json::Value, OpsError> {
+    render_sync_with(config_path, RenderRequest::default()).await
+}
+
+/// [`render_sync`] at the requested quality.
+pub async fn render_sync_with(config_path: &str, req: RenderRequest) -> Result<serde_json::Value, OpsError> {
     let cfg = resolve_projects(config_path);
     if !cfg.exists() {
         return Err(OpsError::not_found_with(
@@ -40,20 +71,15 @@ pub async fn render_sync(config_path: &str) -> Result<serde_json::Value, OpsErro
     let cfg_camino = Utf8PathBuf::from_path_buf(cfg.clone())
         .map_err(|_| OpsError::invalid(format!("non-UTF-8 config path: {}", cfg.display())))?;
 
+    let published = crate::plan::RenderPlan::begin(&cfg);
     let lock = project_lock(&cfg);
     let _guard = lock.lock().await;
     let render_target = cfg_camino.clone();
     let join = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        vibecut::run_pipeline::run_cmd(
-            &render_target,
-            /*dry_run*/ false,
-            /*no_visual*/ false,
-            /*no_cache*/ false,
-            /*explain*/ false,
-            /*print_effective_config*/ false,
-            /*random_seed*/ false,
-        )
-        .map_err(|e| format!("{e:#}"))
+        published.started();
+        vibecut::run_pipeline::run_with(&render_target, run_options(req, published))
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
     })
     .await
     .map_err(|e| OpsError::internal(format!("render task panicked: {e}")))?;
@@ -62,13 +88,33 @@ pub async fn render_sync(config_path: &str) -> Result<serde_json::Value, OpsErro
         Ok(()) => (true, None),
         Err(msg) => (false, Some(msg)),
     };
-    Ok(build_render_result_json(&cfg, ok, error_msg.as_deref()))
+    Ok(build_render_result_json(&cfg, ok, error_msg.as_deref(), req.quality))
+}
+
+/// How the pipeline runs a web / MCP render: everything at its default
+/// but the requested quality, and the plan published for storyboards.
+fn run_options(req: RenderRequest, published: crate::plan::RenderPlan) -> vibecut::run_pipeline::RunOptions {
+    vibecut::run_pipeline::RunOptions {
+        quality: req.quality,
+        on_plan: Some(published.hook()),
+        ..Default::default()
+    }
 }
 
 /// Submit a render job and return its `job_id` immediately. The render
 /// runs in the background via `tokio::spawn` + `spawn_blocking`; poll
 /// with [`render_status`].
 pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<String, OpsError> {
+    submit_async_with(jobs, config_path, RenderRequest::default()).await
+}
+
+/// [`submit_async`] at the requested quality. The render publishes its
+/// plan as soon as it has one, for [`crate::plan::plan`].
+pub async fn submit_async_with(
+    jobs: &JobRegistry,
+    config_path: &str,
+    req: RenderRequest,
+) -> Result<String, OpsError> {
     let cfg = resolve_projects(config_path);
     if !cfg.exists() {
         return Err(OpsError::not_found_with(
@@ -80,6 +126,8 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
         .map_err(|_| OpsError::invalid(format!("non-UTF-8 config path: {}", cfg.display())))?;
 
     let job_id = jobs.submit_for(&cfg.to_string_lossy()).await;
+    // From now on a storyboard request waits for this render's plan.
+    let published = crate::plan::RenderPlan::begin(&cfg);
     let cancel = jobs
         .cancel_token(&job_id)
         .await
@@ -111,15 +159,8 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
                 || {
                     // Stopped between `begin` and here.
                     vibecut::cancel::check()?;
-                    vibecut::run_pipeline::run_cmd(
-                        &cfg_for_blocking,
-                        /*dry_run*/ false,
-                        /*no_visual*/ false,
-                        /*no_cache*/ false,
-                        /*explain*/ false,
-                        /*print_effective_config*/ false,
-                        /*random_seed*/ false,
-                    )
+                    published.started();
+                    vibecut::run_pipeline::run_with(&cfg_for_blocking, run_options(req, published)).map(|_| ())
                 },
             )
             .map_err(|e| RenderStop::classify(&e, &render_cancel))
@@ -131,7 +172,7 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
         let cfg_std = cfg_camino.as_std_path().to_path_buf();
         let final_state = match inner {
             Ok(Ok(())) => {
-                let mut result_json = build_render_result_json(&cfg_std, true, None);
+                let mut result_json = build_render_result_json(&cfg_std, true, None, req.quality);
                 // Each async render also keeps its own copy, so a UI can
                 // compare and restore earlier versions.
                 let tag = format!(
@@ -139,7 +180,8 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
                     chrono::Utc::now().format("%Y%m%dT%H%M%S"),
                     job_id_for_task
                 );
-                let out = output_path_from_toml(&cfg_std);
+                let out = output_path_from_toml(&cfg_std)
+                    .map(|o| quality_output_path(&o, effective_quality(&cfg_std, req.quality)));
                 let kept = tokio::task::spawn_blocking(move || {
                     out.as_deref().and_then(|o| keep_version(o, &tag))
                 })
@@ -312,14 +354,22 @@ pub fn job_state_json(job_id: &str, state: JobState) -> serde_json::Value {
 /// Build the JSON body returned by a sync render and (after
 /// completion) by an async one. Same shape either way so callers see
 /// one contract regardless of how the call was made.
-fn build_render_result_json(cfg_std: &Path, ok: bool, error_msg: Option<&str>) -> serde_json::Value {
-    let output_path = output_path_from_toml(cfg_std);
+fn build_render_result_json(
+    cfg_std: &Path,
+    ok: bool,
+    error_msg: Option<&str>,
+    requested: Option<Quality>,
+) -> serde_json::Value {
+    let quality = effective_quality(cfg_std, requested);
+    // A draft's output and manifest sit beside the final's.
+    let output_path = output_path_from_toml(cfg_std).map(|o| quality_output_path(&o, quality));
     let manifest_path = output_path.as_ref().map(manifest_for_output);
     let manifest = manifest_path.as_deref().and_then(load_json);
 
     let mut result = serde_json::json!({
         "ok": ok,
         "config_path": cfg_std.to_string_lossy(),
+        "quality": quality.as_str(),
     });
     if let Some(msg) = error_msg {
         result["error"] = serde_json::Value::String(msg.into());
@@ -363,6 +413,27 @@ fn output_path_from_toml(cfg_path: &Path) -> Option<PathBuf> {
         .get("path")?
         .as_str()
         .map(PathBuf::from)
+}
+
+/// The quality a render of `cfg_path` runs at: the request's, else the
+/// config's `[project].quality`, else final (see
+/// `vibecut::project_config::Config::render_quality`).
+fn effective_quality(cfg_path: &Path, requested: Option<Quality>) -> Quality {
+    requested
+        .or_else(|| {
+            let text = std::fs::read_to_string(cfg_path).ok()?;
+            let doc: toml::Value = toml::from_str(&text).ok()?;
+            Quality::parse(doc.get("project")?.get("quality")?.as_str()?)
+        })
+        .unwrap_or_default()
+}
+
+/// Where a render at `quality` writes the configured output `out`.
+fn quality_output_path(out: &Path, quality: Quality) -> PathBuf {
+    match camino::Utf8Path::from_path(out) {
+        Some(p) => vibecut::run_pipeline::output_path_for(p, quality).into_std_path_buf(),
+        None => out.to_path_buf(),
+    }
 }
 
 /// Keep this render's output and manifest as their own version under
@@ -517,6 +588,60 @@ mod tests {
         let listed = list_jobs(&jobs).await;
         assert_eq!(listed["jobs"][0]["job_id"], id.as_str());
         assert!(listed["jobs"][0]["config_path"].as_str().unwrap().ends_with("p.toml"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_quality_field_is_draft_or_final() {
+        assert_eq!(RenderRequest::from_quality_field(None).unwrap().quality, None);
+        assert_eq!(RenderRequest::from_quality_field(Some("")).unwrap().quality, None);
+        assert_eq!(RenderRequest::from_quality_field(Some("Draft")).unwrap().quality, Some(Quality::Draft));
+        assert_eq!(RenderRequest::from_quality_field(Some("final")).unwrap().quality, Some(Quality::Final));
+        let e = RenderRequest::from_quality_field(Some("preview")).unwrap_err();
+        assert!(matches!(e, OpsError::InvalidInput { .. }), "{e:?}");
+    }
+
+    /// A draft's result names the draft's own files, beside the final's;
+    /// the request wins over the config's `[project].quality`.
+    #[test]
+    fn a_draft_result_names_the_draft_beside_the_final() {
+        let d = tmp("draft_result");
+        let out = d.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let toml = |quality: &str| {
+            format!(
+                "schema_version = 1\n[project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\n{quality}\n\
+                 [input]\nfolder = \".\"\n[[outputs]]\npath = \"{}\"\nresolution = \"1920x1080\"\n",
+                out.join("reel.mp4").to_string_lossy().replace('\\', "/")
+            )
+        };
+        let cfg = d.join("p.toml");
+        std::fs::write(&cfg, toml("")).unwrap();
+        std::fs::write(out.join("reel.draft.manifest.json"), r#"{"segments":[1,2,3],"beat_sync":{"n_cuts":2}}"#).unwrap();
+        let name = |v: &serde_json::Value, k: &str| {
+            Path::new(v[k].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned()
+        };
+
+        let r = build_render_result_json(&cfg, true, None, Some(Quality::Draft));
+        assert_eq!(r["quality"], "draft");
+        assert_eq!(name(&r, "output_path"), "reel.draft.mp4");
+        assert_eq!(name(&r, "manifest_path"), "reel.draft.manifest.json");
+        assert_eq!(r["manifest_summary"]["n_segments"], 3);
+
+        let r = build_render_result_json(&cfg, true, None, None);
+        assert_eq!(r["quality"], "final");
+        assert_eq!(name(&r, "output_path"), "reel.mp4");
+        assert_eq!(name(&r, "manifest_path"), "reel.manifest.json");
+
+        std::fs::write(&cfg, toml("quality = \"draft\"")).unwrap();
+        assert_eq!(build_render_result_json(&cfg, true, None, None)["quality"], "draft");
+        assert_eq!(build_render_result_json(&cfg, true, None, Some(Quality::Final))["quality"], "final");
+
+        // Its kept version is a draft too, never confused with the final's.
+        std::fs::write(out.join("reel.draft.mp4"), b"draft").unwrap();
+        let (v, m) = keep_version(&out.join("reel.draft.mp4"), "t1").unwrap();
+        assert!(v.ends_with("versions/reel.draft__t1.mp4"), "{v:?}");
+        assert!(m.ends_with("versions/reel.draft__t1.manifest.json"), "{m:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

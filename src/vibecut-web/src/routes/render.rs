@@ -15,6 +15,16 @@ use crate::state::AppState;
 #[derive(Debug, Deserialize)]
 pub struct RenderBody {
     pub config_path: String,
+    /// `draft` (a fast 540p preview beside the final, `<stem>.draft.mp4`)
+    /// or `final`; absent: the config's `[project].quality`, else final.
+    #[serde(default)]
+    pub quality: Option<String>,
+}
+
+impl RenderBody {
+    fn request(&self) -> Result<vibecut_ops::render::RenderRequest, ApiError> {
+        Ok(vibecut_ops::render::RenderRequest::from_quality_field(self.quality.as_deref())?)
+    }
 }
 
 /// Blocking: takes 1–10 minutes. Fine for a first REST cut — the
@@ -24,7 +34,7 @@ pub struct RenderBody {
 pub async fn render_sync(
     Json(body): Json<RenderBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = vibecut_ops::render::render_sync(&body.config_path).await?;
+    let result = vibecut_ops::render::render_sync_with(&body.config_path, body.request()?).await?;
     Ok(Json(result))
 }
 
@@ -32,10 +42,12 @@ pub async fn render_async(
     State(state): State<AppState>,
     Json(body): Json<RenderBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let job_id = vibecut_ops::render::submit_async(&state.jobs, &body.config_path).await?;
+    let req = body.request()?;
+    let job_id = vibecut_ops::render::submit_async_with(&state.jobs, &body.config_path, req).await?;
     Ok(Json(serde_json::json!({
         "job_id": job_id,
         "state": "queued",
+        "quality": req.quality.map(|q| q.as_str()),
     })))
 }
 

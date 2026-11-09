@@ -5,8 +5,15 @@
 //! subprocess.
 //!
 //! The CLI binary's `Cmd::Run` arm is now a thin call into
-//! [`run_cmd`]; everything else here is the same orchestration logic
-//! that used to live in `main.rs`.
+//! [`run_cmd`] / [`run_with`]; everything else here is the same
+//! orchestration logic that used to live in `main.rs`.
+//!
+//! A run is two phases: [`plan_edit`] decides the edit (probe, music and
+//! footage analysis, picking, beat-burst, ramps, beat lock) and
+//! [`render_plan`] encodes it at a [`Quality`] — a fast 540p draft or the
+//! final. [`plan_cmd`] runs the first phase alone and returns the plan as a
+//! [`PlanSummary`] (the exact output timeline the render will produce);
+//! [`RunOptions::on_plan`] hands the same summary to a caller mid-run.
 
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -22,7 +29,7 @@ const RAMP_SEED_MULTIPLIER: u64 = 0xc0ffee_d00d;
 const HARD_CUT_XFADE_SECS: f32 = 0.10;
 
 use crate::progress::{checkpoint as progress, Stage};
-use crate::project_config::Config;
+use crate::project_config::{Config, Quality};
 use crate::selection_planner::{
     DuckWindow, ExtractOpts, Manifest, MANIFEST_SCHEMA_VERSION, Segment, build_score_curve,
     extract_telemetry_with, group_into_sources, select_duck_windows,
@@ -42,6 +49,45 @@ pub fn run_cmd(
     print_effective_config: bool,
     random_seed: bool,
 ) -> Result<()> {
+    run_with(
+        config_path,
+        RunOptions { dry_run, no_visual, no_cache, explain, print_effective_config, random_seed, ..Default::default() },
+    )
+    .map(|_| ())
+}
+
+/// What a run asks for beyond its config: [`run_cmd`]'s flags, the render
+/// quality, and a hook that sees the edit before anything is encoded.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Parse and validate only.
+    pub dry_run: bool,
+    pub no_visual: bool,
+    pub no_cache: bool,
+    pub explain: bool,
+    /// Print the merged config and stop.
+    pub print_effective_config: bool,
+    pub random_seed: bool,
+    /// Overrides `[project].quality` (see [`Config::render_quality`]).
+    pub quality: Option<Quality>,
+    /// Called once with the planned edit, before the render phase starts —
+    /// what a UI shows as a storyboard while the clips are encoded.
+    pub on_plan: Option<Box<dyn FnOnce(&PlanSummary) + Send>>,
+}
+
+/// What a finished render wrote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderOutcome {
+    pub quality: Quality,
+    /// Every output written, the primary (the manifest's `output`) first.
+    pub outputs: Vec<Utf8PathBuf>,
+    pub manifest: Utf8PathBuf,
+}
+
+/// [`run_cmd`] with every option: renders `config_path` and says what it
+/// wrote (`None` for a dry run or `print_effective_config`).
+pub fn run_with(config_path: &Utf8Path, opts: RunOptions) -> Result<Option<RenderOutcome>> {
+    let RunOptions { dry_run, print_effective_config, random_seed, .. } = opts;
     let mut cfg = Config::load(config_path)
         .with_context(|| format!("loading config {config_path}"))?;
 
@@ -60,7 +106,7 @@ pub fn run_cmd(
         let s = toml::to_string_pretty(&cfg)
             .context("serializing effective config")?;
         println!("{s}");
-        return Ok(());
+        return Ok(None);
     }
 
     println!("config OK · schema v{}", cfg.schema_version);
@@ -132,13 +178,72 @@ pub fn run_cmd(
 
     if dry_run {
         println!("\n(dry-run: pipeline not executed; only schema validated)");
-        return Ok(());
+        return Ok(None);
     }
 
-    execute_pipeline(&cfg, no_visual, no_cache, explain)
+    execute_pipeline(&cfg, opts).map(Some)
 }
 
-fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool) -> Result<()> {
+/// Plan `config_path` without rendering it: probe, music and footage
+/// analysis (from the cache when the footage was analysed before), picking,
+/// the beat lock and the output timeline the render will produce. Seconds
+/// on analysed footage. The render plans the same config to the same edit.
+pub fn plan_cmd(config_path: &Utf8Path, no_visual: bool, no_cache: bool) -> Result<PlanSummary> {
+    let cfg = Config::load(config_path).with_context(|| format!("loading config {config_path}"))?;
+    let plan = plan_edit(&cfg, no_visual, no_cache, PlanFor::Preview)?;
+    Ok(plan.summary(&cfg))
+}
+
+fn execute_pipeline(cfg: &Config, opts: RunOptions) -> Result<RenderOutcome> {
+    let RunOptions { no_visual, no_cache, explain, quality, on_plan, .. } = opts;
+    let plan = plan_edit(cfg, no_visual, no_cache, PlanFor::Render)?;
+    if let Some(hook) = on_plan {
+        hook(&plan.summary(cfg));
+    }
+    render_plan(cfg, plan, cfg.render_quality(quality), explain)
+}
+
+/// Who a plan is for: a render goes on to encode it; a plan on its own
+/// (the storyboard) keeps its scratch files apart from a render's, which
+/// may be running on the same project at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanFor {
+    Render,
+    Preview,
+}
+
+/// The edit, decided before anything is encoded: what the footage and the
+/// music are, which moments play in which order, every clip's beat-locked
+/// length, its speed ramp, the beat-burst. [`plan_edit`] makes it and
+/// [`render_plan`] encodes it; a draft and a final of one config share it.
+pub struct EditPlan {
+    hw: HwConfig,
+    chapter_has_audio: std::collections::HashMap<Utf8PathBuf, bool>,
+    chapter_color: std::collections::HashMap<Utf8PathBuf, crate::video_renderer::ColorConversion>,
+    sources: Vec<crate::selection_planner::Source>,
+    image_effect_map: std::collections::HashMap<Utf8PathBuf, crate::project_config::ImageEffect>,
+    target: f64,
+    audio: Option<crate::audio_analysis::AnalyzedAudio>,
+    soundtrack_resolved: Option<Utf8PathBuf>,
+    cache_enabled: bool,
+    cache_dir: Utf8PathBuf,
+    angle_groups: Vec<crate::multi_angle::AngleGroup>,
+    /// The picks in output order, beat-locked, the beat-burst's clips
+    /// still separate (see `burst_range`).
+    segments: Vec<Segment>,
+    /// Outgoing speed ramp per pick, parallel to `segments`.
+    seg_ramps: Vec<Option<crate::video_renderer::SpeedRamp>>,
+    /// `(start, end_exclusive, total_secs)` of the beat-burst's clips in
+    /// `segments`; the render folds them into one concat input.
+    burst_range: Option<(usize, usize, f32)>,
+    /// The intro card's beat-locked length, when the beat lock moved it.
+    intro_card_len: Option<f64>,
+}
+
+/// Plan phase: probe, music analysis, footage analysis (cached), picking,
+/// angles, ordering, the beat-burst, speed ramps and the beat lock. Nothing
+/// is encoded; see [`render_plan`].
+fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) -> Result<EditPlan> {
     let runner = NativeRunner::new();
     let v = runner
         .version()
@@ -159,16 +264,6 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     let pref = encoder_pref_from_cfg(&cfg.outputs[0].encoder);
     let hw = HwConfig::resolve(support, pref);
     println!("hardware accel: {} → encoder = {}", hw.support.summary(), hw.encoder.name());
-
-    // Body render uses CRF chosen for high quality if we'll re-transcode to
-    // multiple outputs (avoids generation-loss artifacts), otherwise the
-    // single output's configured CRF.
-    let outputs = cfg.resolved_outputs();
-    let body_crf: u32 = if direct_single_output(cfg) {
-        outputs[0].crf
-    } else {
-        outputs[0].crf.min(18)
-    };
 
     // 1. Probe inputs.
     progress(Stage::Probing, 0.0, None)?;
@@ -340,7 +435,10 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             s.files[0].clone()
         } else {
             std::fs::create_dir_all(&workspace_pre).ok();
-            let combined = workspace_pre.join("soundtrack_combined.m4a");
+            let combined = workspace_pre.join(match purpose {
+                PlanFor::Render => "soundtrack_combined.m4a",
+                PlanFor::Preview => "soundtrack_combined.preview.m4a",
+            });
             println!("\nconcatenating {} soundtrack files → {combined}", s.files.len());
             crate::audio_analysis::concat_soundtrack_files(&s.files, &combined)
                 .context("concatenating soundtrack files")?
@@ -1059,19 +1157,6 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         );
     }
 
-    // 5. Render. Body is rendered at the highest resolution among all outputs;
-    // the per-output transcode pass downscales/copies to each target.
-    let (width, height) = cfg.body_resolution();
-    if width == 0 || height == 0 {
-        anyhow::bail!("could not parse any [[outputs]].resolution as WIDTHxHEIGHT");
-    }
-    let workspace = cfg.workspace_dir();
-    std::fs::create_dir_all(&workspace)
-        .with_context(|| format!("creating workspace {workspace}"))?;
-
-    let stabilize = cfg.grading.stabilize;
-    let lut3d_path: Option<Utf8PathBuf> = cfg.grading.lut.clone();
-
     // Per-segment outgoing speed-ramp decision. Each transition between
     // adjacent normal-paced segments may receive a "whip-up" ramp: the last
     // `speed_ramp_duration` of the outgoing clip plays at `speed_ramp_factor`
@@ -1257,11 +1342,82 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             }
         }
     }
+    Ok(EditPlan {
+        hw,
+        chapter_has_audio,
+        chapter_color,
+        sources,
+        image_effect_map,
+        target,
+        audio,
+        soundtrack_resolved,
+        cache_enabled,
+        cache_dir,
+        angle_groups,
+        segments,
+        seg_ramps,
+        burst_range,
+        intro_card_len,
+    })
+}
+
+/// Render phase: encode `plan` at `quality` — cards, clips (cached by
+/// [`clip_cache_key`]), the burst fold, the concat, the soundtrack mux and
+/// ducking, the outputs, the beat-sync check and the manifest.
+fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) -> Result<RenderOutcome> {
+    let EditPlan {
+        hw,
+        chapter_has_audio,
+        chapter_color,
+        sources,
+        image_effect_map,
+        target,
+        audio,
+        soundtrack_resolved,
+        cache_enabled,
+        cache_dir,
+        angle_groups,
+        mut segments,
+        mut seg_ramps,
+        burst_range,
+        intro_card_len,
+    } = plan;
+    let runner = NativeRunner::new();
+    // What this quality encodes: the body's size and CRF, the outputs, and
+    // a draft's shortcuts (see `render_targets`).
+    let targets = render_targets(cfg, quality);
+    let hw = if targets.fast { hw.fast() } else { hw };
+    let outputs = targets.outputs.clone();
+    let body_crf = targets.body_crf;
+    if quality == Quality::Draft {
+        println!(
+            "\ndraft: {}x{} body, crf {}, {} preset, no stabilization → {}",
+            targets.body.0,
+            targets.body.1,
+            body_crf,
+            hw.encoder.name(),
+            outputs[0].path
+        );
+    }
+
+    // 5. Render. Body is rendered at the highest resolution among all outputs;
+    // the per-output transcode pass downscales/copies to each target.
+    let (width, height) = targets.body;
+    if width == 0 || height == 0 {
+        anyhow::bail!("could not parse any [[outputs]].resolution as WIDTHxHEIGHT");
+    }
+    let workspace = cfg.workspace_dir();
+    std::fs::create_dir_all(&workspace)
+        .with_context(|| format!("creating workspace {workspace}"))?;
+
+    let stabilize = targets.stabilize;
+    let lut3d_path: Option<Utf8PathBuf> = cfg.grading.lut.clone();
 
     // Per-segment fingerprint (covers source path + start + duration + render
-    // params + ramp settings). Used to name `seg_NNN_HASH.{trf,mp4}` so a
-    // re-run with different picker output OR different ramp decisions never
-    // collides with a stale cached clip in the same slot.
+    // params + ramp settings). Used to name `seg_HASH.{trf,mp4}` (see
+    // `clip_cache_key`) so a re-run with different picker output OR
+    // different ramp decisions never collides with a stale cached clip,
+    // while a moment that only moved in the edit keeps its clip.
     let seg_hashes: Vec<String> = segments
         .iter()
         .enumerate()
@@ -1288,7 +1444,14 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     let seg_hashes: Vec<String> = seg_hashes
         .into_iter()
         .zip(&seg_colors)
-        .map(|(h, c)| with_color_tag(h, c))
+        .enumerate()
+        .map(|(i, (h, c))| {
+            let s = &segments[i];
+            // An image's animation is seeded by its position (see normalize).
+            let image_seed = crate::media_probe::is_image_path(&s.chapter_path)
+                .then(|| cfg.project.seed.unwrap_or(0).wrapping_add(i as u64));
+            clip_cache_key(with_color_tag(h, c), targets.fast, image_seed)
+        })
         .collect();
 
     if stabilize {
@@ -1301,7 +1464,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             if crate::media_probe::is_image_path(&s.chapter_path) {
                 continue;
             }
-            let trf = workspace.join(format!("seg_{:03}_{}.trf", i + 1, seg_hashes[i]));
+            let trf = workspace.join(clip_file(&seg_hashes[i], false, "trf"));
             // Cache: skip detect if the fingerprinted .trf already exists and
             // is fresher than the source. The fingerprint guarantees the file
             // was produced for this exact (source, window, params) tuple, so
@@ -1359,7 +1522,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     });
     if let Some(intro) = &intro_cfg {
         let dur = intro.duration.as_secs_f32();
-        let (texts, images) = card_to_layers(intro);
+        let (texts, images) = scale_layers(card_to_layers(intro), targets.layer_scale);
         match intro.mode {
             crate::project_config::CardMode::Card => {
                 let path = workspace.join("intro.mp4");
@@ -1399,7 +1562,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     }
     if let Some(outro) = &cfg.outro {
         let dur = outro.duration.as_secs_f32();
-        let (texts, images) = card_to_layers(outro);
+        let (texts, images) = scale_layers(card_to_layers(outro), targets.layer_scale);
         match outro.mode {
             crate::project_config::CardMode::Card => {
                 let path = workspace.join("outro.mp4");
@@ -1444,9 +1607,8 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     let last_idx = segments.len().saturating_sub(1);
     let mut normalize_hits = 0u32;
     for (i, s) in segments.iter().enumerate() {
-        let out = workspace.join(format!("seg_{:03}_{}.mp4", i + 1, seg_hashes[i]));
         let trf = if stabilize && !crate::media_probe::is_image_path(&s.chapter_path) {
-            Some(workspace.join(format!("seg_{:03}_{}.trf", i + 1, seg_hashes[i])))
+            Some(workspace.join(clip_file(&seg_hashes[i], false, "trf")))
         } else {
             None
         };
@@ -1491,7 +1653,11 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 });
             }
         }
-        // Cache: skip normalize when the fingerprinted `seg_NNN_HASH.mp4`
+        // A clip with titles burnt in gets a name of its own, so it is never
+        // taken for (or taken by) the plain clip of the same moment.
+        let titled = !overlays.is_empty() || !image_overlays.is_empty();
+        let out = workspace.join(clip_file(&seg_hashes[i], titled, "mp4"));
+        // Cache: skip normalize when the fingerprinted `seg_HASH.mp4`
         // already exists, is fresher than the source, has the right duration,
         // AND this segment carries no overlays (text or image — neither is
         // baked into the fingerprint, so we re-encode whenever they apply).
@@ -1605,30 +1771,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             )
             .context("beat-burst concat stage")?;
             // Replace M normalized entries with one entry; collapse segments[]
-            // in parallel into one synthetic Segment whose duration = total.
-            let first = segments[bs].clone();
-            let synth = crate::selection_planner::Segment {
-                source_id: format!("burst:{}", first.source_id),
-                chapter_path: burst_intermediate.clone(),
-                chapter_index: 1,
-                in_chapter_start_secs: 0.0,
-                duration_secs: total_secs as f64,
-                virtual_start_secs: first.virtual_start_secs,
-                reason: format!(
-                    "beat-burst x{} ({:.2}s total)",
-                    be - bs,
-                    total_secs
-                ),
-                // Synthetic placeholder for the folded burst — a high score so
-                // the energy_arc placement keeps it near the peak (it's the
-                // most kinetic moment of the cut by construction).
-                score: Some(1.0),
-            };
+            // (and the ramps) in parallel into one synthetic Segment.
+            burst_parts = fold_burst(&mut segments, &mut seg_ramps, (bs, be, total_secs), &burst_intermediate);
             normalized.splice(bs..be, std::iter::once(burst_intermediate));
-            burst_parts = segments.splice(bs..be, std::iter::once(synth)).collect();
-            // Keep the per-seam ramp lookup in step with the folded list
-            // (the concat stage indexes it by post-fold position).
-            seg_ramps.splice(bs..be, std::iter::once(None));
         }
     }
 
@@ -1667,21 +1812,18 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         .enumerate()
         .map(|(i, p)| (p.clone(), probe_dur(p, segments[i].duration_secs as f32)))
         .collect();
-    let xfade = (!cfg.transition.hard_cut()).then_some((cfg.transition.default.as_str(), trans_dur));
     // How the body is assembled: the inputs, their seams, the chain layout
     // the concat renders from (the xfade offsets, or the frames each input
     // keeps), and what each input is. Becomes the output timeline that
     // ducking, the beat-sync check and the manifest all read.
-    let plan = BodyConcat::plan(
+    let plan = body_chain(
+        cfg,
         intro_path.as_ref().map(|p| (p.clone(), probe_dur(p, intro_dur))),
         clips,
         outro_path.as_ref().map(|p| (p.clone(), probe_dur(p, outro_dur))),
         &segments,
         &seg_ramps,
         burst_fold,
-        xfade,
-        (cfg.project.fade_in.as_secs_f32(), cfg.project.fade_out.as_secs_f32()),
-        cfg.project.fps,
     );
     println!("\n{} → {body}", plan.describe());
     plan.render(&runner, width, height, cfg.project.fps, body_crf, &hw, &body)?;
@@ -1695,7 +1837,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // replaces the last good video with half of a new one. Staged by the
     // resolved outputs, so `staged.path(i)` pairs with `outputs[i]`.
     let staged = crate::staging::StagedOutputs::new(outputs.iter().map(|o| o.path.as_path()));
-    let muxed_body: Utf8PathBuf = if direct_single_output(cfg) {
+    let muxed_body: Utf8PathBuf = if targets.direct {
         // Single output in the body's shape: write straight to the user's
         // chosen path (staged).
         let p = staged.path(0).to_path_buf();
@@ -1894,7 +2036,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // the muxed body (no extra pass). Otherwise transcode each, reframing
     // any whose aspect differs from the body's.
     // Final paths: the staged files land there at commit time.
-    let final_outputs: Vec<Utf8PathBuf> = if direct_single_output(cfg) {
+    let final_outputs: Vec<Utf8PathBuf> = if targets.direct {
         vec![outputs[0].path.clone()]
     } else {
         let mut paths = Vec::with_capacity(outputs.len());
@@ -1912,6 +2054,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             let fit = crate::output_format::reframe_fit((width, height), (ow, oh), o.fit);
             let pref = encoder_pref_from_cfg(&o.encoder);
             let out_hw = HwConfig::resolve(hw.support.clone(), pref);
+            let out_hw = if targets.fast { out_hw.fast() } else { out_hw };
             let started = std::time::Instant::now();
             println!(
                 "  [{i}] {} → {ow}x{oh}{}  enc={}  crf={}  a={}",
@@ -1949,7 +2092,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         }
         paths
     };
-    let primary_output = &cfg.outputs[0].path;
+    let primary_output = &outputs[0].path;
 
     progress(Stage::Checking, 0.0, None)?;
     // 7c. Beat-sync check: where did the cuts land against the music?
@@ -2006,6 +2149,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             .collect(),
         beat_sync,
         timeline: Some(timeline),
+        quality: (quality == Quality::Draft).then_some(quality),
         generator: format!("vibecut {}", env!("CARGO_PKG_VERSION")),
     };
     // Last chance to stop: past this point the new video replaces the old.
@@ -2073,7 +2217,396 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         }
     }
 
-    Ok(())
+
+    Ok(RenderOutcome { quality, outputs: final_outputs, manifest: manifest_path })
+}
+
+// ---------- The plan as the outside world sees it ----------
+
+/// The planned edit as JSON for a storyboard (`POST /api/plan`, the MCP
+/// `plan_edit` tool, a render's plan hook): every clip with its source
+/// window and its place in the output, the music and its beats as they
+/// will play, and a frame to show for each clip. Its `segments` and
+/// `timeline` have the manifest's shape and, rendered, are the manifest's.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanSummary {
+    pub project_name: String,
+    pub fps: u32,
+    pub seed: Option<u64>,
+    pub target_duration_secs: f64,
+    /// Length of the video the plan renders to.
+    pub duration_secs: f64,
+    /// Who made the music (as the manifest records it); empty without.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub soundtrack: Vec<crate::track_meta::SoundtrackCredit>,
+    /// The song's tempo and beat grid, when there is music.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub song: Option<PlanSong>,
+    /// Beats as they will play in the output (seconds, loop copies of the
+    /// song included), up to `duration_secs`.
+    pub beats: Vec<f64>,
+    /// The picks in output order — a beat-burst folded into one, as in the
+    /// manifest.
+    pub segments: Vec<Segment>,
+    /// Where every clip and card will play (the manifest's `timeline`).
+    pub timeline: crate::output_timeline::OutputTimeline,
+    /// One frame per timeline clip, for thumbnails: grab `source_path` at
+    /// `t_secs` (e.g. `GET /api/frames/at`).
+    pub thumbnails: Vec<PlanThumbnail>,
+}
+
+/// The soundtrack's beat grid in a [`PlanSummary`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlanSong {
+    pub path: Utf8PathBuf,
+    pub tempo_bpm: f32,
+    pub beat_interval_secs: f32,
+    pub duration_secs: f32,
+}
+
+/// A representative frame of one timeline clip.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlanThumbnail {
+    /// Index into the timeline's `clips`.
+    pub clip_index: usize,
+    pub segment_index: usize,
+    pub source_path: Utf8PathBuf,
+    /// Source (chapter-local) seconds: the middle of what the clip shows.
+    pub t_secs: f64,
+    /// Where the clip's cut in plays in the output.
+    pub output_secs: f64,
+}
+
+impl EditPlan {
+    /// The body as the render will assemble it, from the plan alone: the
+    /// burst folded as the render folds it and every clip at its planned
+    /// length — which the normalize stage writes frame-exactly, so this is
+    /// the chain (and the output timeline) the concat stage will build.
+    fn planned_body(&self, cfg: &Config) -> (Vec<Segment>, BodyConcat) {
+        let fps = cfg.project.fps;
+        let workspace = cfg.workspace_dir();
+        let mut segments = self.segments.clone();
+        let mut ramps = self.seg_ramps.clone();
+        let mut burst: Option<(usize, Vec<Segment>, Vec<f32>)> = None;
+        if let Some((bs, be, total)) = self.burst_range {
+            if be > bs && bs < segments.len() {
+                let subs: Vec<f32> =
+                    segments[bs..be].iter().map(|s| frame_exact_secs(s.duration_secs, fps) as f32).collect();
+                let parts = fold_burst(&mut segments, &mut ramps, (bs, be, total), &workspace.join("beat_burst.mp4"));
+                burst = Some((bs, parts, subs));
+            }
+        }
+        let clips: Vec<(Utf8PathBuf, f32)> = segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let secs = match &burst {
+                    // The folded burst is its clips back to back.
+                    Some((bs, _, subs)) if *bs == i => subs.iter().map(|&d| d as f64).sum::<f64>(),
+                    _ => frame_exact_secs(s.duration_secs, fps),
+                };
+                (s.chapter_path.clone(), secs as f32)
+            })
+            .collect();
+        let card = |c: Option<&crate::project_config::TextCard>, len: Option<f64>, name: &str| {
+            chain_card_secs(c).map(|d| (workspace.join(name), frame_exact_secs(len.unwrap_or(d), fps) as f32))
+        };
+        let chain = body_chain(
+            cfg,
+            card(cfg.intro.as_ref(), self.intro_card_len, "intro.mp4"),
+            clips,
+            card(cfg.outro.as_ref(), None, "outro.mp4"),
+            &segments,
+            &ramps,
+            burst.as_ref().map(|(bs, parts, subs)| (*bs, parts.as_slice(), subs.as_slice())),
+        );
+        (segments, chain)
+    }
+
+    /// The plan as a [`PlanSummary`].
+    pub fn summary(&self, cfg: &Config) -> PlanSummary {
+        let (segments, chain) = self.planned_body(cfg);
+        let timeline = crate::output_timeline::OutputTimeline::build(&chain.layout, &chain.items);
+        let duration = timeline.duration_secs;
+        let beats: Vec<f64> = match &self.audio {
+            Some(a) if a.tempo_bpm > 0.0 => {
+                // Laid out as the mux lays the song under the video.
+                let spans = soundtrack_loop_plan(a).spans(duration as f32, a.duration_secs);
+                crate::beat_sync::beats_in_output(&a.beats, &spans)
+                    .into_iter()
+                    .map(|b| b as f64)
+                    .filter(|&b| b >= 0.0 && b <= duration)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let song = match (&self.audio, &self.soundtrack_resolved) {
+            (Some(a), Some(path)) => Some(PlanSong {
+                path: path.clone(),
+                tempo_bpm: a.tempo_bpm,
+                beat_interval_secs: a.beat_interval_secs(),
+                duration_secs: a.duration_secs,
+            }),
+            _ => None,
+        };
+        let thumbnails = timeline
+            .clips
+            .iter()
+            .enumerate()
+            .map(|(k, c)| PlanThumbnail {
+                clip_index: k,
+                segment_index: c.segment_index,
+                source_path: c.source_path.clone(),
+                t_secs: c.source_in_secs + (c.source_out_secs - c.source_in_secs).max(0.0) * 0.5,
+                output_secs: c.cut_in_secs,
+            })
+            .collect();
+        PlanSummary {
+            project_name: cfg.project.name.clone(),
+            fps: cfg.project.fps,
+            seed: cfg.project.seed,
+            target_duration_secs: self.target,
+            duration_secs: duration,
+            soundtrack: crate::track_meta::manifest_soundtrack(cfg),
+            song,
+            beats,
+            segments,
+            timeline,
+            thumbnails,
+        }
+    }
+}
+
+/// Seconds a clip planned at `secs` lasts once encoded: the normalize
+/// stage writes exactly `round(secs × fps)` frames (at least one).
+fn frame_exact_secs(secs: f64, fps: u32) -> f64 {
+    let f = fps.max(1) as f64;
+    ((secs.max(0.0) * f).round()).max(1.0) / f
+}
+
+/// Fold the beat-burst's clips `segments[bs..be]` into one synthetic
+/// segment reading `burst_file` (their concat), the ramps in step with it.
+/// Returns the folded clips, which the output timeline still shows one by
+/// one. The render and [`EditPlan::planned_body`] fold the same way.
+fn fold_burst(
+    segments: &mut Vec<Segment>,
+    seg_ramps: &mut Vec<Option<crate::video_renderer::SpeedRamp>>,
+    (bs, be, total_secs): (usize, usize, f32),
+    burst_file: &Utf8Path,
+) -> Vec<Segment> {
+    let first = segments[bs].clone();
+    let synth = crate::selection_planner::Segment {
+        source_id: format!("burst:{}", first.source_id),
+        chapter_path: burst_file.to_path_buf(),
+        chapter_index: 1,
+        in_chapter_start_secs: 0.0,
+        duration_secs: total_secs as f64,
+        virtual_start_secs: first.virtual_start_secs,
+        reason: format!(
+            "beat-burst x{} ({:.2}s total)",
+            be - bs,
+            total_secs
+        ),
+        // Synthetic placeholder for the folded burst — a high score so
+        // the energy_arc placement keeps it near the peak (it's the
+        // most kinetic moment of the cut by construction).
+        score: Some(1.0),
+    };
+    let parts = segments.splice(bs..be, std::iter::once(synth)).collect();
+    // Keep the per-seam ramp lookup in step with the folded list
+    // (the concat stage indexes it by post-fold position).
+    seg_ramps.splice(bs..be, std::iter::once(None));
+    parts
+}
+
+/// The concat chain of a body: [`BodyConcat::plan`] with the project's
+/// transition and fades. The render calls it with the encoded files' probed
+/// lengths, [`EditPlan::planned_body`] with the planned ones.
+fn body_chain(
+    cfg: &Config,
+    intro: Option<(Utf8PathBuf, f32)>,
+    clips: Vec<(Utf8PathBuf, f32)>,
+    outro: Option<(Utf8PathBuf, f32)>,
+    segments: &[Segment],
+    seg_ramps: &[Option<crate::video_renderer::SpeedRamp>],
+    burst: Option<(usize, &[Segment], &[f32])>,
+) -> BodyConcat {
+    let trans_dur = cfg.transition.duration.as_secs_f32();
+    let xfade = (!cfg.transition.hard_cut()).then_some((cfg.transition.default.as_str(), trans_dur));
+    BodyConcat::plan(
+        intro,
+        clips,
+        outro,
+        segments,
+        seg_ramps,
+        burst,
+        xfade,
+        (cfg.project.fade_in.as_secs_f32(), cfg.project.fade_out.as_secs_f32()),
+        cfg.project.fps,
+    )
+}
+
+// ---------- Draft and final ----------
+
+/// A draft's frame: its short side at most this many pixels (960x540 for
+/// a 16:9 master, 540x960 for a vertical output).
+pub const DRAFT_SHORT_SIDE: u32 = 540;
+/// CRF of every draft encode: plenty for a preview on a 540p frame.
+pub const DRAFT_CRF: u32 = 28;
+
+/// Where a render of quality `quality` writes the output configured at
+/// `output`: the path itself for a final, `<stem>.draft.<ext>` next to it
+/// for a draft — never the final's file.
+pub fn output_path_for(output: &Utf8Path, quality: Quality) -> Utf8PathBuf {
+    match quality {
+        Quality::Final => output.to_path_buf(),
+        Quality::Draft => {
+            let stem = output.file_stem().unwrap_or("output");
+            let ext = output.extension().unwrap_or("mp4");
+            output.with_file_name(format!("{stem}.draft.{ext}"))
+        }
+    }
+}
+
+/// `size` scaled down so its short side is at most [`DRAFT_SHORT_SIDE`],
+/// aspect kept, both sides even.
+fn draft_size((w, h): (u32, u32)) -> (u32, u32) {
+    let short = w.min(h).max(1);
+    if short <= DRAFT_SHORT_SIDE {
+        return (w, h);
+    }
+    let k = DRAFT_SHORT_SIDE as f64 / short as f64;
+    let even = |x: f64| ((x.round() as u32) & !1).max(2);
+    (even(w as f64 * k), even(h as f64 * k))
+}
+
+/// What a render encodes at one quality.
+#[derive(Debug, Clone)]
+struct RenderTargets {
+    /// The body's frame and CRF.
+    body: (u32, u32),
+    body_crf: u32,
+    /// The files written, the primary first.
+    outputs: Vec<crate::output_format::ResolvedOutput>,
+    /// One output in the body's shape: the mux writes it directly.
+    direct: bool,
+    stabilize: bool,
+    /// Every encode at the encoder's fastest preset ([`HwConfig::fast`]).
+    fast: bool,
+    /// Card titles and logos are sized in pixels for the final's frame; a
+    /// draft's smaller frame scales them by this.
+    layer_scale: f64,
+}
+
+/// The final renders the config as written. A draft renders the same edit
+/// to the first output only, at [`draft_size`] (body and output alike),
+/// [`DRAFT_CRF`], the fastest encoder preset and without stabilization,
+/// to [`output_path_for`] — so it never replaces the final.
+fn render_targets(cfg: &Config, quality: Quality) -> RenderTargets {
+    let body = cfg.body_resolution();
+    let outputs = cfg.resolved_outputs();
+    match quality {
+        Quality::Final => {
+            // Body render uses CRF chosen for high quality if we'll re-transcode to
+            // multiple outputs (avoids generation-loss artifacts), otherwise the
+            // single output's configured CRF.
+            let direct = direct_single_output(cfg);
+            let body_crf: u32 = if direct {
+                outputs[0].crf
+            } else {
+                outputs[0].crf.min(18)
+            };
+            RenderTargets {
+                body,
+                body_crf,
+                outputs,
+                direct,
+                stabilize: cfg.grading.stabilize,
+                fast: false,
+                layer_scale: 1.0,
+            }
+        }
+        Quality::Draft => {
+            let draft_body = draft_size(body);
+            let mut out = outputs[0].clone();
+            (out.width, out.height) = draft_size((out.width, out.height));
+            out.path = output_path_for(&out.path, Quality::Draft);
+            out.crf = DRAFT_CRF;
+            out.encoder_preset = None;
+            out.max_bitrate = None;
+            let direct = !crate::output_format::needs_own_pass(draft_body, &out);
+            RenderTargets {
+                body: draft_body,
+                body_crf: DRAFT_CRF,
+                outputs: vec![out],
+                direct,
+                stabilize: false,
+                fast: true,
+                layer_scale: draft_body.1 as f64 / body.1.max(1) as f64,
+            }
+        }
+    }
+}
+
+/// Card layers sized for a frame `k` times the final's (a draft's).
+fn scale_layers(
+    (mut texts, mut images): (Vec<TextOverlay>, Vec<ImageOverlay>),
+    k: f64,
+) -> (Vec<TextOverlay>, Vec<ImageOverlay>) {
+    if (k - 1.0).abs() < 1e-9 {
+        return (texts, images);
+    }
+    let px = |v: u32| ((v as f64 * k).round() as u32).max(1);
+    let off = |v: i32| (v as f64 * k).round() as i32;
+    for t in &mut texts {
+        t.size = px(t.size);
+        t.x_offset = off(t.x_offset);
+        t.y_offset = off(t.y_offset);
+        if t.bg_color_hex.is_some() {
+            // drawtext's own default box padding is 20 px.
+            t.bg_padding_px = Some(px(t.bg_padding_px.unwrap_or(20)));
+        }
+    }
+    for im in &mut images {
+        im.height = px(im.height);
+        im.x_offset = off(im.x_offset);
+        im.y_offset = off(im.y_offset);
+    }
+    (texts, images)
+}
+
+/// The clip cache key of one normalized segment: its [`segment_fingerprint`]
+/// (already with its colour tag, [`with_color_tag`]) plus what else changes
+/// the encode — a draft's fast preset, an image's effect seed (set by its
+/// position) — each folded in only when it applies, so a plain final clip
+/// keeps its fingerprint. The key never depends on where the clip plays,
+/// so a tweak that moves a moment reuses its clip.
+fn clip_cache_key(fingerprint: String, fast: bool, image_seed: Option<u64>) -> String {
+    if !fast && image_seed.is_none() {
+        return fingerprint;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(fingerprint.as_bytes());
+    if fast {
+        h.update(b"fast");
+    }
+    if let Some(seed) = image_seed {
+        h.update(b"image-seed");
+        h.update(&seed.to_le_bytes());
+    }
+    h.finalize().to_hex()[..8].to_string()
+}
+
+/// File name of a cached clip (`mp4`) or its stabilization transforms
+/// (`trf`): `seg_<key>.<ext>`, `seg_<key>_titled.mp4` for a clip with a
+/// title burnt in (re-encoded every time, and never mistaken for the plain
+/// clip of the same moment).
+fn clip_file(key: &str, titled: bool, ext: &str) -> String {
+    if titled {
+        format!("seg_{key}_titled.{ext}")
+    } else {
+        format!("seg_{key}.{ext}")
+    }
 }
 
 /// Picks a single clip length: the midpoint of the configured min/max.
@@ -2136,10 +2669,10 @@ fn normalized_is_fresh(out: &Utf8Path, source: &Utf8Path, duration_secs: f64) ->
     }
 }
 
-/// 8-hex-char fingerprint of a segment's render spec. Embedded in the
-/// `seg_NNN_HASH.{trf,mp4}` filenames so two runs with the same picker
-/// output collide on the same files (cache hit) while a re-pick produces
-/// different filenames (no stale-content collision).
+/// 8-hex-char fingerprint of a segment's render spec. Embedded (through
+/// [`clip_cache_key`]) in the `seg_HASH.{trf,mp4}` filenames so two runs
+/// with the same picker output collide on the same files (cache hit) while
+/// a re-pick produces different filenames (no stale-content collision).
 fn segment_fingerprint(
     s: &Segment,
     width: u32,
@@ -2332,7 +2865,8 @@ fn generate_random_seed() -> u64 {
     crate::rng::splitmix64(nanos.wrapping_add(crate::rng::GOLDEN_RATIO_64))
 }
 
-fn manifest_path_for(output: &Utf8Path) -> Utf8PathBuf {
+/// `<dir>/<stem>.manifest.json` for an output `<dir>/<stem>.<ext>`.
+pub fn manifest_path_for(output: &Utf8Path) -> Utf8PathBuf {
     let parent = output.parent().unwrap_or(Utf8Path::new("."));
     let stem = output.file_stem().unwrap_or("output");
     parent.join(format!("{stem}.manifest.json"))
@@ -3604,5 +4138,320 @@ mod tests {
             "peak should beat right edge; scores={scores:?}");
         // Strongest pick (0.9) lands at the middle.
         assert!((scores[mid] - 0.9).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod plan_render_tests {
+    //! The plan / render split and draft quality: the plan is what the
+    //! render encodes, a draft is the same edit, smaller, beside the final.
+    use super::*;
+    use crate::output_format::ResolvedOutput;
+
+    fn cfg_with(project_extra: &str, outputs: &str) -> Config {
+        let cfg: Config = toml::from_str(&format!(
+            "schema_version = 1\n\
+             [project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\n{project_extra}\n\
+             [input]\nfolder = \".\"\n\
+             {outputs}"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    fn one_output(keys: &str) -> Config {
+        cfg_with("", &format!("[[outputs]]\npath = \"out/reel.mp4\"\n{keys}\n"))
+    }
+
+    fn dims(o: &ResolvedOutput) -> (u32, u32) {
+        (o.width, o.height)
+    }
+
+    #[test]
+    fn a_final_renders_the_config_as_written() {
+        // One output in the body's shape: the mux writes it, at its own CRF.
+        let t = render_targets(&one_output("resolution = \"1920x1080\"\ncrf = 22"), Quality::Final);
+        assert_eq!((t.body, t.body_crf, t.direct, t.fast, t.layer_scale), ((1920, 1080), 22, true, false, 1.0));
+        assert_eq!(t.outputs.len(), 1);
+        assert_eq!(t.outputs[0].path.as_str(), "out/reel.mp4");
+        // Two outputs: a high-quality body, then a pass per output.
+        let two = cfg_with(
+            "",
+            "[[outputs]]\npath = \"out/a.mp4\"\nresolution = \"1920x1080\"\ncrf = 22\n\
+             [[outputs]]\npath = \"out/b.mp4\"\npreset = \"reels\"\n",
+        );
+        let t = render_targets(&two, Quality::Final);
+        assert_eq!((t.body_crf, t.direct, t.outputs.len()), (18, false, 2));
+        // Stabilization is the config's call.
+        let stab = cfg_with("", "[grading]\nstabilize = true\n[[outputs]]\npath = \"o.mp4\"\nresolution = \"1920x1080\"\n");
+        assert!(render_targets(&stab, Quality::Final).stabilize);
+        assert!(!render_targets(&stab, Quality::Draft).stabilize);
+    }
+
+    #[test]
+    fn a_draft_is_the_first_output_small_fast_and_beside_the_final() {
+        let t = render_targets(&one_output("resolution = \"1920x1080\"\ncrf = 18\nencoder_preset = \"slow\""), Quality::Draft);
+        assert_eq!((t.body, t.body_crf, t.fast, t.stabilize), ((960, 540), DRAFT_CRF, true, false));
+        assert_eq!(t.outputs.len(), 1);
+        let o = &t.outputs[0];
+        assert_eq!(o.path.as_str(), "out/reel.draft.mp4");
+        assert_eq!((dims(o), o.crf, o.encoder_preset.as_deref()), ((960, 540), DRAFT_CRF, None));
+        assert!(t.direct, "a 16:9 draft is the body's mux, no extra pass");
+        assert!((t.layer_scale - 0.5).abs() < 1e-9);
+
+        // Several outputs: only the first, and a 4K master drafts at 540p too.
+        let many = cfg_with(
+            "",
+            "[[outputs]]\npath = \"out/uhd.mp4\"\nresolution = \"3840x2160\"\n\
+             [[outputs]]\npath = \"out/v.mp4\"\npreset = \"reels\"\n",
+        );
+        let t = render_targets(&many, Quality::Draft);
+        assert_eq!((t.body, t.outputs.len()), ((960, 540), 1));
+        assert_eq!(t.outputs[0].path.as_str(), "out/uhd.draft.mp4");
+        assert!((t.layer_scale - 0.25).abs() < 1e-9);
+
+        // A vertical first output keeps its shape: a 540x960 reframe of
+        // the 960x540 body, capped bitrate dropped.
+        let t = render_targets(&one_output("preset = \"reels\"\nmax_bitrate = \"8M\""), Quality::Draft);
+        assert_eq!((t.body, dims(&t.outputs[0])), ((960, 540), (540, 960)));
+        assert_eq!(t.outputs[0].max_bitrate, None);
+        assert!(!t.direct);
+        let t = render_targets(&one_output("preset = \"square\""), Quality::Draft);
+        assert_eq!(dims(&t.outputs[0]), (540, 540));
+
+        // A project already smaller than a draft keeps its size; the draft
+        // is still its own (faster, lower-quality) file.
+        let t = render_targets(&one_output("resolution = \"640x360\""), Quality::Draft);
+        assert_eq!((t.body, dims(&t.outputs[0]), t.layer_scale), ((640, 360), (640, 360), 1.0));
+        assert_eq!(t.outputs[0].path.as_str(), "out/reel.draft.mp4");
+    }
+
+    #[test]
+    fn draft_paths_never_name_the_final() {
+        let p = Utf8Path::new("/projects/out/coast.mp4");
+        assert_eq!(output_path_for(p, Quality::Final), p);
+        let d = output_path_for(p, Quality::Draft);
+        assert_eq!(d.as_str(), "/projects/out/coast.draft.mp4");
+        assert_eq!(manifest_path_for(&d).as_str(), "/projects/out/coast.draft.manifest.json");
+        assert_eq!(manifest_path_for(p).as_str(), "/projects/out/coast.manifest.json");
+        assert_eq!(output_path_for(Utf8Path::new("reel.mov"), Quality::Draft).as_str(), "reel.draft.mov");
+        // Not a platform version: a reformat of a draft is a version of the
+        // draft, never of the final.
+        assert_eq!(crate::output_format::version_base_stem(d.as_std_path()), None);
+        assert_eq!(draft_size((1920, 1080)), (960, 540));
+        assert_eq!(draft_size((1080, 1920)), (540, 960));
+        assert_eq!(draft_size((2704, 1520)), (960, 540));
+        assert_eq!(draft_size((320, 180)), (320, 180));
+    }
+
+    #[test]
+    fn clip_keys_follow_the_encode_not_the_position() {
+        let s = Segment {
+            source_id: "0301".into(),
+            chapter_path: "/f/GX010301.MP4".into(),
+            chapter_index: 1,
+            in_chapter_start_secs: 4.5,
+            duration_secs: 2.0,
+            virtual_start_secs: 4.5,
+            reason: String::new(),
+            score: Some(0.5),
+        };
+        let fp = |w, h, crf| segment_fingerprint(&s, w, h, 30, crf, None, false, None, None);
+        let final_key = clip_cache_key(fp(1920, 1080, 20), false, None);
+        // A plain final clip keeps its fingerprint.
+        assert_eq!(final_key, fp(1920, 1080, 20));
+        // A draft clip can never be taken for the final's (or the other way
+        // round), even at the same size and CRF: the preset differs.
+        let draft_key = clip_cache_key(fp(960, 540, DRAFT_CRF), true, None);
+        assert_ne!(draft_key, final_key);
+        assert_ne!(clip_cache_key(fp(1920, 1080, 20), true, None), final_key);
+        // An image's animation seed is part of its key.
+        assert_ne!(clip_cache_key(fp(1920, 1080, 20), false, Some(1)), clip_cache_key(fp(1920, 1080, 20), false, Some(2)));
+        // The file name has no position in it: the same moment at another
+        // place in the edit is the same file.
+        assert_eq!(clip_file(&final_key, false, "mp4"), format!("seg_{final_key}.mp4"));
+        assert_eq!(clip_file(&final_key, false, "trf"), format!("seg_{final_key}.trf"));
+        // A clip with a title burnt in never shares the plain clip's file.
+        assert_ne!(clip_file(&final_key, true, "mp4"), clip_file(&final_key, false, "mp4"));
+    }
+
+    #[test]
+    fn draft_titles_shrink_with_the_frame() {
+        let card: crate::project_config::TextCard = toml::from_str(
+            "duration = \"2s\"\n[[layers]]\nkind = \"text\"\ncontent = \"Hi\"\nsize = 110\ny_offset = 40\n\
+             background = { color = \"#000000\" }\n\
+             [[layers]]\nkind = \"image\"\npath = \"logo.png\"\nheight = 120\nx_offset = -30\n",
+        )
+        .unwrap();
+        let layers = card_to_layers(&card);
+        let (t, i) = scale_layers(layers.clone(), 1.0);
+        assert_eq!((t[0].size, t[0].y_offset, t[0].bg_padding_px, i[0].height), (110, 40, None, 120));
+        let (t, i) = scale_layers(layers, 0.5);
+        assert_eq!((t[0].size, t[0].y_offset, t[0].bg_padding_px), (55, 20, Some(10)));
+        assert_eq!((i[0].height, i[0].x_offset), (60, -15));
+    }
+
+    // ---- with ffmpeg: a tiny project, planned and rendered ----
+
+    fn ffmpeg(args: &[&str]) {
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-nostdin"])
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "ffmpeg {args:?}");
+    }
+
+    /// Two 6 s lavfi clips with sound, a 120 BPM click track, an intro
+    /// card, and one 16:9 output at `resolution`.
+    fn fixture(name: &str, resolution: &str) -> (Utf8PathBuf, Utf8PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vibecut_plan_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Utf8PathBuf::from_path_buf(dir).unwrap();
+        let footage = dir.join("footage");
+        std::fs::create_dir_all(&footage).unwrap();
+        for i in 1..=2 {
+            ffmpeg(&[
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=6",
+                "-f", "lavfi", "-i", &format!("sine=frequency={}:duration=6", 220 * i),
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest",
+                footage.join(format!("clip{i}.mp4")).as_str(),
+            ]);
+        }
+        let song = dir.join("clicks.wav");
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "aevalsrc='0.8*sin(2*PI*880*t)*lt(mod(t\\,0.5)\\,0.04)':s=22050:d=24",
+            song.as_str(),
+        ]);
+        let fwd = |p: &Utf8Path| p.as_str().replace('\\', "/");
+        let toml = format!(
+            "schema_version = 1\n\n[project]\nname = \"PlanTest\"\ntarget_duration = \"8s\"\nfps = 30\nseed = 3\n\
+             temp_dir = \"{work}\"\n\n[input]\nfolder = \"{footage}\"\ninclude = [\"*.mp4\"]\n\n\
+             [soundtrack]\nfile = \"{song}\"\nbeat_align = true\nduck_count = 0\n\n\
+             [intro]\nduration = \"1s\"\nmode = \"card\"\n[[intro.layers]]\nkind = \"text\"\ncontent = \"Hi\"\nsize = 40\n\n\
+             [selection]\nmin_clip = \"1s\"\nmax_clip = \"2s\"\n\n\
+             [[outputs]]\npath = \"{out}\"\nresolution = \"{resolution}\"\nencoder = \"libx264\"\ncrf = 30\n",
+            work = fwd(&dir.join("work")),
+            footage = fwd(&footage),
+            song = fwd(&song),
+            out = fwd(&dir.join("out").join("reel.mp4")),
+        );
+        let config = dir.join("p.toml");
+        std::fs::write(&config, toml).unwrap();
+        (dir, config)
+    }
+
+    fn json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
+    fn manifest(path: &Utf8Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// The plan (on its own, and as the render's hook sees it) is the edit
+    /// the render encodes: the same segments and the same frame-exact
+    /// timeline as the manifest written from the encoded files.
+    #[test]
+    fn the_plan_is_what_the_render_encodes() {
+        let (dir, config) = fixture("split", "320x180");
+        let standalone = plan_cmd(&config, true, false).unwrap();
+        assert!(!standalone.timeline.clips.is_empty());
+        assert!(standalone.timeline.intro.is_some(), "intro card planned");
+        assert!(standalone.song.is_some() && !standalone.beats.is_empty(), "beats planned");
+        assert_eq!(standalone.thumbnails.len(), standalone.timeline.clips.len());
+
+        let hooked: std::sync::Arc<std::sync::Mutex<Option<PlanSummary>>> = Default::default();
+        let sink = hooked.clone();
+        let done = run_with(
+            &config,
+            RunOptions {
+                no_visual: true,
+                on_plan: Some(Box::new(move |p| *sink.lock().unwrap() = Some(p.clone()))),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("rendered");
+        assert_eq!(done.quality, Quality::Final);
+        assert_eq!(done.outputs, vec![dir.join("out").join("reel.mp4")]);
+        let hooked = hooked.lock().unwrap().clone().expect("the render showed its plan");
+        assert_eq!(json(&hooked), json(&standalone), "the render planned the same edit");
+
+        let m = manifest(&done.manifest);
+        assert_eq!(m["timeline"], json(&standalone.timeline), "planned timeline = rendered timeline");
+        assert_eq!(m["segments"], json(&standalone.segments));
+        assert!((standalone.duration_secs - m["timeline"]["duration_secs"].as_f64().unwrap()).abs() < 1e-9);
+        // A final's manifest says nothing about quality (as before drafts).
+        assert!(m.get("quality").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn clips_in(work: &Utf8Path) -> std::collections::BTreeMap<String, std::time::SystemTime> {
+        std::fs::read_dir(work)
+            .unwrap()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().into_string().ok()?;
+                if !(name.starts_with("seg_") && name.ends_with(".mp4")) {
+                    return None;
+                }
+                Some((name, e.metadata().ok()?.modified().ok()?))
+            })
+            .collect()
+    }
+
+    /// A draft cuts the same edit, smaller, to its own file and manifest:
+    /// the final's stay untouched, and drafts and finals never take (or
+    /// remove) each other's cached clips.
+    #[test]
+    fn a_draft_renders_the_same_edit_beside_the_final() {
+        let (dir, config) = fixture("draft", "1280x720");
+        let render = |quality| {
+            run_with(&config, RunOptions { no_visual: true, quality: Some(quality), ..Default::default() })
+                .unwrap()
+                .expect("rendered")
+        };
+        let work = dir.join("work");
+        let fin = render(Quality::Final);
+        let final_bytes = std::fs::read(&fin.outputs[0]).unwrap();
+        let final_clips = clips_in(&work);
+        assert!(!final_clips.is_empty());
+
+        let draft = render(Quality::Draft);
+        assert_eq!(draft.quality, Quality::Draft);
+        assert_eq!(draft.outputs, vec![dir.join("out").join("reel.draft.mp4")]);
+        assert_eq!(draft.manifest, dir.join("out").join("reel.draft.manifest.json"));
+        let probed = crate::media_probe::probe_metadata(&draft.outputs[0]).unwrap();
+        let v = probed.media.unwrap().video.unwrap();
+        assert_eq!((v.width, v.height), (960, 540));
+        // The final is exactly as it was.
+        assert_eq!(std::fs::read(&fin.outputs[0]).unwrap(), final_bytes);
+        let (fm, dm) = (manifest(&fin.manifest), manifest(&draft.manifest));
+        assert_eq!(dm["quality"], "draft");
+        assert_eq!(dm["resolution"], "960x540");
+        assert_eq!(dm["output"], draft.outputs[0].as_str());
+        // Same edit: same picks, same timeline, same beat check.
+        assert_eq!(dm["timeline"], fm["timeline"]);
+        assert_eq!(dm["segments"], fm["segments"]);
+        // The draft's clips are its own: every final clip is still there,
+        // untouched, and none was reused for the draft.
+        let after_draft = clips_in(&work);
+        for (name, t) in &final_clips {
+            assert_eq!(after_draft.get(name), Some(t), "{name} was rewritten or removed by the draft");
+        }
+        assert!(after_draft.len() > final_clips.len(), "the draft encoded its own clips");
+
+        // The final again: every clip from its cache, the draft's left alone.
+        render(Quality::Final);
+        let after_final = clips_in(&work);
+        for (name, t) in &after_draft {
+            if name.contains("_titled") {
+                continue; // burnt-in titles are encoded every time
+            }
+            assert_eq!(after_final.get(name), Some(t), "{name} changed on a cached re-render");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3,6 +3,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import type { RenderProgress } from '$lib/api';
 	import { keepFocus } from '$lib/focus';
+	import Storyboard from './Storyboard.svelte';
 
 	let {
 		compact = false,
@@ -66,6 +67,22 @@
 
 	const errorText = $derived(s.makeError ?? s.renderError ?? 'Something went wrong.');
 
+	// What this render is: a quick draft, or the draft on screen being
+	// finished in full quality.
+	const eyebrow = $derived(
+		failed
+			? 'Render stopped'
+			: s.finishing
+				? 'Finishing in full quality'
+				: compact
+					? s.renderQuality === 'draft'
+						? 'Re-cutting a quick preview'
+						: 'Re-cutting'
+					: s.renderQuality === 'draft'
+						? 'Cutting a quick preview'
+						: 'Now cutting your video'
+	);
+
 	// One tap stops a wrong render — also while the clips are still being
 	// read and planned (no server job yet: it goes back to Create).
 	const canStop = $derived((s.rendering || s.preparing) && !s.stopping);
@@ -101,7 +118,7 @@
 	{/if}
 
 	<div class="stage">
-		<p class="eyebrow">{failed ? 'Render stopped' : compact ? 'Re-cutting' : 'Now cutting your video'}</p>
+		<p class="eyebrow">{eyebrow}</p>
 
 		{#key headline}
 			<h2 class="headline" class:bad={failed}>{headline}</h2>
@@ -135,6 +152,8 @@
 			>
 				<div class="fill" style="width: {Math.max(2, pct)}%"></div>
 			</div>
+
+			<Storyboard {compact} />
 
 			<ol class="stages">
 				{#each stages as st (st.key)}

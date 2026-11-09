@@ -61,7 +61,7 @@
 						aria-checked={v.output_path === current}
 						onclick={() => s.openVersion(i)}
 					>
-						<span class="label">{v.label}</span>
+						<span class="label">{v.label}{#if v.quality === 'draft'}<span class="draft">Draft</span>{/if}</span>
 						<span class="meta">{v.vibe ?? ''}{v.duration_secs ? ` · ${clock(v.duration_secs)}` : ''}</span>
 						{#if v.song}<span class="song serif">♪ {v.song}</span>{/if}
 						{#if v.beats_locked}<span class="beat">{v.beats_locked}</span>{/if}
@@ -183,6 +183,20 @@
 
 	.label {
 		font-weight: 700;
+	}
+
+	/* A quick preview, not yet finished in full quality. */
+	.label .draft {
+		margin-left: 6px;
+		padding: 0 6px;
+		border-radius: 999px;
+		border: 1px solid rgba(56, 214, 255, 0.45);
+		color: var(--cyan);
+		font-size: 10px;
+		font-weight: 600;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		vertical-align: 1px;
 	}
 
 	.meta {
