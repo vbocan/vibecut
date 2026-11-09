@@ -450,6 +450,10 @@ clip held to exactly the frames the manifest `timeline` gives it; the
 timeline records the card spans with `transition_secs = 0`, and the
 beat-sync report scores all of those cuts.
 
+The "punchier" and "calmer" feedback leave `duration` alone in hard-cut
+mode (they only shorten or lengthen crossfades), so a `duration = "0s"`
+project stays on straight cuts; the rest of each action still applies.
+
 `speed_ramp_*` triggers a Reels/TikTok-style "whip-up" on a deterministic
 random subset of transitions, sized by `speed_ramp_probability`. Which
 transitions get ramped is keyed by `[project].seed`, so renders stay

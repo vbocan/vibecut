@@ -1477,12 +1477,17 @@ pub fn mux_with_ducking(
     soundtrack: &Utf8Path,
     windows: &[(f32, f32, f32)], // (start, end, ramp)
     ducking_db: f32,
-    // Total output duration (for fade-out positioning). 0 = no fade-out.
-    body_duration_secs: f32,
+    // Total output duration (for fade-out positioning and the `-t` cap).
+    // 0 = no fade-out. f64: past 256 s an f32 is only good to ~30 µs, and a
+    // cap that falls half an audio sample short loses the last video frame.
+    body_duration_secs: f64,
     soundtrack_fade_out_secs: f32,
     loop_plan: SoundtrackLoopPlan,
     output: &Utf8Path,
 ) -> Result<()> {
+    // Fade and loop-copy arithmetic is in f32 like the rest of the graph;
+    // only the `-t` cap needs the full precision.
+    let body_secs_f32 = body_duration_secs as f32;
     let soundtrack_first_play_end_secs = loop_plan.first_play_end_secs;
     let soundtrack_loop_start_secs = loop_plan.loop_start_secs;
     let soundtrack_loop_secs = loop_plan.loop_secs;
@@ -1577,7 +1582,7 @@ pub fn mux_with_ducking(
         // each cycle adding (loop_secs − xfade_secs); capped so we don't
         // build an unbounded filter graph for crazy targets. Shared with
         // `SoundtrackLoopPlan::spans`, which the beat-sync check relies on.
-        let total_copies = loop_plan.smart_copies(body_duration_secs);
+        let total_copies = loop_plan.smart_copies(body_secs_f32);
         let n_cycles = total_copies - 1;
         // Each copy reads its own input of the soundtrack file. Splitting
         // one input with `asplit` does NOT work here: `acrossfade` reads its
@@ -1650,8 +1655,8 @@ pub fn mux_with_ducking(
         src_vol = src_vol_expr,
         bg_vol = bg_vol_expr,
     ));
-    if soundtrack_fade_out_secs > 0.0 && body_duration_secs > soundtrack_fade_out_secs {
-        let fade_start = body_duration_secs - soundtrack_fade_out_secs;
+    if soundtrack_fade_out_secs > 0.0 && body_secs_f32 > soundtrack_fade_out_secs {
+        let fade_start = body_secs_f32 - soundtrack_fade_out_secs;
         filtergraph.push_str(&format!(
             "[mixed];[mixed]afade=t=out:st={st:.3}:d={d:.3}",
             st = fade_start,
@@ -1671,6 +1676,8 @@ pub fn mux_with_ducking(
     // length the video actually has. Microseconds, not milliseconds: 865
     // frames at 30 fps written as "28.833" cut the audio a third of a
     // millisecond early, and `-shortest` then dropped the last video frame.
+    // The same happened past 256 s while the length was carried as an f32
+    // (7700 frames = 256.666667 s printed as "256.666656"), hence the f64.
     let body_dur = if body_duration_secs > 0.0 {
         format!("{body_duration_secs:.6}")
     } else {
@@ -2835,7 +2842,7 @@ mod tests {
         // frame in the mux; the cap must not fall short of the body.
         let runner = MockRunner::new();
         let out = camino::Utf8PathBuf::from("/tmp/sv_mux_cap/out.mp4");
-        let body_secs = 865.0_f32 / 30.0;
+        let body_secs = 865.0_f64 / 30.0;
         mux_with_ducking(
             &runner,
             camino::Utf8Path::new("body.mp4"),
@@ -2856,5 +2863,39 @@ mod tests {
             .expect("-t cap");
         // Within a microsecond of the true end (well under one audio sample).
         assert!((t - 865.0 / 30.0).abs() < 2e-6, "-t {t}");
+    }
+
+    #[test]
+    fn mux_cap_keeps_the_last_frame_of_long_bodies() {
+        // Past 256 s an f32 length is only good to ~30 µs: 7700 frames
+        // (256.666667 s) came out as "-t 256.666656", 11 µs short — over
+        // half an audio sample, so the mux lost the last video frame. The
+        // cap must not fall short by half a sample at any length.
+        let half_sample = 0.5 / AUDIO_SAMPLE_RATE as f64;
+        for (frames, fps) in [(7700u32, 30u32), (8008, 30), (15_001, 25), (35_999, 60)] {
+            let runner = MockRunner::new();
+            let out = camino::Utf8PathBuf::from("/tmp/sv_mux_cap_long/out.mp4");
+            let body_secs = frames as f64 / fps as f64;
+            mux_with_ducking(
+                &runner,
+                camino::Utf8Path::new("body.mp4"),
+                camino::Utf8Path::new("song.mp3"),
+                &[(5.0, 9.0, 0.3)],
+                -18.0,
+                body_secs,
+                1.5,
+                SoundtrackLoopPlan::default(),
+                &out,
+            )
+            .unwrap();
+            let calls = runner.calls.borrow();
+            let t: f64 = calls[0]
+                .windows(2)
+                .find(|w| w[0] == "-t")
+                .map(|w| w[1].parse().unwrap())
+                .expect("-t cap");
+            assert!(t > body_secs - half_sample, "{frames} frames at {fps} fps: -t {t} < {body_secs}");
+            assert!(t - body_secs < 1e-6, "{frames} frames at {fps} fps: -t {t}");
+        }
     }
 }

@@ -305,10 +305,12 @@ fn apply_calmer(cfg: &mut Config) -> Vec<ChangeNote> {
 
     // Longer crossfades read calmer, but each one eats into both clips it
     // joins. Repeated "calmer" taps must not grow it past what the shortest
-    // clip can afford, or renders start failing.
+    // clip can afford, or renders start failing. A hard-cut project has no
+    // crossfade to lengthen: giving a zero `duration` 200 ms would silently
+    // switch it to crossfades.
     let before = cfg.transition.duration;
     let after = (before + Duration::from_millis(200)).min(calmer_crossfade_cap(cfg));
-    if after > before {
+    if !cfg.transition.hard_cut() && after > before {
         cfg.transition.duration = after;
         notes.push(note(
             "transition.duration",
@@ -377,10 +379,13 @@ fn apply_punchier(cfg: &mut Config) -> Vec<ChangeNote> {
         ));
     }
 
+    // Shorter crossfades, down to 200 ms. Hard-cut projects are already as
+    // punchy as cuts get: raising a zero `duration` to the floor would turn
+    // their straight cuts into crossfades.
     let before = cfg.transition.duration;
     let target = before.saturating_sub(Duration::from_millis(100));
     let after = target.max(Duration::from_millis(200));
-    if before != after {
+    if !cfg.transition.hard_cut() && before != after {
         cfg.transition.duration = after;
         notes.push(note(
             "transition.duration",
@@ -998,6 +1003,46 @@ stabilize = false
         apply(&mut cfg, &FeedbackAction::Punchier).unwrap();
         assert!((cfg.transition.speed_ramp_probability - 0.5).abs() < 1e-4);
         assert!((cfg.transition.speed_ramp_factor - 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn punchier_and_calmer_keep_a_hard_cut_project_on_cuts() {
+        // `duration = "0s"` with a crossfade name is hard-cut mode. Punchier
+        // raised it to its 200 ms floor and calmer added 200 ms, so either
+        // tap silently switched the next render to crossfades.
+        for action in [FeedbackAction::Punchier, FeedbackAction::Calmer] {
+            let mut cfg = base_config();
+            cfg.transition.default = "fade".into();
+            cfg.transition.duration = Duration::ZERO;
+            assert!(cfg.transition.hard_cut());
+            let notes = apply(&mut cfg, &action).unwrap();
+            assert_eq!(cfg.transition.duration, Duration::ZERO, "{action:?}");
+            assert!(cfg.transition.hard_cut(), "{action:?}");
+            assert!(notes.iter().all(|n| n.field != "transition.duration"), "{action:?}");
+            // The rest of the action still applies.
+            assert!(notes.iter().any(|n| n.field == "transition.speed_ramp_probability"), "{action:?}");
+        }
+        // `default = "cut"`: the duration has no effect, so it isn't touched
+        // (and no change is reported) either.
+        for action in [FeedbackAction::Punchier, FeedbackAction::Calmer] {
+            let mut cfg = base_config();
+            cfg.transition.default = "cut".into();
+            let before = cfg.transition.duration;
+            let notes = apply(&mut cfg, &action).unwrap();
+            assert_eq!(cfg.transition.duration, before, "{action:?}");
+            assert!(notes.iter().all(|n| n.field != "transition.duration"), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn punchier_shortens_the_crossfade_to_its_floor() {
+        let mut cfg = base_config();
+        cfg.transition.duration = Duration::from_millis(400);
+        apply(&mut cfg, &FeedbackAction::Punchier).unwrap();
+        assert_eq!(cfg.transition.duration, Duration::from_millis(300));
+        apply(&mut cfg, &FeedbackAction::Punchier).unwrap();
+        apply(&mut cfg, &FeedbackAction::Punchier).unwrap();
+        assert_eq!(cfg.transition.duration, Duration::from_millis(200));
     }
 
     #[test]

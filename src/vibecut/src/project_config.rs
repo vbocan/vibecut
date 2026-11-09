@@ -669,6 +669,15 @@ impl Default for Transition {
     }
 }
 
+impl Transition {
+    /// Hard-cut mode: straight cuts instead of crossfades, because `default`
+    /// is `"cut"` / `"none"` or `duration` is zero. The concat stage, the
+    /// beat lock and the feedback actions all go by this.
+    pub fn hard_cut(&self) -> bool {
+        self.default == "cut" || self.default == "none" || self.duration.is_zero()
+    }
+}
+
 fn default_transition() -> String {
     "fade".into()
 }
@@ -1241,6 +1250,20 @@ stabilize = false
         cfg2.validate().expect("re-validate");
         assert_eq!(cfg.project.name, cfg2.project.name);
         assert_eq!(cfg.project.target_duration, cfg2.project.target_duration);
+    }
+
+    #[test]
+    fn hard_cut_mode_is_cut_none_or_a_zero_duration() {
+        let t = |default: &str, ms: u64| Transition {
+            default: default.into(),
+            duration: Duration::from_millis(ms),
+            ..Transition::default()
+        };
+        assert!(!t("fade", 400).hard_cut());
+        assert!(!t("dissolve", 1).hard_cut());
+        assert!(t("cut", 400).hard_cut());
+        assert!(t("none", 400).hard_cut());
+        assert!(t("fade", 0).hard_cut());
     }
 
     #[test]
