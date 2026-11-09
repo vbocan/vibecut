@@ -19,6 +19,9 @@ pub struct ProposeBody {
     pub target_duration: Option<String>,
     #[serde(default = "default_seed")]
     pub seed: u64,
+    /// Song file; omit to let Vibecut pick one for the vibe, `"none"` for
+    /// no music.
+    pub soundtrack: Option<String>,
 }
 
 fn default_vibe() -> String {
@@ -33,20 +36,27 @@ pub async fn propose_vibe(
     Json(body): Json<ProposeBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let started = Instant::now();
-    let args_json = serde_json::json!({ "folder": body.folder, "vibe": body.vibe });
+    let args_json =
+        serde_json::json!({ "folder": body.folder, "vibe": body.vibe, "soundtrack": body.soundtrack });
     let result = vibecut_ops::propose::propose_vibe(vibecut_ops::propose::ProposeArgs {
         folder: &body.folder,
         vibe: &body.vibe,
         title: body.title.as_deref(),
         target_duration: body.target_duration.as_deref(),
         seed: body.seed,
+        soundtrack: body.soundtrack.as_deref(),
     })
     .await;
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (excerpt, ok) = match &result {
         Ok(r) => (
-            serde_json::json!({ "vibe": r.vibe, "config_path": r.config_path, "output_path": r.output_path }),
+            serde_json::json!({
+                "vibe": r.vibe,
+                "config_path": r.config_path,
+                "output_path": r.output_path,
+                "soundtrack": r.soundtrack,
+            }),
             true,
         ),
         Err(e) => (serde_json::json!({ "error": e.to_string() }), false),
@@ -61,5 +71,8 @@ pub async fn propose_vibe(
         "config_path": result.config_path,
         "config_toml": result.config_toml,
         "output_path": result.output_path,
+        "soundtrack": result.soundtrack,
+        "auto_pick": result.auto_pick,
+        "music_note": result.music_note,
     })))
 }

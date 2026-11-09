@@ -4,6 +4,8 @@
 	import { musicFileUrl, type Track } from '$lib/api';
 	import { clock } from '$lib/vibes';
 	import EnergyBars from './EnergyBars.svelte';
+	import MusicImport from './MusicImport.svelte';
+	import { collectionLabel, licenceBadge } from '$lib/music';
 
 	let { compact = false }: { compact?: boolean } = $props();
 
@@ -21,7 +23,9 @@
 	let audio: HTMLAudioElement | undefined;
 
 	const shown = $derived(mood === 'all' ? s.tracks : s.tracks.filter((t) => t.mood === mood));
-	const auto = $derived(s.autoTrackFor(s.effectiveVibe));
+	// The server picks the song ("Picked for you"); this only shows it.
+	const auto = $derived(s.autoPick);
+	const autoTrack = $derived(auto ? (s.tracks.find((t) => t.path === auto.path) ?? null) : null);
 
 	function setBeat(t: Track | null) {
 		const beat = t?.beat_interval_secs ?? s.effectiveTrack?.beat_interval_secs;
@@ -65,7 +69,7 @@
 				s.requestChange(`Song: ${title}`, () => choose(path));
 				return;
 			}
-			const target = path ?? s.autoTrackFor(s.effectiveVibe)?.path ?? null;
+			const target = path ?? s.autoPick?.path ?? null;
 			if (target && target !== s.effectiveTrack?.path) {
 				void s.changeSong(target).then(() => {
 					if (path === null && !s.configError) s.selectedTrackPath = null;
@@ -110,6 +114,7 @@
 			>
 			<button class="btn" type="button" onclick={() => s.loadMusic()}>Look again</button>
 		</div>
+		<MusicImport />
 	{:else}
 		<button
 			type="button"
@@ -122,8 +127,11 @@
 			<span class="auto-text">
 				<strong>Let Vibecut pick</strong>
 				<span
-					>{#if auto && s.effectiveVibe}Best match for this vibe: <em>{auto.title}</em> · {Math.round(auto.bpm)} BPM{:else}Matched to the vibe you choose{/if}</span
+					>{#if auto && s.effectiveVibe}Picked for you: <em>{auto.title}</em>{#if autoTrack}{` · ${Math.round(
+								autoTrack.bpm
+							)} BPM`}{/if}{:else}Matched to the vibe you choose{/if}</span
 				>
+				{#if auto && s.effectiveVibe}<span class="why">{auto.reason}</span>{/if}
 			</span>
 		</button>
 
@@ -144,6 +152,7 @@
 			{#each shown as t, i (t.path)}
 				{@const isOn = s.selectedTrackPath === t.path}
 				{@const isPlaying = playing === t.path}
+				{@const lic = licenceBadge(t)}
 				<li class="row" class:on={isOn} class:playing={isPlaying} style="--i: {i}">
 					<button
 						type="button"
@@ -174,6 +183,9 @@
 							<span class="mood {t.mood}">{t.mood}</span>
 							<span class="mono">{Math.round(t.bpm)} BPM</span>
 							<span class="mono">{clock(t.duration_secs)}</span>
+							<span class="lic {lic.tone}" title={t.licence.note}>{lic.text}</span>
+							{#if t.collection === 'starter'}<span class="starter">{collectionLabel(t.collection)}</span>{/if}
+							{#if auto?.path === t.path}<span class="picked">Picked for you</span>{/if}
 							{#if t.grid_tight}<span class="tight" title="Clear, steady beat — cuts will lock precisely"
 									>beat-lock ready</span
 								>{/if}
@@ -186,6 +198,7 @@
 				</li>
 			{/each}
 		</ul>
+		<MusicImport />
 	{/if}
 </section>
 
@@ -416,6 +429,32 @@
 
 	.tight {
 		color: var(--good);
+	}
+
+	.auto-text .why {
+		font-size: var(--fs-xs);
+		color: var(--text-faint);
+		margin-top: 2px;
+	}
+
+	.lic.ok {
+		color: var(--good);
+	}
+	.lic.credit {
+		color: var(--cyan);
+	}
+	.lic.caution {
+		color: #ffc94a;
+	}
+
+	.starter {
+		color: var(--lime);
+		font-weight: 700;
+	}
+
+	.picked {
+		color: var(--magenta);
+		font-weight: 700;
 	}
 
 	.wave {

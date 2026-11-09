@@ -2023,6 +2023,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         fps: cfg.project.fps,
         seed: cfg.project.seed,
         card_windows,
+        soundtrack: crate::track_meta::manifest_soundtrack(cfg),
         sources,
         segments,
         duck_windows,

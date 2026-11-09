@@ -32,7 +32,9 @@
 	const caption = $derived(
 		[
 			title,
-			s.effectiveTrack ? `Music: ${s.effectiveTrack.title}` : null,
+			// CC BY and friends: the credit the licence asks for, from the
+			// shared version's own render record when it has one.
+			...s.captionMusic,
 			// Only claim the beat lock when the report backs it up.
 			beat && beat.n_cuts > 0 && beat.within_tolerance === beat.n_cuts
 				? 'Edited with Vibecut — every cut on the beat.'

@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let app = vibecut_web::router(state);
+    vibecut_ops::music::warm_up();
 
     tracing::info!("vibecut-web starting on {bind_addr}");
     tracing::info!("  GET/POST http://{bind_addr}/api/*");

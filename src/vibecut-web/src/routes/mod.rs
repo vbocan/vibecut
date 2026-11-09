@@ -52,6 +52,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/reformat", post(reformat::reformat))
         .route("/music", get(music::list_music))
         .route("/music/file", get(music::serve_music_file))
+        .route("/music/pick", get(music::pick_music))
         .route("/sessions", get(sessions::list_sessions))
         .route("/ws/render/{job_id}", get(crate::ws::render_progress_ws))
 }

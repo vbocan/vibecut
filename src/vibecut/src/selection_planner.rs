@@ -953,6 +953,10 @@ pub struct Manifest {
     /// keeps these spans inside its safe area (`output_format`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub card_windows: Vec<[f64; 2]>,
+    /// Who made the music, its licence, credit line and SHA-256 — one
+    /// entry per soundtrack file (see `track_meta`). Absent without music.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub soundtrack: Vec<crate::track_meta::SoundtrackCredit>,
     pub sources: Vec<Source>,
     pub segments: Vec<Segment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -8,6 +8,7 @@ import type { FeedbackAction } from './api';
 import type { Manifest } from './types/generated/Manifest';
 import type { Segment } from './types/generated/Segment';
 import type { Config } from './types/generated/Config';
+import { captionMusicLines, labelsFollowProject, projectSongPath, trackForPath } from './music';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
 
@@ -67,19 +68,13 @@ interface Persisted {
 	proposeResult: api.ProposeResult | null;
 	renderResult: api.RenderResult | null;
 	renderHistory: RenderHistoryEntry[];
+	/** The settings the song pick depends on (absent in older saves). */
+	targetDuration?: string;
+	seed?: number;
+	proposedPickKey?: string;
 }
 
 const STORAGE_KEY = 'vibecut.session.v1';
-
-/** Vibe → the moods that suit it, best first (for auto-picking a song). */
-const VIBE_MOODS: Record<string, api.Track['mood'][]> = {
-	kid_reel: ['upbeat', 'driving', 'warm'],
-	action_highlight: ['driving', 'upbeat'],
-	drone_cinematic: ['chill', 'warm'],
-	family_chronicle: ['warm', 'upbeat', 'chill'],
-	documentary: ['chill', 'warm'],
-	memory_keeper: ['warm', 'chill']
-};
 
 /** Where the one-tap flow is. */
 export type MakeStep = 'idle' | 'scanning' | 'planning' | 'scoring' | 'rendering' | 'done' | 'failed';
@@ -171,6 +166,11 @@ class AppState {
 	tracks = $state<api.Track[]>([]);
 	loadingMusic = $state(false);
 	musicError = $state<string | null>(null);
+	/** Library metadata problems worth showing in the import view. */
+	musicWarnings = $state<string[]>([]);
+	/** Where downloaded songs go, as the server sees it. */
+	musicImportDir = $state<string | null>(null);
+	musicDirs = $state<api.MusicLibrary['dirs']>([]);
 	/** Chosen song; null = let Vibecut pick one that suits the vibe. */
 	selectedTrackPath = $state<string | null>(null);
 
@@ -178,33 +178,115 @@ class AppState {
 		this.loadingMusic = true;
 		this.musicError = null;
 		try {
-			this.tracks = (await api.listMusic()).tracks;
+			const lib = await api.listMusic();
+			this.tracks = lib.tracks;
+			this.musicWarnings = lib.warnings ?? [];
+			this.musicImportDir = lib.import_dir ?? null;
+			this.musicDirs = lib.dirs ?? [];
 		} catch (e) {
 			this.musicError = e instanceof api.ApiError ? e.describe() : String(e);
 		} finally {
 			this.loadingMusic = false;
 		}
+		void this.refreshAutoPick(true);
 	}
 
-	/** Best library song for a vibe: matching mood first, then the
-	 *  clearest beat (strongest pulse). Deterministic. */
-	autoTrackFor(vibeKey: string | null): api.Track | null {
-		if (this.tracks.length === 0) return null;
-		const moods = (vibeKey && VIBE_MOODS[vibeKey]) || ['upbeat', 'warm', 'driving', 'chill'];
-		const rank = (t: api.Track) => {
-			const m = moods.indexOf(t.mood);
-			return (m === -1 ? moods.length : m) * 100 - Math.min(t.pulse_strength, 50);
-		};
-		return [...this.tracks].sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path))[0];
+	// ---------- Server-side song pick ----------
+	//
+	// The server picks the song (vibe tempo and energy, length, seed) when
+	// it proposes without one; the UI only ever shows that pick, so the
+	// label and the render can't disagree. Before a proposal exists the
+	// same pick comes from GET /music/pick with the settings propose will
+	// send; afterwards from the proposal itself.
+
+	/** The server's pick for the current vibe / length / seed (pre-proposal). */
+	previewPick = $state<api.MusicPick | null>(null);
+	private previewPickKey = '';
+	/** `pickKey()` when the current proposal was made: its pick only
+	 *  stands while the settings it was made with do. */
+	private proposedPickKey = $state('');
+
+	/** The settings the server's song pick depends on. */
+	private pickKey(): string {
+		return `${this.effectiveVibe ?? ''}|${this.resolvedDuration() ?? ''}|${this.seed}`;
 	}
 
-	/** The song a render will use: the chosen one, else the auto pick. */
-	effectiveTrack = $derived.by((): api.Track | null => {
-		if (this.selectedTrackPath) {
-			return this.tracks.find((t) => t.path === this.selectedTrackPath) ?? null;
+	/** Ask the server what it would pick now. Cheap: the library is cached. */
+	async refreshAutoPick(force = false) {
+		const vibe = this.effectiveVibe;
+		if (!vibe || this.tracks.length === 0) {
+			this.previewPick = null;
+			this.previewPickKey = '';
+			return;
 		}
-		return this.autoTrackFor(this.effectiveVibe);
+		const target_duration = this.resolvedDuration();
+		const key = this.pickKey();
+		if (!force && key === this.previewPickKey) return;
+		this.previewPickKey = key;
+		try {
+			const r = await api.pickMusic({ vibe, target_duration, seed: this.seed });
+			if (this.previewPickKey === key) this.previewPick = r.pick;
+		} catch {
+			if (this.previewPickKey === key) this.previewPick = null;
+		}
+	}
+
+	/** Labels describe the project (its video, its render) rather than what
+	 *  the next "Make my video" would use (see `labelsFollowProject`). */
+	private followProject = $derived.by(() =>
+		labelsFollowProject({
+			hasProposal: this.proposeResult !== null,
+			versions: this.renderHistory.length,
+			makeStep: this.makeStep,
+			makeError: this.makeError
+		})
+	);
+
+	/** `config_path` of the proposal `configStructured` was read from. */
+	private structuredFor = $state<string | null>(null);
+
+	/** The song file the project's config uses (`undefined`: unknown). */
+	private projectSong = $derived.by((): string | null | undefined => {
+		const p = this.proposeResult;
+		if (!p) return undefined;
+		const loaded = this.configStructured !== null && this.structuredFor === p.config_path;
+		return projectSongPath({
+			configLoaded: loaded,
+			configFiles: loaded ? this.configStructured?.soundtrack?.files : undefined,
+			proposalSong: p.soundtrack
+		});
 	});
+
+	/** What "Let Vibecut pick" means right now. On the project: the pick it
+	 *  was made with (what choosing it switches back to). Otherwise what the
+	 *  next proposal would pick: the proposal's own pick while the vibe /
+	 *  length / seed are the ones it was made with, else the server's preview. */
+	autoPick = $derived.by((): api.MusicPick | null => {
+		const p = this.proposeResult;
+		if (p && this.followProject && p.auto_pick !== undefined) return p.auto_pick;
+		if (p && p.auto_pick !== undefined && this.proposedPickKey === this.pickKey()) return p.auto_pick;
+		return this.previewPick;
+	});
+
+	/** The song in use. On the project: the one its config names — never a
+	 *  fresh pick, which can differ after a reload or a library change.
+	 *  Before it: the chosen one, else the server's pick. A song missing
+	 *  from the library list keeps what is known about it (see `trackForPath`). */
+	effectiveTrack = $derived.by((): api.Track | null => {
+		const fromProject = this.followProject ? this.projectSong : undefined;
+		const path = fromProject !== undefined ? fromProject : (this.selectedTrackPath ?? this.autoPick?.path ?? null);
+		if (!path) return null;
+		const p = this.proposeResult;
+		return trackForPath(path, this.tracks, {
+			credit: (this.manifest?.soundtrack ?? []).find((c) => c.file === path) ?? null,
+			title: p?.soundtrack?.path === path ? p.soundtrack.title : this.autoPick?.path === path ? this.autoPick.title : null
+		});
+	});
+
+	/** Music lines for the share caption: what the shown version's render
+	 *  recorded (every file, with the credit its licence needs), else the
+	 *  project's song. */
+	captionMusic = $derived.by(() => captionMusicLines(this.manifest?.soundtrack, this.effectiveTrack));
 
 	// ---------- One-tap "make my video" ----------
 	makeStep = $state<MakeStep>('idle');
@@ -241,20 +323,11 @@ class AppState {
 				if (this.discoverError) throw new Error(this.discoverError);
 			}
 			this.makeStep = 'planning';
+			// The proposal carries the song: the chosen one, else the
+			// server's pick for the vibe.
 			await this.propose();
 			if (!live()) return;
 			if (this.proposeError) throw new Error(this.proposeError);
-			const track = this.effectiveTrack;
-			if (track && this.proposeResult) {
-				this.makeStep = 'scoring';
-				await api.applyFeedback(this.proposeResult.config_path, {
-					kind: 'different_music',
-					path: track.path
-				});
-				if (!live()) return;
-				await this.refreshConfig();
-				if (!live()) return;
-			}
 			this.startRenderAsync();
 		} catch (e) {
 			if (!live()) return;
@@ -431,6 +504,8 @@ class AppState {
 			this.configDirty = false;
 			this.selectedVibe = u.selectedVibe;
 			this.selectedTrackPath = u.selectedTrackPath;
+			// The restored proposal was made with the restored settings.
+			this.proposedPickKey = this.pickKey();
 			this.lastChanges = [];
 			await this.loadStructuredConfig();
 			this.renderMode = 'done';
@@ -542,15 +617,18 @@ class AppState {
 		if (!vibe) return;
 		this.proposing = true;
 		this.proposeError = null;
+		const pickKey = this.pickKey();
 		try {
 			const r = await api.proposeVibe({
 				folder: this.folder,
 				vibe,
 				title: this.title || undefined,
 				target_duration: this.resolvedDuration(),
-				seed: this.seed
+				seed: this.seed,
+				soundtrack: this.selectedTrackPath ?? undefined
 			});
 			this.proposeResult = r;
+			this.proposedPickKey = pickKey;
 			this.configToml = r.config_toml;
 			this.configDirty = false;
 			// A fresh proposal invalidates whatever the previous one rendered.
@@ -627,7 +705,9 @@ class AppState {
 		if (!this.proposeResult) return;
 		this.configStructuredError = null;
 		try {
-			this.configStructured = await api.readConfigStructured(this.proposeResult.config_path);
+			const path = this.proposeResult.config_path;
+			this.configStructured = await api.readConfigStructured(path);
+			this.structuredFor = path;
 			this.configStructuredSnapshot = JSON.stringify(this.configStructured);
 		} catch (e) {
 			this.configStructuredError = e instanceof api.ApiError ? e.describe() : String(e);
@@ -639,8 +719,10 @@ class AppState {
 		this.savingConfig = true;
 		this.configStructuredError = null;
 		try {
-			const r = await api.writeConfigStructured(this.proposeResult.config_path, this.configStructured);
+			const path = this.proposeResult.config_path;
+			const r = await api.writeConfigStructured(path, this.configStructured);
 			this.configStructured = r;
+			this.structuredFor = path;
 			this.configStructuredSnapshot = JSON.stringify(r);
 			this.configChangedSinceRender = true;
 			// Keep the Raw tab's textarea in sync too, same reasoning in
@@ -1291,7 +1373,10 @@ class AppState {
 			selectedTrackPath: this.selectedTrackPath,
 			proposeResult: this.proposeResult,
 			renderResult: this.renderMode === 'done' ? this.renderResult : null,
-			renderHistory: this.renderHistory
+			renderHistory: this.renderHistory,
+			targetDuration: this.targetDuration,
+			seed: this.seed,
+			proposedPickKey: this.proposedPickKey
 		};
 		try {
 			localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
@@ -1315,11 +1400,14 @@ class AppState {
 		this.selectedVibe = p.selectedVibe;
 		this.selectedTrackPath = p.selectedTrackPath;
 		this.renderHistory = p.renderHistory ?? [];
+		if (typeof p.targetDuration === 'string') this.targetDuration = p.targetDuration;
+		if (typeof p.seed === 'number') this.seed = p.seed;
 		if (p.folder) void this.discover();
 		if (p.proposeResult) {
 			try {
 				const cfg = await api.readConfig(p.proposeResult.config_path);
 				this.proposeResult = { ...p.proposeResult, config_toml: cfg.config_toml };
+				this.proposedPickKey = p.proposedPickKey ?? '';
 				this.configToml = cfg.config_toml;
 				await this.loadStructuredConfig();
 			} catch {
@@ -1359,6 +1447,7 @@ class AppState {
 		this.proposeResult = null;
 		this.configToml = '';
 		this.configStructured = null;
+		this.structuredFor = null;
 		this.makeStep = 'idle';
 		this.makeError = null;
 		this.renderHistory = [];

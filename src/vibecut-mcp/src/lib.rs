@@ -80,6 +80,11 @@ pub struct ProposeArgs {
     /// produces the same cut.
     #[serde(default = "default_seed")]
     pub seed: u64,
+
+    /// Soundtrack file (container path, e.g. under `/projects/music`).
+    /// Omit to let Vibecut pick a library song that suits the vibe and
+    /// length (the result says which and why); `"none"` for no music.
+    pub soundtrack: Option<String>,
 }
 
 fn default_vibe() -> String {
@@ -286,7 +291,7 @@ impl VibecutMcpServer {
     /// folder. The TOML is written to `/projects` so the user can edit
     /// it; pass the returned `config_path` to `render` to produce the
     /// edit.
-    #[tool(description = "Generate a starting TOML config for a vibe + footage folder. Writes the TOML to /projects and returns its path, contents, and rationale.")]
+    #[tool(description = "Generate a starting TOML config for a vibe + footage folder. Writes the TOML to /projects and returns its path, contents, and rationale. Music is on by default: without `soundtrack` it picks a library song that suits the vibe and says why (`soundtrack.reason`).")]
     async fn propose_vibe(
         &self,
         Parameters(args): Parameters<ProposeArgs>,
@@ -305,6 +310,7 @@ impl VibecutMcpServer {
             title: args.title.as_deref(),
             target_duration: args.target_duration.as_deref(),
             seed: args.seed,
+            soundtrack: args.soundtrack.as_deref(),
         })
         .await;
         match result {
@@ -316,6 +322,9 @@ impl VibecutMcpServer {
                     "config_path": r.config_path,
                     "config_toml": r.config_toml,
                     "output_path": r.output_path,
+                    "soundtrack": r.soundtrack,
+                    "auto_pick": r.auto_pick,
+                    "music_note": r.music_note,
                     "next_step": "Call `render` with this config_path to produce the edit. To tweak before rendering, modify the TOML and save it back to the same path."
                 });
                 Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
