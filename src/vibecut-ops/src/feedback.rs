@@ -543,7 +543,7 @@ fn apply_drop_segment(
         end: Duration::from_secs_f32(hi),
     });
 
-    Ok(vec![
+    let mut notes = vec![
         ChangeNote {
             field: "selection.exclude".into(),
             before: format!("(no exclude entries for {basename})"),
@@ -552,7 +552,58 @@ fn apply_drop_segment(
                 basename, lo, hi, seg_index, at_seconds
             ),
         },
-    ])
+    ];
+    // An `[[input.ranges]]` moment plays whatever the picker excludes:
+    // dropping one removes its range. (Not a pick that merely overlaps one.)
+    let forced = cfg.input.ranges_only
+        || manifest
+            .pointer(&format!("/segments/{seg_index}/reason"))
+            .and_then(|r| r.as_str())
+            .is_some_and(|r| r.starts_with(FORCED_RANGE_REASON));
+    if forced {
+        let window = (in_chapter_start as f64, (in_chapter_start + segment_dur) as f64);
+        notes.extend(remove_dropped_range(cfg, chapter_path, window));
+    }
+    Ok(notes)
+}
+
+/// How the pipeline's manifest marks a segment injected from
+/// `[[input.ranges]]` (`run_pipeline`: "forced via [[input.ranges]] 2.00s..6.00s").
+const FORCED_RANGE_REASON: &str = "forced via [[input.ranges]]";
+
+/// Remove the `[[input.ranges]]` entry a dropped clip played — on its
+/// file, the one its source window overlaps most — and say so. In an
+/// `input.ranges_only` config, whose list is the playing order, a caption
+/// the range opened (a recap's month) passes to the next range, unless
+/// that one opens its own.
+fn remove_dropped_range(cfg: &mut Config, chapter_path: &str, (lo, hi): (f64, f64)) -> Option<ChangeNote> {
+    let path = camino::Utf8Path::new(chapter_path);
+    let (i, _) = cfg
+        .input
+        .ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.matches_file(path))
+        .map(|(i, r)| (i, hi.min(r.end.as_secs_f64()) - lo.max(r.start.as_secs_f64())))
+        .filter(|(_, overlap)| *overlap > 0.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let before = cfg.input.ranges.len();
+    let r = cfg.input.ranges.remove(i);
+    if cfg.input.ranges_only {
+        if let (Some(caption), Some(next)) = (&r.caption, cfg.input.ranges.get_mut(i)) {
+            next.caption.get_or_insert_with(|| caption.clone());
+        }
+    }
+    Some(ChangeNote {
+        field: "input.ranges".into(),
+        before: format!("{before} range(s)"),
+        after: format!(
+            "removed: file={:?} start={} end={}",
+            r.file,
+            fmt_duration(r.start),
+            fmt_duration(r.end)
+        ),
+    })
 }
 
 /// The source window that played at an output time.
@@ -1464,6 +1515,122 @@ stabilize = false
         assert_eq!(added.file, "GX010322.MP4");
         assert!((added.start.as_secs_f32() - 19.5).abs() < 1e-3);
         assert!((added.end.as_secs_f32() - 22.5).abs() < 1e-3);
+    }
+
+    /// A recap-shaped manifest: three clips that play `[[input.ranges]]`,
+    /// laid out by the engine's own timeline code.
+    fn ranges_manifest(reasons: [&str; 3]) -> serde_json::Value {
+        use vibecut::output_timeline::{ChainItem, ChainLayout, ClipSource, OutputTimeline};
+        let parts = [("/f/alps/GX010201.MP4", 4.0), ("/f/alps/GX010201.MP4", 20.0), ("/f/coast/GX010301.MP4", 8.0)];
+        let layout = ChainLayout::new(&[3.0, 4.0, 4.0, 4.0], &[0.3, 0.3, 0.3], 30);
+        let mut items = vec![ChainItem::IntroCard];
+        items.extend(parts.iter().enumerate().map(|(i, &(path, start))| {
+            ChainItem::Clip(ClipSource {
+                segment_index: i,
+                source_id: format!("s{i}"),
+                source_path: path.into(),
+                source_in_secs: start,
+                duration_secs: 4.0,
+                ramp: None,
+            })
+        }));
+        let segments: Vec<serde_json::Value> = parts
+            .iter()
+            .zip(reasons)
+            .map(|(&(path, start), reason)| {
+                serde_json::json!({ "chapter_path": path, "in_chapter_start_secs": start, "duration_secs": 4.0, "reason": reason })
+            })
+            .collect();
+        serde_json::json!({
+            "segments": segments,
+            "timeline": serde_json::to_value(OutputTimeline::build(&layout, &items)).unwrap(),
+        })
+    }
+
+    fn with_ranges(cfg: &mut Config, ranges_only: bool) {
+        let range = |file: &str, start: u64, caption: Option<&str>| vibecut::project_config::InputRange {
+            file: file.into(),
+            start: Duration::from_secs(start),
+            end: Duration::from_secs(start + 4),
+            caption: caption.map(str::to_string),
+        };
+        cfg.input.ranges_only = ranges_only;
+        cfg.input.ranges = vec![
+            range("/f/alps/GX010201.MP4", 4, Some("March")),
+            range("/f/alps/GX010201.MP4", 20, None),
+            range("/f/coast/GX010301.MP4", 8, Some("June")),
+        ];
+    }
+
+    fn drop_in(cfg: &mut Config, manifest: &serde_json::Value, name: &str, t: f32) -> Result<Vec<ChangeNote>> {
+        let dir = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("manifest.json");
+        std::fs::write(&p, manifest.to_string()).unwrap();
+        let r = apply(cfg, &FeedbackAction::DropSegment { at_seconds: t, manifest_path: Some(p.to_string_lossy().into()) });
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    fn range_summary(cfg: &Config) -> Vec<(u64, Option<&str>)> {
+        cfg.input.ranges.iter().map(|r| (r.start.as_secs(), r.caption.as_deref())).collect()
+    }
+
+    /// A recap plays exactly its ranges: an exclude alone would leave the
+    /// dropped moment in. Dropping removes its range; the month's caption
+    /// moves on to the month's next moment.
+    #[test]
+    fn dropping_a_recap_moment_removes_its_range() {
+        let manifest = ranges_manifest(["forced via [[input.ranges]] 4.00s..8.00s"; 3]);
+        let mut cfg = base_config();
+        with_ranges(&mut cfg, true);
+        // Intro 0–3 s, then 4 s clips: the first plays to about 6.85 s.
+        let notes = drop_in(&mut cfg, &manifest, "sv_drop_recap", 4.0).unwrap();
+        assert_eq!(range_summary(&cfg), vec![(20, Some("March")), (8, Some("June"))]);
+        assert!(notes.iter().any(|n| n.field == "input.ranges" && n.after.contains("GX010201")), "{notes:?}");
+        assert_eq!(cfg.selection.exclude.last().unwrap().file, "GX010201.MP4");
+        cfg.validate().unwrap();
+
+        // The month's only moment: its caption goes with it.
+        let mut cfg = base_config();
+        with_ranges(&mut cfg, true);
+        cfg.input.ranges.remove(1);
+        let manifest = {
+            let mut m = ranges_manifest(["forced via [[input.ranges]]"; 3]);
+            // Same layout; the second clip now plays the coast range.
+            m["timeline"]["clips"][1]["source_path"] = "/f/coast/GX010301.MP4".into();
+            m["timeline"]["clips"][1]["source_in_secs"] = 8.0.into();
+            m["timeline"]["clips"][1]["source_out_secs"] = 12.3.into();
+            m
+        };
+        drop_in(&mut cfg, &manifest, "sv_drop_recap_only", 4.0).unwrap();
+        assert_eq!(range_summary(&cfg), vec![(8, Some("June"))]);
+
+        // The last one: a ranges_only config can't be left empty.
+        drop_in(&mut cfg, &manifest, "sv_drop_recap_last", 9.0).unwrap();
+        assert!(cfg.input.ranges.is_empty());
+        assert!(cfg.validate().unwrap_err().to_string().contains("ranges_only"));
+    }
+
+    /// In an ordinary project a range is a must-include on top of the
+    /// picks: dropping it removes it, dropping a pick that happens to
+    /// overlap it does not.
+    #[test]
+    fn dropping_a_pick_keeps_the_range_it_overlaps() {
+        let manifest = ranges_manifest([
+            "score=0.91 hilight+accel",
+            "forced via [[input.ranges]] 20.00s..24.00s",
+            "score=0.40 hilight+accel",
+        ]);
+        let mut cfg = base_config();
+        with_ranges(&mut cfg, false);
+        let notes = drop_in(&mut cfg, &manifest, "sv_drop_pick", 4.0).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(cfg.input.ranges.len(), 3);
+        // The forced one (second clip, about 6.85–10.55 s).
+        drop_in(&mut cfg, &manifest, "sv_drop_forced", 8.0).unwrap();
+        assert_eq!(range_summary(&cfg), vec![(4, Some("March")), (8, Some("June"))]);
+        assert_eq!(cfg.selection.exclude.len(), 2);
     }
 
     #[test]

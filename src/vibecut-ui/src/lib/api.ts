@@ -6,6 +6,8 @@
 import type { FeedbackAction } from './types/generated/FeedbackAction';
 import type { ChangeNote } from './types/generated/ChangeNote';
 import type { Config } from './types/generated/Config';
+import type { SelectionExclude } from './types/generated/SelectionExclude';
+import type { Transition } from './types/generated/Transition';
 
 const BASE = '/api';
 
@@ -145,6 +147,10 @@ export interface ProposeResult {
 	auto_pick?: MusicPick | null;
 	/** Why there's no music, when there isn't. */
 	music_note?: string | null;
+	/** The video's own title, for projects that name themselves (a recap). */
+	title?: string;
+	/** Set when the project is a recap: what to make it again from. */
+	recap?: { year: number | null; from: string; to: string; length: number; shuffle?: number | null };
 }
 
 export interface ProposedSoundtrack {
@@ -537,4 +543,136 @@ export interface SessionFileInfo {
 
 export function listSessions(): Promise<{ sessions: SessionFileInfo[] }> {
 	return getJson('/sessions');
+}
+
+// ---------- recap ("Your year") ----------
+
+export type RecapGrouping = 'month' | 'trip';
+
+/** One moment a recap plays: where it is in its footage file, when it was
+ *  filmed, and the window the recap cuts from it. */
+export interface RecapMoment {
+	path: string;
+	start_secs: number;
+	end_secs: number;
+	file_secs: number | null;
+	/** RFC 3339, UTC. */
+	recorded_at: string;
+	/** `file_time`: the clip had no recording date; the file's time stands in. */
+	dated_by: 'footage' | 'file_time';
+	score: number;
+	/** Kept versions that picked it. */
+	versions: number;
+	trip: string;
+	clip_start_secs: number;
+	clip_end_secs: number;
+	/** The month or trip it stands for (a `RecapBucket.label`). */
+	bucket: string;
+	/** Lower third over it: its bucket's label, on the bucket's first moment. */
+	caption: string | null;
+}
+
+/** A month (or trip) of the period and how much of it the recap uses. */
+export interface RecapBucket {
+	key: string;
+	label: string;
+	first_recorded: string;
+	available: number;
+	/** 0: left out, the length had no room. */
+	chosen: number;
+	trips: string[];
+}
+
+export interface RecapPlan {
+	period: { from: string; to: string; year: number | null };
+	title: string;
+	subtitle: string;
+	grouping: RecapGrouping;
+	buckets: RecapBucket[];
+	/** In playing order. */
+	moments: RecapMoment[];
+	length_secs: number;
+	moment_secs: number;
+	estimated_secs: number;
+	/** At least `min_buckets` months or trips: enough for a recap. */
+	eligible: boolean;
+	min_buckets: number;
+	versions: number;
+	notes: string[];
+	/** The shuffle this draw came from; null: each month's best. */
+	shuffle: number | null;
+}
+
+export interface RecapYear {
+	year: number;
+	months: number;
+	trips: number;
+	moments: number;
+	eligible: boolean;
+}
+
+export interface RecapPreview {
+	/** Null when there are no saved versions at all. */
+	plan: RecapPlan | null;
+	/** Newest first. */
+	years: RecapYear[];
+	versions: number;
+}
+
+/** What a recap of this period would play — nothing is written. Without a
+ *  period: the latest year that has saved versions. */
+export function recapPreview(args: { year?: number; from?: string; to?: string; length?: number } = {}): Promise<RecapPreview> {
+	const q = new URLSearchParams();
+	if (args.year !== undefined) q.set('year', String(args.year));
+	if (args.from) q.set('from', args.from);
+	if (args.to) q.set('to', args.to);
+	if (args.length !== undefined) q.set('length', String(args.length));
+	const qs = q.toString();
+	return getJson(`/recap${qs ? `?${qs}` : ''}`);
+}
+
+export interface RecapArgs {
+	year?: number;
+	from?: string;
+	to?: string;
+	/** Seconds, or text like '1m30s'. */
+	length?: number | string;
+	title?: string;
+	/** Vibe whose music profile picks the song (server default: family_chronicle). */
+	vibe?: string;
+	/** Song file; omit to let the server pick one, 'none' for no music. */
+	soundtrack?: string;
+	seed?: number;
+	/** Also submit the render job (the server's default). */
+	render?: boolean;
+	/** Windows dropped from the recap on screen (its `[[selection.exclude]]`):
+	 *  kept out of the new one. */
+	exclude?: SelectionExclude[];
+	/** Another draw of each month's strong moments (the Studio's Shuffle). */
+	shuffle?: number;
+	/** The recap on screen's `[transition]` (Calmer / More energy), kept. */
+	transition?: Transition;
+}
+
+export interface RecapResult {
+	config_path: string;
+	config_toml: string;
+	output_path: string;
+	plan: RecapPlan;
+	soundtrack: ProposedSoundtrack | null;
+	auto_pick: MusicPick | null;
+	music_note: string | null;
+	/** The vibe whose music profile chose the song. */
+	vibe: string;
+	vibe_name: string;
+	rationale: string;
+	/** With `render` (the default): the render job. */
+	job_id?: string;
+	state?: string;
+}
+
+/** Write the recap's project config (and, unless `render: false`, start
+ *  its render). Refused (400) without enough months or trips. */
+export function makeRecap(args: RecapArgs): Promise<RecapResult> {
+	return sendJson('/recap', args);
 }

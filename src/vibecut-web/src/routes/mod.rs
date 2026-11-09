@@ -10,6 +10,7 @@ pub mod jobs;
 pub mod music;
 pub mod output;
 pub mod propose;
+pub mod recap;
 pub mod reformat;
 pub mod render;
 pub mod sessions;
@@ -50,6 +51,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/frames/at", get(frames::inspect_at))
         .route("/output", get(output::serve_output))
         .route("/reformat", post(reformat::reformat))
+        .route("/recap", get(recap::preview_recap).post(recap::make_recap))
         .route("/music", get(music::list_music))
         .route("/music/file", get(music::serve_music_file))
         .route("/music/pick", get(music::pick_music))

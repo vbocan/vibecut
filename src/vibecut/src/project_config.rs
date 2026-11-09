@@ -247,6 +247,14 @@ pub struct Input {
     pub include: Vec<String>,
     #[serde(default)]
     pub ranges: Vec<InputRange>,
+    /// Render exactly the `[[input.ranges]]`, in the order listed: the
+    /// picker adds nothing, `[selection].order` is not applied, and there
+    /// is no beat-burst or multi-angle pass (so no footage analysis
+    /// either). Clip lengths are still beat-locked. Used by generated
+    /// configs such as the yearly recap, whose moments are already chosen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts-export", ts(as = "Option<bool>", optional))]
+    pub ranges_only: bool,
     /// Explicit video file paths to include as source material. Each file is
     /// probed and scored the same way as folder-discovered videos.
     #[serde(default)]
@@ -332,6 +340,9 @@ pub enum ImageEffect {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export))]
 pub struct InputRange {
+    /// The footage file: a file name or file-name suffix (`"GX010023.MP4"`,
+    /// `"0023.MP4"`), or a path (`"/footage/alps/GX010023.MP4"`, matched by
+    /// its trailing components) when two folders hold files of that name.
     pub file: String,
     #[serde(with = "humantime_serde")]
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
@@ -339,6 +350,26 @@ pub struct InputRange {
     #[serde(with = "humantime_serde")]
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub end: Duration,
+    /// A short caption drawn as a lower third over the clip that plays this
+    /// range (e.g. the month in a recap: `"March"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub caption: Option<String>,
+}
+
+impl InputRange {
+    /// Whether this range names the footage file at `path`: by file name
+    /// (any letter case), file-name suffix, or trailing path components.
+    pub fn matches_file(&self, path: &camino::Utf8Path) -> bool {
+        let needle = self.file.as_str();
+        if needle.is_empty() {
+            return false;
+        }
+        let name = path.file_name().unwrap_or("");
+        name.eq_ignore_ascii_case(needle)
+            || name.ends_with(needle)
+            || ((needle.contains('/') || needle.contains('\\')) && path.ends_with(needle))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1110,6 +1141,11 @@ impl Config {
                 )));
             }
         }
+        if self.input.ranges_only && self.input.ranges.is_empty() && self.input.images.is_empty() {
+            return Err(ConfigError::Validation(
+                "input.ranges_only needs at least one [[input.ranges]] entry".into(),
+            ));
+        }
 
         if matches!(self.selection.order, Order::StrictChronological) {
             for (i, img) in self.input.images.iter().enumerate() {
@@ -1397,6 +1433,65 @@ stabilize = false
         assert_eq!((o.width, o.height, o.crf), (1920, 1080, 22));
         assert_eq!((o.preset, o.encoder_preset.as_deref()), (None, Some("p5")));
         assert_eq!(o.audio_bitrate, "160k");
+    }
+
+    #[test]
+    fn ranges_take_a_caption_and_a_ranges_only_switch() {
+        let cfg = with_outputs(
+            "[[outputs]]\npath = \"a.mp4\"\nresolution = \"1920x1080\"\n",
+        )
+        .unwrap();
+        // Off by default, and an untouched config doesn't grow the keys.
+        assert!(!cfg.input.ranges_only);
+        let s = toml::to_string(&cfg).unwrap();
+        assert!(!s.contains("ranges_only") && !s.contains("caption"), "{s}");
+
+        let text = "schema_version = 1\n\
+             [project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\n\
+             [input]\nranges_only = true\n\
+             [[input.ranges]]\nfile = \"/footage/alps/GX010201.MP4\"\nstart = \"2s\"\nend = \"6s 500ms\"\ncaption = \"March\"\n\
+             [[input.ranges]]\nfile = \"GX010301.MP4\"\nstart = \"0s\"\nend = \"3s\"\n\
+             [[outputs]]\npath = \"a.mp4\"\nresolution = \"1920x1080\"\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.input.ranges_only);
+        assert_eq!(cfg.input.ranges[0].caption.as_deref(), Some("March"));
+        assert_eq!(cfg.input.ranges[1].caption, None);
+        // Round-trips through the serializer (the structured editor's path).
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(back.input.ranges_only);
+        assert_eq!(back.input.ranges[0].caption.as_deref(), Some("March"));
+        assert_eq!(back.input.ranges[0].end, Duration::from_millis(6500));
+
+        // Nothing to render: rejected up front.
+        let bare = text.split("[[input.ranges]]").next().unwrap().to_string()
+            + "[[outputs]]\npath = \"a.mp4\"\nresolution = \"1920x1080\"\n";
+        let err = toml::from_str::<Config>(&bare).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("ranges_only needs at least one"), "{err}");
+    }
+
+    #[test]
+    fn a_range_names_its_file_by_name_suffix_or_path() {
+        let r = |file: &str| InputRange {
+            file: file.into(),
+            start: Duration::ZERO,
+            end: Duration::from_secs(1),
+            caption: None,
+        };
+        let alps = camino::Utf8Path::new("/footage/Alps Ski Day/GX010201.MP4");
+        let coast = camino::Utf8Path::new("/footage/Coastline/GX010201.MP4");
+        assert!(r("GX010201.MP4").matches_file(alps));
+        assert!(r("gx010201.mp4").matches_file(alps), "file names ignore letter case");
+        assert!(r("0201.MP4").matches_file(alps), "a file-name suffix still works");
+        assert!(!r("GX010202.MP4").matches_file(alps));
+        assert!(!r("").matches_file(alps));
+        // Two folders, one file name: a path tells them apart.
+        assert!(r("/footage/Alps Ski Day/GX010201.MP4").matches_file(alps));
+        assert!(!r("/footage/Alps Ski Day/GX010201.MP4").matches_file(coast));
+        assert!(r("Coastline/GX010201.MP4").matches_file(coast));
+        assert!(!r("Coastline/GX010201.MP4").matches_file(alps));
+        // Whole components only.
+        assert!(!r("line/GX010201.MP4").matches_file(coast));
     }
 
     #[test]

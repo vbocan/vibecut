@@ -5,6 +5,7 @@
 	import VibePicker from './VibePicker.svelte';
 	import SongPicker from './SongPicker.svelte';
 	import CommandBar from './CommandBar.svelte';
+	import RecapCard from './RecapCard.svelte';
 
 	// Keyboard focus scrolls clear of the fixed "Make it" dock.
 	onMount(() => {
@@ -12,6 +13,9 @@
 		html.style.scrollPaddingBottom = 'calc(190px + env(safe-area-inset-bottom))';
 		return () => (html.style.scrollPaddingBottom = '');
 	});
+
+	// Every visit: a render since the last one may have made a recap possible.
+	onMount(() => void s.loadRecap());
 
 	const ready = $derived(!!s.folder && !!s.effectiveVibe && !s.discovering);
 	const vibe = $derived(s.vibes.find((v) => v.key === s.effectiveVibe));
@@ -39,6 +43,8 @@
 			cut to the music.
 		</p>
 	</header>
+
+	<RecapCard />
 
 	<div class="acts">
 		<div class="glass act-card"><TripPicker /></div>

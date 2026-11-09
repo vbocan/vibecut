@@ -25,6 +25,7 @@ pub mod logger;
 pub mod music;
 pub mod paths;
 pub mod propose;
+pub mod recap;
 pub mod reformat;
 pub mod render;
 pub mod vibes;

@@ -442,8 +442,10 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     let telemetries: Vec<crate::selection_planner::SourceTelemetry>;
     let mut curves: Vec<crate::selection_scoring::ScoreCurve>;
 
-    if sources.is_empty() {
-        // Images-only project: no video sources to analyse.
+    if sources.is_empty() || cfg.input.ranges_only {
+        // Images-only project: no video sources to analyse. With
+        // `ranges_only` the moments are already chosen, so nothing reads
+        // the score curves (no picker, burst or angle pass below).
         telemetries = Vec::new();
         curves = Vec::new();
     } else {
@@ -540,7 +542,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // curves to one combined curve in master scene-time. The picker then
     // operates on that combined curve under the master id; angle selection
     // for each pick happens after.
-    let angle_groups: Vec<crate::multi_angle::AngleGroup> = if cfg.multi_angle.enabled {
+    let angle_groups: Vec<crate::multi_angle::AngleGroup> = if cfg.multi_angle.enabled && !cfg.input.ranges_only {
         let mut groups = crate::multi_angle::discover_groups(&sources, &cfg.multi_angle, 1.0);
         if groups.is_empty() {
             tracing::info!("multi_angle.enabled=true but no groups found (no overlapping recording windows)");
@@ -688,15 +690,19 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         );
     }
 
-    let mut segments = select_multi_source(
-        &sources,
-        &curves,
-        inflated_target,
-        clip_len,
-        cfg.selection.max_per_source,
-        cfg.selection.variety,
-        cfg.project.seed.unwrap_or(0),
-    );
+    let mut segments = if cfg.input.ranges_only {
+        Vec::new()
+    } else {
+        select_multi_source(
+            &sources,
+            &curves,
+            inflated_target,
+            clip_len,
+            cfg.selection.max_per_source,
+            cfg.selection.variety,
+            cfg.project.seed.unwrap_or(0),
+        )
+    };
 
     // For each segment whose source_id is a group master, pick the
     // best angle to actually display. Rewrites the segment's source/chapter/
@@ -793,14 +799,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     for r in &cfg.input.ranges {
         let needle = r.file.as_str();
         let Some(matching) = sources.iter().find_map(|s| {
-            s.chapters.iter().find_map(|ch| {
-                let name = ch.path.file_name().unwrap_or("");
-                if name.eq_ignore_ascii_case(needle) || name.ends_with(needle) {
-                    Some((s, ch))
-                } else {
-                    None
-                }
-            })
+            s.chapters.iter().find_map(|ch| r.matches_file(&ch.path).then_some((s, ch)))
         }) else {
             tracing::warn!(file = needle, "input.ranges: no source matched; range skipped");
             continue;
@@ -833,6 +832,13 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     }
     if forced_added > 0 {
         println!("\ninput.ranges: {forced_added} mandatory segment(s) injected");
+    }
+    if cfg.input.ranges_only && forced_added == 0 && image_segments.is_empty() {
+        anyhow::bail!(
+            "input.ranges_only is set but none of the {} [[input.ranges]] matched a video \
+             (list the files under [[input.videos]] or [input].folder)",
+            cfg.input.ranges.len()
+        );
     }
 
     // Apply the configured ordering.
@@ -873,11 +879,11 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
         });
     };
-    let strict_chrono = matches!(
-        cfg.selection.order,
-        crate::project_config::Order::StrictChronological
-    );
+    let strict_chrono = !cfg.input.ranges_only
+        && matches!(cfg.selection.order, crate::project_config::Order::StrictChronological);
     match cfg.selection.order {
+        // The ranges play in the order they are listed.
+        _ if cfg.input.ranges_only => println!("\norder: as listed (input.ranges_only)"),
         crate::project_config::Order::Chronological => chronological_sort(&mut segments),
         crate::project_config::Order::EnergyArc => {
             // Center-out zigzag placement: strongest pick at the middle
@@ -926,9 +932,10 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // slice of normal-paced segments around that output time. Tracked by
     // `burst_range` so the renderer can fold those clips into one stream-copy
     // concat (= internal hard cuts, while the burst as a whole still xfades
-    // into and out of its neighbors).
+    // into and out of its neighbors). Never with `ranges_only`: those
+    // moments are fixed, and the burst would pick new ones.
     let mut burst_range: Option<(usize, usize, f32)> = None; // (start, end_exclusive, total_secs)
-    if let Some(audio_ref) = audio.as_ref() {
+    if let Some(audio_ref) = audio.as_ref().filter(|_| !cfg.input.ranges_only) {
         if let Some(snd) = &cfg.soundtrack {
             // Where each pick will play, predicted with the concat stage's
             // own layout arithmetic: cards in card mode join the chain (with
@@ -1438,6 +1445,19 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         }
     }
 
+    // `[[input.ranges]].caption`: a lower third on the clip playing that range.
+    let seg_captions: Vec<Option<(TextOverlay, f32, f32)>> = {
+        let seam = if cfg.transition.hard_cut() { 0.0 } else { trans_dur };
+        range_captions(&cfg.input.ranges, &segments)
+            .into_iter()
+            .zip(&segments)
+            .map(|(c, s)| {
+                let text = c?;
+                let (start, dur) = caption_window(s.duration_secs as f32, seam)?;
+                Some((caption_overlay(text, height), start, dur))
+            })
+            .collect()
+    };
     progress(Stage::Clips, 0.0, Some(format!("0 of {} clips", segments.len())))?;
     println!("\nnormalizing segments → {workspace}");
     let mut normalized: Vec<Utf8PathBuf> = Vec::with_capacity(segments.len());
@@ -1490,6 +1510,13 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                     duration_secs: d,
                 });
             }
+        }
+        if let Some((caption, start, dur)) = &seg_captions[i] {
+            overlays.push(crate::video_renderer::OverlayDirective {
+                overlay: caption,
+                start_secs: *start,
+                duration_secs: *dur,
+            });
         }
         // Cache: skip normalize when the fingerprinted `seg_NNN_HASH.mp4`
         // already exists, is fresher than the source, has the right duration,
@@ -2505,6 +2532,154 @@ fn card_to_layers(card: &crate::project_config::TextCard) -> (Vec<TextOverlay>, 
         }
     }
     (texts, images)
+}
+
+/// Seconds a range caption stays up (fades included).
+const CAPTION_SECS: f32 = 2.4;
+/// Shortest on-screen time worth drawing a caption for.
+const CAPTION_MIN_SECS: f32 = 0.8;
+
+/// Each segment's `[[input.ranges]].caption`, if it plays a captioned
+/// range: every captioned range goes to the one segment on its file that
+/// overlaps it most, so a caption shows once even when a pick overlaps it.
+fn range_captions<'a>(
+    ranges: &'a [crate::project_config::InputRange],
+    segments: &[Segment],
+) -> Vec<Option<&'a str>> {
+    let mut out = vec![None; segments.len()];
+    for r in ranges {
+        let Some(text) = r.caption.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        let (lo, hi) = (r.start.as_secs_f64(), r.end.as_secs_f64());
+        let best = segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| r.matches_file(&s.chapter_path))
+            .map(|(i, s)| {
+                let s0 = s.in_chapter_start_secs;
+                (i, (s0 + s.duration_secs).min(hi) - s0.max(lo))
+            })
+            .filter(|(_, overlap)| *overlap > 0.0)
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((i, _)) = best {
+            out[i].get_or_insert(text);
+        }
+    }
+    out
+}
+
+/// When a caption shows inside its clip, as `(start, duration)` in
+/// clip-local seconds: just after the incoming crossfade (`seam`), at most
+/// [`CAPTION_SECS`], clear of the outgoing one. `None` when the clip is
+/// too short to read it.
+fn caption_window(clip_secs: f32, seam: f32) -> Option<(f32, f32)> {
+    let start = seam.max(0.0) + 0.15;
+    let dur = CAPTION_SECS.min(clip_secs - start - seam.max(0.0));
+    (dur >= CAPTION_MIN_SECS).then_some((start, dur))
+}
+
+/// A range caption: small white text on a translucent box, centred in
+/// the lower third (centred so a vertical crop of the render keeps it).
+fn caption_overlay(text: &str, body_height: u32) -> TextOverlay {
+    let h = body_height.max(1) as f32;
+    let size = (h * 0.045).round().max(16.0) as u32;
+    TextOverlay {
+        content: text.to_string(),
+        font_path: resolve_font(None),
+        size,
+        color_hex: "#FFFFFF".into(),
+        position: "bottom-center".into(),
+        x_offset: 0,
+        // Lift it off the bottom edge, into the title-safe area.
+        y_offset: -((h * 0.07).round() as i32),
+        fade_in_secs: 0.25,
+        fade_out_secs: 0.35,
+        appear_at_secs: 0.0,
+        disappear_at_secs: CAPTION_SECS,
+        bg_color_hex: Some("#00000080".into()),
+        bg_padding_px: Some((size as f32 * 0.4).round() as u32),
+    }
+}
+
+#[cfg(test)]
+mod range_caption_tests {
+    use super::*;
+    use crate::project_config::InputRange;
+    use std::time::Duration;
+
+    fn range(file: &str, start: f64, end: f64, caption: Option<&str>) -> InputRange {
+        InputRange {
+            file: file.into(),
+            start: Duration::from_secs_f64(start),
+            end: Duration::from_secs_f64(end),
+            caption: caption.map(str::to_string),
+        }
+    }
+
+    fn seg(path: &str, start: f64, dur: f64) -> Segment {
+        Segment {
+            source_id: "s".into(),
+            chapter_path: path.into(),
+            chapter_index: 1,
+            in_chapter_start_secs: start,
+            duration_secs: dur,
+            virtual_start_secs: start,
+            reason: String::new(),
+            score: None,
+        }
+    }
+
+    #[test]
+    fn each_caption_lands_on_the_clip_playing_its_range() {
+        let ranges = [
+            range("/f/alps/GX010201.MP4", 10.0, 14.0, Some("March")),
+            range("/f/coast/GX010201.MP4", 3.0, 7.0, Some(" June ")),
+            range("/f/coast/GX010301.MP4", 0.0, 4.0, None),
+            range("/f/coast/GX010302.MP4", 0.0, 4.0, Some("  ")),
+        ];
+        let segs = [
+            // Beat lock nudged it: still the March range.
+            seg("/f/alps/GX010201.MP4", 9.8, 4.1),
+            // Same file name, other folder.
+            seg("/f/coast/GX010201.MP4", 3.0, 4.0),
+            seg("/f/coast/GX010301.MP4", 0.0, 4.0),
+            seg("/f/coast/GX010302.MP4", 0.0, 4.0),
+        ];
+        assert_eq!(range_captions(&ranges, &segs), vec![Some("March"), Some("June"), None, None]);
+    }
+
+    #[test]
+    fn a_caption_shows_once_even_when_two_clips_overlap_its_range() {
+        let ranges = [range("GX010201.MP4", 10.0, 14.0, Some("March"))];
+        let segs = [
+            seg("/f/GX010201.MP4", 8.0, 3.0),  // 1 s inside
+            seg("/f/GX010201.MP4", 10.5, 3.5), // 3.5 s inside
+            seg("/f/GX010201.MP4", 20.0, 3.0), // outside
+        ];
+        assert_eq!(range_captions(&ranges, &segs), vec![None, Some("March"), None]);
+    }
+
+    #[test]
+    fn captions_clear_the_crossfades_and_skip_tiny_clips() {
+        let (start, dur) = caption_window(4.0, 0.3).unwrap();
+        assert!((start - 0.45).abs() < 1e-6);
+        assert!((dur - CAPTION_SECS).abs() < 1e-6);
+        // Short clip: shortened to stay clear of the outgoing crossfade.
+        let (start, dur) = caption_window(2.0, 0.3).unwrap();
+        assert!((start + dur - 1.7).abs() < 1e-5, "{start} + {dur}");
+        // Hard cuts: right after the cut.
+        assert_eq!(caption_window(4.0, 0.0), Some((0.15, CAPTION_SECS)));
+        assert_eq!(caption_window(1.2, 0.3), None);
+    }
+
+    #[test]
+    fn the_caption_scales_with_the_frame() {
+        let c = caption_overlay("March", 1080);
+        assert_eq!((c.size, c.y_offset, c.position.as_str()), (49, -76, "bottom-center"));
+        assert_eq!(caption_overlay("March", 2160).size, 97);
+        assert!(c.bg_color_hex.is_some());
+    }
 }
 
 /// Convert a chapter's `creation_time` ISO-8601 string + an offset within the

@@ -92,8 +92,8 @@
 		{/if}
 		<div class="actions">
 			<!-- aria-disabled while busy: a disabled button drops the focus. -->
-			<button class="btn" type="button" disabled={burst} aria-disabled={busy} onclick={() => act('more')}>More of this clip</button>
-			<button class="btn" type="button" disabled={burst} aria-disabled={busy} onclick={() => act('less')}>Less of this clip</button>
+			<button class="btn" type="button" disabled={burst || s.rangesOnly} aria-disabled={busy} onclick={() => act('more')}>More of this clip</button>
+			<button class="btn" type="button" disabled={burst || s.rangesOnly} aria-disabled={busy} onclick={() => act('less')}>Less of this clip</button>
 			<button class="btn danger" type="button" aria-disabled={busy} onclick={() => act('drop')}>Drop this moment</button>
 		</div>
 		<details class="tech">
