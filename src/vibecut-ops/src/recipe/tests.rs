@@ -1172,6 +1172,41 @@ fn chips_read_like_a_summary() {
     assert!(json["music"]["songs"][0]["id"].is_null());
 }
 
+/// Every key the vibe templates render today is in the frozen file
+/// (inside arrays too): format 1 hasn't shipped, so a key added to the
+/// schema goes into the file now (VIBECUT_WRITE_BASELINES=1), rather than
+/// leaning on the current-template fallback.
+#[test]
+fn the_frozen_file_has_every_key_the_templates_render() {
+    fn missing(frozen: &Value, current: &Value, path: &str, out: &mut Vec<String>) {
+        match (frozen, current) {
+            (Value::Object(f), Value::Object(c)) => {
+                for (k, cv) in c {
+                    match f.get(k) {
+                        Some(fv) => missing(fv, cv, &format!("{path}.{k}"), out),
+                        None => out.push(format!("{path}.{k}")),
+                    }
+                }
+            }
+            (Value::Array(f), Value::Array(c)) => {
+                for (i, cv) in c.iter().enumerate() {
+                    match f.get(i) {
+                        Some(fv) => missing(fv, cv, &format!("{path}.{i}"), out),
+                        None => out.push(format!("{path}.{i}")),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for key in VIBE_IDS {
+        let frozen = &super::frozen_baselines()[key];
+        missing(frozen, &current_baseline(vibes::get(key).unwrap()).unwrap(), key, &mut out);
+    }
+    assert!(out.is_empty(), "the frozen baselines lack {out:?}");
+}
+
 #[test]
 fn keys_added_after_format_1_take_the_current_template() {
     // A key the frozen file lacks is filled in; a key it has keeps its
@@ -1182,6 +1217,14 @@ fn keys_added_after_format_1_take_the_current_template() {
     assert_eq!(
         frozen,
         serde_json::json!({ "scoring": { "gps_speed": 0.4, "gyro": 0.4 }, "project": { "fps": 30 }, "grading": { "stabilize": false } })
+    );
+    // Arrays pair up by position; extra elements on either side stay as they are.
+    let mut frozen = serde_json::json!({ "intro": { "layers": [{ "size": 96 }, { "size": 48 }] }, "palette": ["fade"] });
+    let current = serde_json::json!({ "intro": { "layers": [{ "size": 80, "shadow": true }] }, "palette": ["cut", "fade"] });
+    super::fill_missing(&mut frozen, &current);
+    assert_eq!(
+        frozen,
+        serde_json::json!({ "intro": { "layers": [{ "size": 96, "shadow": true }, { "size": 48 }] }, "palette": ["fade"] })
     );
     // And an untouched vibe has no settings at all, whatever was added.
     for key in vibes::names() {

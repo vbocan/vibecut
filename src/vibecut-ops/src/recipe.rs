@@ -100,6 +100,7 @@ pub const SEGMENTS: &[&str] = &[
     "multi_angle", "enabled", "sync", "min_hold",
     "grading", "stabilize",
     "outputs", "resolution", "crf", "preset", "audio_bitrate", "fit", "max_bitrate",
+    "gyro", "landings",
 ];
 
 /// Common string values by position. Append only; at most 128 entries.
@@ -936,12 +937,14 @@ fn frozen_baselines() -> &'static Map<String, Value> {
 /// A vibe's style as format 1 froze it: what a code's settings are
 /// differences from. Without music the soundtrack section is empty.
 ///
-/// Config keys added to the schema after format 1 (say a new scoring
-/// signal) aren't in the frozen file. They take the vibe's current
-/// template value, so an untouched new key never shows up as a setting
-/// and an old code, which can't mention it, gets today's default. Keys
-/// the frozen file does have keep their format-1 value, so what an
-/// existing code means never changes.
+/// The frozen file holds every key the schema had when format 1 shipped
+/// (a test fails when a template has a key it lacks, until format 1
+/// ships the file is regenerated instead). Keys added to the schema
+/// after that (say a new scoring signal) take the vibe's current
+/// template value as a fallback, so an untouched new key never shows up
+/// as a setting and an old code, which can't mention it, gets today's
+/// default. Keys the frozen file does have keep their format-1 value, so
+/// what an existing code means never changes.
 pub fn frozen_baseline(vibe: &str, with_music: bool) -> Result<Value, OpsError> {
     let mut v = frozen_baselines()
         .get(vibe)
@@ -957,17 +960,28 @@ pub fn frozen_baseline(vibe: &str, with_music: bool) -> Result<Value, OpsError> 
 }
 
 /// Adds every object key of `from` that `into` lacks (recursively).
-/// Existing keys, arrays and scalars in `into` are left as they are.
+/// Arrays are filled element by element, pairing elements by position
+/// (a new key on a card's text layers reaches each frozen layer from the
+/// template's layer at the same index); elements only one side has, and
+/// existing scalars in `into`, are left as they are.
 fn fill_missing(into: &mut Value, from: &Value) {
-    if let (Value::Object(i), Value::Object(f)) = (into, from) {
-        for (k, fv) in f {
-            match i.get_mut(k) {
-                Some(iv) => fill_missing(iv, fv),
-                None => {
-                    i.insert(k.clone(), fv.clone());
+    match (into, from) {
+        (Value::Object(i), Value::Object(f)) => {
+            for (k, fv) in f {
+                match i.get_mut(k) {
+                    Some(iv) => fill_missing(iv, fv),
+                    None => {
+                        i.insert(k.clone(), fv.clone());
+                    }
                 }
             }
         }
+        (Value::Array(i), Value::Array(f)) => {
+            for (iv, fv) in i.iter_mut().zip(f) {
+                fill_missing(iv, fv);
+            }
+        }
+        _ => {}
     }
 }
 
