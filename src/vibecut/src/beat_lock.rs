@@ -219,7 +219,7 @@ mod tests {
         durs.extend(locked.iter().map(|l| l.duration_secs as f32));
         durs.push(2.0); // outro
         let seams = vec![w as f32; durs.len() - 1];
-        let cuts: Vec<f32> = planned_cuts(&durs, &seams, true, true, None)
+        let cuts: Vec<f32> = planned_cuts(&durs, &seams, true, true, None, FPS)
             .into_iter()
             .filter(|c| c.kind != CutKind::IntroToBody)
             .map(|c| c.output_secs)
@@ -246,7 +246,7 @@ mod tests {
         let clips: Vec<LockClip> = (0..40).map(|_| clip(interval as f64 * 2.0, Some(0.0))).collect();
         let locked = lock_cuts(&clips, LockStart { output_secs: 0.0, seam_in_secs: 0.0 }, &grid, FPS);
         let durs: Vec<f32> = locked.iter().map(|l| l.duration_secs as f32).collect();
-        let cuts: Vec<f32> = planned_cuts(&durs, &vec![0.0; durs.len() - 1], false, false, None)
+        let cuts: Vec<f32> = planned_cuts(&durs, &vec![0.0; durs.len() - 1], false, false, None, FPS)
             .into_iter()
             .map(|c| c.output_secs)
             .collect();

@@ -516,7 +516,8 @@ pub struct Selection {
     /// Per-source scoring weights. The picker multiplies
     /// each source's score curve by its weight before composing the
     /// pick set. The MCP server's `apply_feedback(MoreOf)` /
-    /// `apply_feedback(LessOf)` actions append entries here. Hand-edits
+    /// `apply_feedback(LessOf)` actions double / halve entries here
+    /// (between 0.125 and 8; never 0). Hand-edits
     /// work too — drop in a `[[selection.source_weights]]` entry to
     /// tilt the picker for a given render.
     #[serde(default)]
@@ -526,7 +527,8 @@ pub struct Selection {
 /// One per-source scoring multiplier. `weight = 1.5` means "give this
 /// source 50 % more weight" — the picker multiplies its score curve
 /// by 1.5 before composing the pick set. `weight = 0.0` effectively
-/// drops the source from candidacy entirely. Last-write-wins if the
+/// drops the source from candidacy entirely (it only fills slots
+/// nothing else can). Last-write-wins if the
 /// same `source_id` appears more than once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -620,6 +622,9 @@ pub enum Order {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export))]
 pub struct Transition {
+    /// ffmpeg xfade name used at every seam. `"cut"` / `"none"` (or a zero
+    /// `duration`) join the clips with straight cuts; the intro/outro cards
+    /// and the project fade-in / fade-out are kept either way.
     #[serde(default = "default_transition")]
     pub default: String,
     #[serde(with = "humantime_serde", default = "default_transition_duration")]
@@ -661,6 +666,15 @@ impl Default for Transition {
             speed_ramp_factor: default_speed_ramp_factor(),
             speed_ramp_flash: default_speed_ramp_flash(),
         }
+    }
+}
+
+impl Transition {
+    /// Hard-cut mode: straight cuts instead of crossfades, because `default`
+    /// is `"cut"` / `"none"` or `duration` is zero. The concat stage, the
+    /// beat lock and the feedback actions all go by this.
+    pub fn hard_cut(&self) -> bool {
+        self.default == "cut" || self.default == "none" || self.duration.is_zero()
     }
 }
 
@@ -1236,6 +1250,20 @@ stabilize = false
         cfg2.validate().expect("re-validate");
         assert_eq!(cfg.project.name, cfg2.project.name);
         assert_eq!(cfg.project.target_duration, cfg2.project.target_duration);
+    }
+
+    #[test]
+    fn hard_cut_mode_is_cut_none_or_a_zero_duration() {
+        let t = |default: &str, ms: u64| Transition {
+            default: default.into(),
+            duration: Duration::from_millis(ms),
+            ..Transition::default()
+        };
+        assert!(!t("fade", 400).hard_cut());
+        assert!(!t("dissolve", 1).hard_cut());
+        assert!(t("cut", 400).hard_cut());
+        assert!(t("none", 400).hard_cut());
+        assert!(t("fade", 0).hard_cut());
     }
 
     #[test]

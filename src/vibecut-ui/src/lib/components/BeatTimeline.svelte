@@ -17,12 +17,20 @@
 	let hoverT = $state<number | null>(null);
 
 	const layout = $derived(s.segmentLayout);
-	const duration = $derived(s.videoDuration ?? layout.at(-1)?.endSecs ?? 0);
+	const timeline = $derived(s.manifest?.timeline);
+	const duration = $derived(s.videoDuration ?? timeline?.duration_secs ?? layout.at(-1)?.endSecs ?? 0);
 	const sourceIds = $derived(s.manifest?.sources.map((x) => x.id) ?? []);
 	const cuts = $derived(s.manifest?.beat_sync?.cuts ?? []);
-	// Title / end cards sit outside the footage segments.
-	const introEnd = $derived(cuts.find((c) => c.kind === 'intro_to_body')?.output_secs ?? 0);
-	const outroStart = $derived(cuts.find((c) => c.kind === 'body_to_outro')?.output_secs ?? null);
+	// Title / end cards sit outside the footage segments: exact from the
+	// manifest's timeline, else from the beat-sync cut list.
+	const introEnd = $derived(
+		timeline ? (timeline.intro?.cut_secs ?? 0) : (cuts.find((c) => c.kind === 'intro_to_body')?.output_secs ?? 0)
+	);
+	const outroStart = $derived(
+		timeline
+			? (timeline.outro?.cut_secs ?? null)
+			: (cuts.find((c) => c.kind === 'body_to_outro')?.output_secs ?? null)
+	);
 	// The single strongest moment (not the burst) gets a pin.
 	const hero = $derived.by(() => {
 		let best: (typeof layout)[number] | null = null;

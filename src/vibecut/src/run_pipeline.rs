@@ -917,31 +917,65 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     let mut burst_range: Option<(usize, usize, f32)> = None; // (start, end_exclusive, total_secs)
     if let Some(audio_ref) = audio.as_ref() {
         if let Some(snd) = &cfg.soundtrack {
-            // Compute provisional output layout so plan_burst knows where each
-            // segment sits in output time.
-            let (out_starts, out_durs) =
-                compute_segment_output_layout(&segments, intro_dur, use_transitions, trans_dur);
-            let total_output =
-                compute_total_output(&out_durs, intro_dur, outro_dur, use_transitions, trans_dur);
+            // Where each pick will play, predicted with the concat stage's
+            // own layout arithmetic: cards in card mode join the chain (with
+            // a crossfade, or a straight cut in hard-cut mode), and the beat
+            // lock (when on) keeps each pick's cut-to-cut span at its planned
+            // length.
+            let xfade_path = !cfg.transition.hard_cut();
+            let card_secs = |c: &Option<crate::project_config::TextCard>| chain_card_secs(c.as_ref());
+            let seam = if xfade_path {
+                trans_dur.max(crate::video_renderer::MIN_XFADE_SECS) as f64
+            } else {
+                0.0
+            };
+            let planned: Vec<f64> = segments.iter().map(|s| s.duration_secs).collect();
+            let predicted = crate::output_timeline::predict_layout(
+                card_secs(&cfg.intro),
+                &planned,
+                card_secs(&cfg.outro),
+                seam,
+                beat_locked,
+                cfg.project.fps,
+            );
+            // The soundtrack as the mux lays it under the output (loop
+            // copies included): the drop's song time is not its output time.
+            let soundtrack_spans = soundtrack_loop_plan(audio_ref)
+                .spans(predicted.total as f32 + 60.0, audio_ref.duration_secs);
+            let burst_ctx = crate::beat_burst::BurstContext {
+                clip_spans: &predicted.clip_spans,
+                soundtrack: &soundtrack_spans,
+                body_start: predicted.body_start,
+                body_end: predicted.body_end,
+                total: predicted.total,
+            };
             if let Some(plan) = crate::beat_burst::plan_burst(
                 audio_ref,
                 snd,
                 &segments,
-                &out_starts,
-                &out_durs,
+                &burst_ctx,
                 &sources,
                 &curves,
-                intro_dur,
-                total_output,
             ) {
                 println!(
-                    "\nbeat-burst: {} cuts × {:.3}s @ output_t={:.2}s (every {} beat{})",
+                    "\nbeat-burst: {} cuts × {:.3}s @ output_t={:.2}s (every {} beat{}; replaces {} pick{}{})",
                     plan.sub_clips.len(),
                     plan.beat_secs,
                     plan.output_start_secs,
                     plan.beats_per_cut,
-                    if plan.beats_per_cut == 1 { "" } else { "s" }
+                    if plan.beats_per_cut == 1 { "" } else { "s" },
+                    plan.replace_count,
+                    plural(plan.replace_count),
+                    plan.trim_before_secs
+                        .map(|t| format!(", the pick before it {t:.2}s shorter"))
+                        .unwrap_or_default(),
                 );
+                // Cut the pick the drop falls in short so the burst starts on it.
+                if let Some(trim) = plan.trim_before_secs {
+                    if let Some(s) = plan.replace_at.checked_sub(1).and_then(|i| segments.get_mut(i)) {
+                        s.duration_secs = (s.duration_secs - trim).max(0.1);
+                    }
+                }
                 let total_burst_secs: f32 =
                     plan.sub_clips.iter().map(|c| c.duration_secs as f32).sum();
                 // Splice: remove the M existing segments, insert N burst sub-clips.
@@ -1113,18 +1147,14 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     let mut intro_card_len: Option<f64> = None;
     if let (Some(a), Some(snd)) = (audio.as_ref(), cfg.soundtrack.as_ref()) {
         if snd.beat_align && a.tempo_bpm > 0.0 && !a.beats.is_empty() && !segments.is_empty() {
-            use crate::beat_lock::{lock_cuts, LockClip, LockStart};
-            use crate::project_config::CardMode;
+            use crate::beat_lock::{lock_cuts, LockClip};
             let fps = cfg.project.fps;
-            let xfade_path = use_transitions && trans_dur > 0.0;
+            let xfade_path = !cfg.transition.hard_cut();
             let seam = |w: f32| w.max(crate::video_renderer::MIN_XFADE_SECS) as f64;
             let default_seam = if xfade_path { seam(trans_dur) } else { 0.0 };
-            let intro_card = cfg
-                .intro
-                .as_ref()
-                .filter(|c| matches!(c.mode, CardMode::Card))
-                .map(|c| c.duration.as_secs_f64());
-            let outro_card = cfg.outro.as_ref().is_some_and(|c| matches!(c.mode, CardMode::Card));
+            // Cards in card mode join the chain on both concat paths.
+            let intro_card = chain_card_secs(cfg.intro.as_ref());
+            let outro_card = chain_card_secs(cfg.outro.as_ref()).is_some();
             // Beats as they play in the output. The loop layout's prefix
             // doesn't depend on the body length, so any horizon past the end
             // of the cut gives the same beats.
@@ -1132,45 +1162,28 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             let horizon = (intro_card.unwrap_or(0.0) + planned_total * 1.6 + 60.0) as f32;
             let spans = soundtrack_loop_plan(a).spans(horizon, a.duration_secs);
             let beats = crate::beat_sync::beats_in_output(&a.beats, &spans);
-            // Cards only join the chain on the crossfade path. The intro
-            // card's length moves by at most half a beat so the footage comes
-            // in on a beat.
-            let start = match intro_card.filter(|_| xfade_path) {
-                Some(d) => {
-                    let len = crate::beat_lock::lock_card_end(
-                        d,
-                        default_seam,
-                        &beats,
-                        a.beat_interval_secs() as f64,
-                        fps,
-                    );
-                    if (len - d).abs() > 1e-6 {
-                        intro_card_len = Some(len);
-                    }
-                    LockStart { output_secs: len - default_seam, seam_in_secs: default_seam }
-                }
-                None => LockStart { output_secs: 0.0, seam_in_secs: 0.0 },
-            };
+            let (start, card_len) = beat_lock_start(
+                intro_card,
+                default_seam,
+                &beats,
+                a.beat_interval_secs() as f64,
+                fps,
+            );
+            intro_card_len = card_len;
             let n = segments.len();
             let clips: Vec<LockClip> = segments
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
                     let ramped = seg_ramps[i].is_some();
-                    // Must match the concat stage's per-seam widths.
-                    let seam_out = if i + 1 < n {
-                        Some(if !xfade_path || (in_burst(i) && in_burst(i + 1)) {
-                            0.0
-                        } else if ramped {
-                            seam(HARD_CUT_XFADE_SECS)
-                        } else {
-                            default_seam
-                        })
-                    } else if xfade_path && outro_card {
-                        Some(default_seam)
-                    } else {
-                        None
-                    };
+                    let seam_out = lock_seam_out(
+                        i,
+                        n,
+                        xfade_path.then_some(default_seam),
+                        ramped,
+                        i + 1 < n && in_burst(i) && in_burst(i + 1),
+                        outro_card,
+                    );
                     let source_end = if crate::media_probe::is_image_path(&s.chapter_path) {
                         None
                     } else {
@@ -1524,6 +1537,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // `burst_sub_durs` keeps (segment index, on-disk sub-clip durations) so
     // the beat-sync check can place the burst's internal cuts.
     let mut burst_sub_durs: Option<(usize, Vec<f32>)> = None;
+    // The burst's own clips, kept for the output timeline (the fold below
+    // replaces them with one synthetic segment).
+    let mut burst_parts: Vec<Segment> = Vec::new();
     if let Some((bs, be, total_secs)) = burst_range {
         if be > bs && bs < normalized.len() {
             let burst_intermediate = workspace.join("beat_burst.mp4");
@@ -1584,7 +1600,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 score: Some(1.0),
             };
             normalized.splice(bs..be, std::iter::once(burst_intermediate));
-            segments.splice(bs..be, std::iter::once(synth));
+            burst_parts = segments.splice(bs..be, std::iter::once(synth)).collect();
             // Keep the per-seam ramp lookup in step with the folded list
             // (the concat stage indexes it by post-fold position).
             seg_ramps.splice(bs..be, std::iter::once(None));
@@ -1594,125 +1610,57 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // (intro/outro setup moved earlier so overlay mode can attach to normalize)
 
     progress(Stage::Joining, 0.0, None);
-    // 7. Concat (with or without xfade transitions). use_transitions and
-    // trans_dur were hoisted earlier so the K computation could see them.
+    // 7. Concat: [intro card], the clips, [outro card] — crossfaded, or
+    // joined with straight cuts in hard-cut mode (`[transition].default =
+    // "cut"` / `"none"`, or a zero `duration`). Both paths keep the cards and
+    // the project fade-in / fade-out (see `BodyConcat`). trans_dur was
+    // hoisted earlier so the K computation could see it.
     let body = workspace.join("body.mp4");
-    // How the body was assembled, for the beat-sync check after the mux.
-    let concat_layout: ConcatLayout;
+    let burst_fold = burst_sub_durs
+        .as_ref()
+        .map(|(bs, d)| (*bs, burst_parts.as_slice(), d.as_slice()));
 
-    if use_transitions && trans_dur > 0.0 {
-        // Assemble the input list: [intro], normalized..., [outro].
-        //
-        // CRITICAL: the duration we pass to `concat_with_xfade` MUST be the
-        // actual on-disk duration of the rendered file, not the planner's
-        // requested duration. The renderer applies `,fps={N}` which snaps
-        // to frame boundaries, and the beat-burst fold concatenates
-        // frame-rounded sub-clips — both introduce small drifts (e.g. a
-        // 6.132 s planned burst lands as exactly 6.000 s on disk). Each
-        // drift becomes a constant offset error in the xfade chain. With
-        // wide xfades (0.35 s) the seam absorbs it, but a hard-cut seam
-        // (0.10 s) after a drifted input makes xfade try to fade past the
-        // end of the left input — xfade then silently stops emitting
-        // video while acrossfade keeps going, producing a body.mp4 with
-        // video=29s / audio=80s. Probe each clip so the offsets reflect
-        // reality.
-        let probe_dur = |p: &Utf8Path, fallback: f32| -> f32 {
-            let d = crate::media_probe::probe_video_duration(p) as f32;
-            if d > 0.0 { d } else { fallback }
-        };
-        let mut inputs: Vec<(Utf8PathBuf, f32)> = Vec::new();
-        if let Some(p) = &intro_path {
-            inputs.push((p.clone(), probe_dur(p, intro_dur)));
-        }
-        for (i, p) in normalized.iter().enumerate() {
-            inputs.push((p.clone(), probe_dur(p, segments[i].duration_secs as f32)));
-        }
-        if let Some(p) = &outro_path {
-            inputs.push((p.clone(), probe_dur(p, outro_dur)));
-        }
-        // Per-pair transition spec: same xfade name everywhere, default
-        // duration, EXCEPT after a segment that has an outgoing speed-ramp
-        // — there we collapse the xfade to ~1 frame so the ramp itself is
-        // the visible transition effect (a Reels-style hard-cut whip-up
-        // rather than a crossfade that masks the speed change).
-        let intro_count = if intro_path.is_some() { 1usize } else { 0 };
-        let mut trans_pairs: Vec<(String, f32)> = Vec::with_capacity(inputs.len().saturating_sub(1));
-        let mut hard_cuts = 0u32;
-        for k in 0..(inputs.len().saturating_sub(1)) {
-            // Is the OUTGOING side at position k a segment with an outgoing
-            // ramp? If so, collapse the seam to a near-cut.
-            let outgoing_seg_idx: Option<usize> =
-                if k >= intro_count && k < intro_count + segments.len() {
-                    Some(k - intro_count)
-                } else {
-                    None
-                };
-            let is_ramped = outgoing_seg_idx
-                .and_then(|i| seg_ramps.get(i))
-                .and_then(|r| r.as_ref())
-                .is_some();
-            let dur = if is_ramped {
-                hard_cuts += 1;
-                // See HARD_CUT_XFADE_SECS: just above one AAC frame so
-                // the audio chain doesn't truncate, yet short enough to
-                // feel like a hard cut and keep the speed-ramp flash visible.
-                HARD_CUT_XFADE_SECS
-            } else {
-                trans_dur
-            };
-            trans_pairs.push((cfg.transition.default.clone(), dur));
-        }
-        println!(
-            "\nconcat with xfade ({} clips, {} default × {:.2}s, {} hard-cut after ramps) → {body}",
-            inputs.len(),
-            cfg.transition.default,
-            trans_dur,
-            hard_cuts,
-        );
-        concat_layout = ConcatLayout {
-            input_durs: inputs.iter().map(|(_, d)| *d).collect(),
-            seam_durs: trans_pairs
-                .iter()
-                .map(|(_, d)| d.max(crate::video_renderer::MIN_XFADE_SECS))
-                .collect(),
-            has_intro: intro_path.is_some(),
-            has_outro: outro_path.is_some(),
-            burst: burst_sub_durs.map(|(bs, d)| (intro_count + bs, d)),
-        };
-        crate::video_renderer::concat_with_xfade(
-            &runner,
-            &inputs,
-            &trans_pairs,
-            width,
-            height,
-            cfg.project.fps,
-            body_crf,
-            cfg.project.fade_in.as_secs_f32(),
-            cfg.project.fade_out.as_secs_f32(),
-            &hw,
-            &body,
-        )
-        .context("xfade concat stage")?;
-    } else {
-        println!("\nconcatenating (hard cuts) → {body}");
-        crate::video_renderer::concat_segments(&runner, &normalized, &workspace, &body)
-            .context("concat stage")?;
-        let input_durs: Vec<f32> = normalized
-            .iter()
-            .zip(&segments)
-            .map(|(p, s)| {
-                let d = crate::media_probe::probe_video_duration(p) as f32;
-                if d > 0.0 { d } else { s.duration_secs as f32 }
-            })
-            .collect();
-        concat_layout = ConcatLayout {
-            seam_durs: vec![0.0; input_durs.len().saturating_sub(1)],
-            input_durs,
-            has_intro: false,
-            has_outro: false,
-            burst: burst_sub_durs,
-        };
-    }
+    // Assemble the input list: [intro], normalized..., [outro].
+    //
+    // CRITICAL: the durations the chain is laid out from MUST be the actual
+    // on-disk durations of the rendered files, not the planner's requested
+    // durations. The renderer applies `,fps={N}` which snaps to frame
+    // boundaries, and the beat-burst fold concatenates frame-rounded
+    // sub-clips — both introduce small drifts (e.g. a 6.132 s planned burst
+    // lands as exactly 6.000 s on disk). Each drift becomes a constant offset
+    // error in the xfade chain. With wide xfades (0.35 s) the seam absorbs
+    // it, but a hard-cut seam (0.10 s) after a drifted input makes xfade try
+    // to fade past the end of the left input — xfade then silently stops
+    // emitting video while acrossfade keeps going, producing a body.mp4 with
+    // video=29s / audio=80s. Probe each clip so the offsets reflect reality.
+    let probe_dur = |p: &Utf8Path, fallback: f32| -> f32 {
+        let d = crate::media_probe::probe_video_duration(p) as f32;
+        if d > 0.0 { d } else { fallback }
+    };
+    let clips: Vec<(Utf8PathBuf, f32)> = normalized
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.clone(), probe_dur(p, segments[i].duration_secs as f32)))
+        .collect();
+    let xfade = (!cfg.transition.hard_cut()).then_some((cfg.transition.default.as_str(), trans_dur));
+    // How the body is assembled: the inputs, their seams, the chain layout
+    // the concat renders from (the xfade offsets, or the frames each input
+    // keeps), and what each input is. Becomes the output timeline that
+    // ducking, the beat-sync check and the manifest all read.
+    let plan = BodyConcat::plan(
+        intro_path.as_ref().map(|p| (p.clone(), probe_dur(p, intro_dur))),
+        clips,
+        outro_path.as_ref().map(|p| (p.clone(), probe_dur(p, outro_dur))),
+        &segments,
+        &seg_ramps,
+        burst_fold,
+        xfade,
+        (cfg.project.fade_in.as_secs_f32(), cfg.project.fade_out.as_secs_f32()),
+        cfg.project.fps,
+    );
+    println!("\n{} → {body}", plan.describe());
+    plan.render(&runner, width, height, cfg.project.fps, body_crf, &hw, &body)?;
+    let timeline = crate::output_timeline::OutputTimeline::build(&plan.layout, &plan.items);
 
     progress(Stage::Mixing, 0.0, None);
     // 7. Mux soundtrack into a body+audio file. Per-output transcoding to
@@ -1770,11 +1718,11 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                     }
                 }
             }
-            // Compute output offsets for each segment, accounting for xfade overlap.
-            let (output_starts, output_durs) =
-                compute_segment_output_layout(&segments, intro_dur, use_transitions, trans_dur);
-            let total_output_dur =
-                compute_total_output(&output_durs, intro_dur, outro_dur, use_transitions, trans_dur);
+            // Where each segment plays, crossfades included — exactly as the
+            // concat stage laid it out (per-seam crossfades, ramped near-cuts,
+            // intro card, folded burst).
+            let (output_starts, output_durs) = timeline.segment_windows(segments.len());
+            let total_output_dur = timeline.duration_secs as f32;
             // Per-segment audio presence — short-circuits the duck audio
             // decode for sources we already know have no audio (saves ~100 ms
             // per segment + silences "audio decode for ducking failed"
@@ -1848,15 +1796,15 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             // audio stream past the video. We use the actual video stream
             // duration so the soundtrack fade-out is anchored to the real end
             // of the picture and the muxed output's audio gets capped to it.
-            let body_video_secs = crate::media_probe::probe_video_duration(&body) as f32;
-            let (_out_starts2, out_durs2) =
-                compute_segment_output_layout(&segments, intro_dur, use_transitions, trans_dur);
-            let body_computed =
-                compute_total_output(&out_durs2, intro_dur, outro_dur, use_transitions, trans_dur);
+            // Kept in f64: the mux's `-t` cap must not fall half an audio
+            // sample short of the picture (an f32 can't hold that past 256 s).
+            let body_video_secs = crate::media_probe::probe_video_duration(&body);
+            let body_computed = timeline.duration_secs;
             let body_total = if body_video_secs > 0.0 { body_video_secs } else { body_computed };
-            if body_video_secs > 0.0 && (body_video_secs - body_computed).abs() > 0.5 {
+            let half_frame = 0.5 / cfg.project.fps.max(1) as f64;
+            if body_video_secs > 0.0 && (body_video_secs - body_computed).abs() > half_frame {
                 println!(
-                    "  body video probed at {:.2}s (computed estimate was {:.2}s; using probed value for soundtrack timing)",
+                    "  body video probed at {:.3}s but the timeline says {:.3}s; using the probed value for soundtrack timing",
                     body_video_secs, body_computed
                 );
             }
@@ -1897,7 +1845,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 &muxed_body,
             )
             .context("mux+duck stage")?;
-            soundtrack_layout = Some((loop_plan, body_total));
+            soundtrack_layout = Some((loop_plan, body_total as f32));
         }
     } else {
         println!("\nno soundtrack configured; copying body → {muxed_body}");
@@ -1955,7 +1903,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         (Some(a), Some(snd), Some((plan, body_secs)), Some(snd_path)) if a.tempo_bpm > 0.0 => {
             check_beat_sync(BeatSyncInputs {
                 audio: a,
-                concat: &concat_layout,
+                timeline: &timeline,
                 loop_plan: plan,
                 body_secs,
                 fade_out_secs: snd.fade_out.as_secs_f32(),
@@ -2000,6 +1948,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             })
             .collect(),
         beat_sync,
+        timeline: Some(timeline),
         generator: format!("vibecut {}", env!("CARGO_PKG_VERSION")),
     };
     manifest
@@ -2436,22 +2385,312 @@ fn resolve_font(name: Option<&str>) -> Option<camino::Utf8PathBuf> {
 }
 
 
-/// How the body video was concatenated: what the beat-sync check needs to
-/// place every cut exactly where the concat stage put it.
-struct ConcatLayout {
-    /// On-disk duration of each concat input (intro, clips, outro).
-    input_durs: Vec<f32>,
-    /// Effective crossfade per seam (0 for hard concat).
-    seam_durs: Vec<f32>,
+/// Length of an intro/outro card as its own concat input, or `None` when it
+/// doesn't join the chain: an overlay card is drawn on the footage. A card
+/// in card mode joins it on both concat paths (crossfaded, or with a
+/// straight cut in hard-cut mode). Planning that counted a card that isn't
+/// there put every later pick its length too late.
+fn chain_card_secs(card: Option<&crate::project_config::TextCard>) -> Option<f64> {
+    card.filter(|c| matches!(c.mode, crate::project_config::CardMode::Card))
+        .map(|c| c.duration.as_secs_f64())
+}
+
+/// The seam after each of `n_inputs` concat inputs (`[intro card]`, the
+/// clips, `[outro card]`) as the concat stage renders it, `(xfade name,
+/// seconds)`, plus how many are near-cuts after a speed-ramped clip.
+/// `xfade` is `(name, seconds)` on the crossfade path: every seam
+/// crossfades, except that the one after a speed-ramped clip collapses to a
+/// near-cut so the ramp itself is the visible transition (a Reels-style
+/// whip-up rather than a crossfade that masks the speed change). In
+/// hard-cut mode (`None`) every seam, the cards' included, is a straight
+/// cut of 0 s.
+fn concat_seams(
+    n_inputs: usize,
+    has_intro: bool,
+    seg_ramps: &[Option<crate::video_renderer::SpeedRamp>],
+    xfade: Option<(&str, f32)>,
+) -> (Vec<(String, f32)>, u32) {
+    let n_seams = n_inputs.saturating_sub(1);
+    let Some((name, secs)) = xfade else {
+        return (vec![("cut".to_string(), 0.0); n_seams], 0);
+    };
+    let intro_count = usize::from(has_intro);
+    let mut ramp_cuts = 0u32;
+    let seams = (0..n_seams)
+        .map(|k| {
+            // Is the OUTGOING side at position k a segment with an
+            // outgoing ramp? If so, collapse the seam to a near-cut.
+            let ramped = k
+                .checked_sub(intro_count)
+                .and_then(|i| seg_ramps.get(i))
+                .is_some_and(|r| r.is_some());
+            let d = if ramped {
+                ramp_cuts += 1;
+                // See HARD_CUT_XFADE_SECS: just above one AAC frame so the
+                // audio chain doesn't truncate, yet short enough to feel
+                // like a hard cut and keep the speed-ramp flash visible.
+                HARD_CUT_XFADE_SECS
+            } else {
+                secs
+            };
+            (name.to_string(), d)
+        })
+        .collect();
+    (seams, ramp_cuts)
+}
+
+/// Seam widths as the renderer applies them, for the chain layout:
+/// crossfades are raised to `MIN_XFADE_SECS` (as `concat_with_xfade` does),
+/// straight cuts stay 0.
+fn layout_seams(seams: &[(String, f32)]) -> Vec<f64> {
+    seams
+        .iter()
+        .map(|(_, d)| if *d > 0.0 { d.max(crate::video_renderer::MIN_XFADE_SECS) as f64 } else { 0.0 })
+        .collect()
+}
+
+/// How the concat stage joins the body: `[intro card]`, the clips, `[outro
+/// card]` on both paths — crossfaded, or with straight cuts in hard-cut mode
+/// — with the project fades over the whole of it. The layout and the items
+/// come from the same input list, so the output timeline describes exactly
+/// what [`BodyConcat::render`] encodes.
+struct BodyConcat {
+    /// Every concat input in output order, `(path, on-disk seconds)`.
+    inputs: Vec<(Utf8PathBuf, f32)>,
+    /// The seam after each input, `(xfade name, seconds)`; 0 s in hard-cut
+    /// mode (see [`concat_seams`]).
+    seams: Vec<(String, f32)>,
+    /// Near-cuts after speed-ramped clips (crossfade path only).
+    ramp_cuts: u32,
+    layout: crate::output_timeline::ChainLayout,
+    items: Vec<crate::output_timeline::ChainItem>,
+    /// `(name, seconds)` on the crossfade path, `None` in hard-cut mode.
+    xfade: Option<(String, f32)>,
+    fade_in_secs: f32,
+    fade_out_secs: f32,
+}
+
+impl BodyConcat {
+    /// `intro` / `outro` are the rendered card-mode cards (overlay cards
+    /// don't join the chain) and `clips` the normalized clips, each with its
+    /// probed duration; `segments` / `seg_ramps` / `burst` describe the clips
+    /// for the timeline (see [`chain_items`]). `fades` is `[project]`
+    /// `(fade_in, fade_out)`.
+    #[allow(clippy::too_many_arguments)]
+    fn plan(
+        intro: Option<(Utf8PathBuf, f32)>,
+        clips: Vec<(Utf8PathBuf, f32)>,
+        outro: Option<(Utf8PathBuf, f32)>,
+        segments: &[Segment],
+        seg_ramps: &[Option<crate::video_renderer::SpeedRamp>],
+        burst: Option<(usize, &[Segment], &[f32])>,
+        xfade: Option<(&str, f32)>,
+        fades: (f32, f32),
+        fps: u32,
+    ) -> Self {
+        let (has_intro, has_outro) = (intro.is_some(), outro.is_some());
+        let inputs: Vec<(Utf8PathBuf, f32)> = intro.into_iter().chain(clips).chain(outro).collect();
+        let (seams, ramp_cuts) = concat_seams(inputs.len(), has_intro, seg_ramps, xfade);
+        let layout = crate::output_timeline::ChainLayout::new(
+            &inputs.iter().map(|(_, d)| *d as f64).collect::<Vec<_>>(),
+            &layout_seams(&seams),
+            fps,
+        );
+        let items = chain_items(segments, seg_ramps, burst, has_intro, has_outro);
+        BodyConcat {
+            inputs,
+            seams,
+            ramp_cuts,
+            layout,
+            items,
+            xfade: xfade.map(|(n, d)| (n.to_string(), d)),
+            fade_in_secs: fades.0,
+            fade_out_secs: fades.1,
+        }
+    }
+
+    /// Hard-cut mode: each input with exactly the frames the layout (and so
+    /// the output timeline) gives it.
+    fn framed_inputs(&self) -> Vec<(Utf8PathBuf, u32)> {
+        self.inputs
+            .iter()
+            .zip(&self.layout.len_frames)
+            .map(|((p, _), &f)| (p.clone(), f))
+            .collect()
+    }
+
+    /// One line for the run log.
+    fn describe(&self) -> String {
+        use crate::output_timeline::ChainItem;
+        let intro = matches!(self.items.first(), Some(ChainItem::IntroCard));
+        let outro = matches!(self.items.last(), Some(ChainItem::OutroCard));
+        let cards = match (intro, outro) {
+            (true, true) => " + intro and outro cards",
+            (true, false) => " + intro card",
+            (false, true) => " + outro card",
+            (false, false) => "",
+        };
+        let n_clips = self.inputs.len() - usize::from(intro) - usize::from(outro);
+        match &self.xfade {
+            Some((name, secs)) => format!(
+                "concat with xfade ({n_clips} clips{cards}, {name} × {secs:.2}s, {} hard-cut after ramps)",
+                self.ramp_cuts
+            ),
+            None => format!(
+                "concat with hard cuts ({n_clips} clips{cards}; fade in {:.2}s, out {:.2}s)",
+                self.fade_in_secs, self.fade_out_secs
+            ),
+        }
+    }
+
+    /// Encode the body: the crossfade chain, or the straight-cut concat
+    /// holding every input to its timeline frames.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        &self,
+        runner: &dyn FfmpegRunner,
+        width: u32,
+        height: u32,
+        fps: u32,
+        crf: u32,
+        hw: &HwConfig,
+        body: &Utf8Path,
+    ) -> Result<()> {
+        if self.xfade.is_some() {
+            crate::video_renderer::concat_with_xfade(
+                runner,
+                &self.inputs,
+                &self.seams,
+                width,
+                height,
+                fps,
+                crf,
+                self.fade_in_secs,
+                self.fade_out_secs,
+                hw,
+                body,
+            )
+            .context("xfade concat stage")
+        } else {
+            crate::video_renderer::concat_with_cuts(
+                runner,
+                &self.framed_inputs(),
+                width,
+                height,
+                fps,
+                crf,
+                self.fade_in_secs,
+                self.fade_out_secs,
+                hw,
+                body,
+            )
+            .context("hard-cut concat stage")
+        }
+    }
+}
+
+/// Where the beat lock starts the footage: after the intro card (its
+/// on-chain length, see [`chain_card_secs`]) whose outgoing seam is `seam`
+/// (0 in hard-cut mode), else at 0. The card's length moves by at most half
+/// a beat so the footage comes in on a beat; the second value is that
+/// length when it moved.
+fn beat_lock_start(
+    intro_card_secs: Option<f64>,
+    seam: f64,
+    beats: &[f32],
+    beat_interval_secs: f64,
+    fps: u32,
+) -> (crate::beat_lock::LockStart, Option<f64>) {
+    use crate::beat_lock::{lock_card_end, LockStart};
+    match intro_card_secs {
+        Some(d) => {
+            let len = lock_card_end(d, seam, beats, beat_interval_secs, fps);
+            (
+                LockStart { output_secs: len - seam, seam_in_secs: seam },
+                ((len - d).abs() > 1e-6).then_some(len),
+            )
+        }
+        None => (LockStart { output_secs: 0.0, seam_in_secs: 0.0 }, None),
+    }
+}
+
+/// The seam after (pre-fold) clip `i` of `n` for the beat lock; must match
+/// the concat stage's per-seam widths ([`concat_seams`]). `xfade` is the
+/// crossfade on the crossfade path, `None` in hard-cut mode, where every
+/// seam is a straight cut. Cuts between beat-burst clips are straight too,
+/// and a speed-ramped clip's seam is a near-cut. The last clip's cut into an
+/// outro card is locked as well; `None` when the clip ends the video.
+fn lock_seam_out(
+    i: usize,
+    n: usize,
+    xfade: Option<f64>,
+    ramped: bool,
+    inside_burst: bool,
+    outro_card: bool,
+) -> Option<f64> {
+    let near_cut = HARD_CUT_XFADE_SECS.max(crate::video_renderer::MIN_XFADE_SECS) as f64;
+    if i + 1 < n {
+        Some(match xfade {
+            None => 0.0,
+            Some(_) if inside_burst => 0.0,
+            Some(_) if ramped => near_cut,
+            Some(w) => w,
+        })
+    } else if outro_card {
+        Some(xfade.unwrap_or(0.0))
+    } else {
+        None
+    }
+}
+
+/// What each concat input is, for the output timeline: `[intro card]`, one
+/// item per (folded) segment — the beat-burst with its own clips, `burst`
+/// being `(segment index, pre-fold clips, on-disk clip durations)` — then
+/// `[outro card]`.
+fn chain_items(
+    segments: &[Segment],
+    seg_ramps: &[Option<crate::video_renderer::SpeedRamp>],
+    burst: Option<(usize, &[Segment], &[f32])>,
     has_intro: bool,
     has_outro: bool,
-    /// (concat input index, sub-clip durations) of a folded beat-burst.
-    burst: Option<(usize, Vec<f32>)>,
+) -> Vec<crate::output_timeline::ChainItem> {
+    use crate::output_timeline::{ChainItem, ClipSource};
+    let source = |i: usize, s: &Segment, ramp| ClipSource {
+        segment_index: i,
+        source_id: s.source_id.clone(),
+        source_path: s.chapter_path.clone(),
+        source_in_secs: s.in_chapter_start_secs,
+        duration_secs: s.duration_secs,
+        ramp,
+    };
+    let mut items = Vec::with_capacity(segments.len() + 2);
+    if has_intro {
+        items.push(ChainItem::IntroCard);
+    }
+    for (i, s) in segments.iter().enumerate() {
+        match burst {
+            Some((bs, parts, durs)) if bs == i && !parts.is_empty() => items.push(ChainItem::Burst(
+                parts
+                    .iter()
+                    .enumerate()
+                    .map(|(k, p)| {
+                        let d = durs.get(k).map_or(p.duration_secs, |&d| d as f64);
+                        (source(i, p, None), d)
+                    })
+                    .collect(),
+            )),
+            _ => items.push(ChainItem::Clip(source(i, s, seg_ramps.get(i).copied().flatten()))),
+        }
+    }
+    if has_outro {
+        items.push(ChainItem::OutroCard);
+    }
+    items
 }
 
 struct BeatSyncInputs<'a> {
     audio: &'a crate::audio_analysis::AnalyzedAudio,
-    concat: &'a ConcatLayout,
+    timeline: &'a crate::output_timeline::OutputTimeline,
     loop_plan: crate::video_renderer::SoundtrackLoopPlan,
     body_secs: f32,
     fade_out_secs: f32,
@@ -2511,16 +2750,10 @@ fn describe_beat_grid(g: &crate::audio_analysis::BeatGridFit) -> String {
 /// check. Measurement failures are logged, never fatal.
 fn check_beat_sync(i: BeatSyncInputs<'_>) -> Option<crate::beat_sync::BeatSyncReport> {
     use crate::beat_sync::{
-        beats_in_output, measure_audio_offset, pick_reference_window, planned_cuts, score_cuts,
+        beats_in_output, measure_audio_offset, pick_reference_window, score_cuts,
         OFFSET_MIN_CONFIDENCE,
     };
-    let cuts = planned_cuts(
-        &i.concat.input_durs,
-        &i.concat.seam_durs,
-        i.concat.has_intro,
-        i.concat.has_outro,
-        i.concat.burst.as_ref().map(|(idx, d)| (*idx, d.as_slice())),
-    );
+    let cuts = i.timeline.cuts();
     if cuts.is_empty() {
         return None;
     }
@@ -2582,79 +2815,6 @@ fn check_beat_sync(i: BeatSyncInputs<'_>) -> Option<crate::beat_sync::BeatSyncRe
     }
     Some(report)
 }
-
-/// Compute the total output duration after intro/outro and xfade overlaps.
-fn compute_total_output(
-    seg_durs: &[f32],
-    intro_dur: f32,
-    outro_dur: f32,
-    use_transitions: bool,
-    trans_dur: f32,
-) -> f32 {
-    let raw: f32 = seg_durs.iter().sum::<f32>() + intro_dur + outro_dur;
-    if !use_transitions || trans_dur <= 0.0 {
-        return raw;
-    }
-    let inputs = seg_durs.len() as f32
-        + if intro_dur > 0.0 { 1.0 } else { 0.0 }
-        + if outro_dur > 0.0 { 1.0 } else { 0.0 };
-    let overlaps = (inputs - 1.0).max(0.0);
-    (raw - overlaps * trans_dur).max(0.0)
-}
-
-/// Compute each segment's `(output_start, visible_duration)` in the rendered
-/// video timeline. With transitions, intro/outro and xfade overlaps shift the
-/// segment offsets; without transitions, segments concat directly.
-fn compute_segment_output_layout(
-    segments: &[Segment],
-    intro_dur: f32,
-    use_transitions: bool,
-    trans_dur: f32,
-) -> (Vec<f32>, Vec<f32>) {
-    let n = segments.len();
-    let mut starts = Vec::with_capacity(n);
-    let durs: Vec<f32> = segments.iter().map(|s| s.duration_secs as f32).collect();
-    if !use_transitions || trans_dur <= 0.0 {
-        // Hard concat: segment k starts at sum of preceding durations.
-        let mut cum = 0.0_f32;
-        for d in &durs {
-            starts.push(cum);
-            cum += *d;
-        }
-        return (starts, durs);
-    }
-    // With xfade: in the input list, intro is index 0 (if present), then
-    // segments. After all xfades, segment k starts in the output at
-    //   intro_dur + (k * (clip_len - trans_dur))   for uniform clip_len
-    // — but more generally, account for variable durations.
-    // Output offset of input k (1-indexed past intro) is:
-    //   sum(durations of inputs 0..k) - k * trans_dur.
-    //
-    // The "segment fully visible" interval is [offset+T, offset+D-T] for
-    // middle segments. We expose the full segment-input window
-    // [offset, offset + D] so the duck ramp can encroach into the xfade —
-    // that gives a more natural feel than hard-bounded ducks.
-    let intro_count = if intro_dur > 0.0 { 1 } else { 0 };
-    for k in 0..n {
-        // Input index in the xfade chain.
-        let input_idx = intro_count + k;
-        // sum of durations up to input_idx.
-        let mut sum = 0.0_f32;
-        if intro_count == 1 {
-            sum += intro_dur;
-        }
-        for (j, d) in durs.iter().take(k).enumerate() {
-            let _ = j;
-            sum += *d;
-        }
-        let off = sum - input_idx as f32 * trans_dur;
-        starts.push(off);
-    }
-    // Visible duration for ducking purposes: keep the full segment duration —
-    // the ramp inside `mux_with_ducking` rolls off naturally at the edges.
-    (starts, durs)
-}
-
 
 /// Distribute `images` at evenly-spaced positions among the ordered `videos`.
 /// Each image i is inserted just before the video at index
@@ -2811,6 +2971,280 @@ mod tests {
             vec!["img:dawn", "vid1", "img:noon", "vid2"],
             "strict_chronological must interleave images & videos by real timestamps"
         );
+    }
+
+    fn card(mode: &str) -> crate::project_config::TextCard {
+        toml::from_str(&format!("duration = \"3s\"\nmode = \"{mode}\"")).unwrap()
+    }
+
+    #[test]
+    fn only_rendered_cards_join_the_chain() {
+        // An overlay intro is drawn on the first clip and may not shift the
+        // planned picks; a card-mode card is its own concat input.
+        assert_eq!(chain_card_secs(Some(&card("card"))), Some(3.0));
+        assert_eq!(chain_card_secs(Some(&card("overlay"))), None);
+        assert_eq!(chain_card_secs(None), None);
+    }
+
+    #[test]
+    fn hard_cut_planning_counts_the_intro_card() {
+        // Hard-cut mode used to drop the cards, so the beat-burst planner
+        // placed picks as if the footage started at 0. Now the card is in the
+        // chain with a straight cut: the footage starts right after it.
+        let p = crate::output_timeline::predict_layout(
+            chain_card_secs(Some(&card("card"))),
+            &[2.0, 2.0, 2.0],
+            None,
+            0.0,
+            true,
+            30,
+        );
+        assert!((p.body_start - 3.0).abs() < 1e-9, "{p:?}");
+        assert!((p.clip_spans[1].0 - 5.0).abs() < 1e-9 && (p.total - 9.0).abs() < 1e-9, "{p:?}");
+    }
+
+    #[test]
+    fn hard_cut_seams_keep_the_cards_with_straight_cuts() {
+        use crate::video_renderer::SpeedRamp;
+        let ramp = SpeedRamp { duration_secs: 0.6, factor: 3.0, flash: false };
+        let ramps = vec![None, Some(ramp), None];
+        // Intro card, three clips (the middle one ramped), outro card: four
+        // seams, every one a straight cut, the cards' included.
+        let (seams, ramp_cuts) = concat_seams(5, true, &ramps, None);
+        assert_eq!(seams.len(), 4);
+        assert!(seams.iter().all(|(_, d)| *d == 0.0), "{seams:?}");
+        assert_eq!(ramp_cuts, 0);
+        assert_eq!(layout_seams(&seams), vec![0.0; 4]);
+        // Crossfade path: only the seam after the ramped clip (input 2)
+        // collapses to the near-cut.
+        let (seams, ramp_cuts) = concat_seams(5, true, &ramps, Some(("fade", 0.3)));
+        let widths: Vec<f32> = seams.iter().map(|(_, d)| *d).collect();
+        assert_eq!(widths, vec![0.3, 0.3, HARD_CUT_XFADE_SECS, 0.3]);
+        assert_eq!(ramp_cuts, 1);
+        assert!(seams.iter().all(|(n, _)| n == "fade"));
+    }
+
+    #[test]
+    fn hard_cut_beat_lock_reaches_the_outro_card() {
+        // The cut into an outro card is locked in hard-cut mode too; it used
+        // to be left wherever the last clip happened to end.
+        assert_eq!(lock_seam_out(2, 3, None, false, false, true), Some(0.0));
+        assert_eq!(lock_seam_out(2, 3, None, false, false, false), None);
+        // Every hard-cut seam is a straight cut, ramped or not.
+        assert_eq!(lock_seam_out(0, 3, None, true, false, true), Some(0.0));
+        // Crossfade path, unchanged: crossfade, near-cut after a ramp,
+        // straight cuts inside the burst.
+        let near_cut = HARD_CUT_XFADE_SECS.max(crate::video_renderer::MIN_XFADE_SECS) as f64;
+        assert_eq!(lock_seam_out(2, 3, Some(0.3), false, false, true), Some(0.3));
+        assert_eq!(lock_seam_out(0, 3, Some(0.3), true, false, true), Some(near_cut));
+        assert_eq!(lock_seam_out(0, 3, Some(0.3), false, true, true), Some(0.0));
+    }
+
+    #[test]
+    fn hard_cut_chain_with_cards_cuts_on_the_beat() {
+        // Hard-cut mode end to end through the pure stages: beat-lock the
+        // intro card and six 4-beat clips at 132 BPM with zero-length seams,
+        // lay the chain out (intro, clips, outro) as the concat stage does,
+        // build the manifest timeline and score its cuts like the sync report.
+        use crate::beat_lock::{lock_cuts, LockClip};
+        const FPS: u32 = 30;
+        let interval = 60.0 / 132.0;
+        let grid: Vec<f32> = (0..200).map(|k| 0.12 + k as f32 * interval as f32).collect();
+        let (start, card_len) = beat_lock_start(Some(3.0), 0.0, &grid, interval, FPS);
+        let intro_len = card_len.unwrap_or(3.0);
+        assert!((start.output_secs - intro_len).abs() < 1e-9 && start.seam_in_secs == 0.0);
+        let n = 6;
+        let clips: Vec<LockClip> = (0..n)
+            .map(|i| LockClip {
+                planned_secs: 4.0 * interval,
+                in_start_secs: 5.0,
+                source_end_secs: Some(60.0),
+                tail_extra_secs: 0.0,
+                seam_out_secs: lock_seam_out(i, n, None, false, false, true),
+                seam_out_without_ramp: None,
+            })
+            .collect();
+        let locked = lock_cuts(&clips, start, &grid, FPS);
+        assert!(locked.iter().all(|l| l.on_beat), "{locked:?}");
+
+        let segs: Vec<Segment> =
+            locked.iter().map(|l| Segment { duration_secs: l.duration_secs, ..seg(0.5) }).collect();
+        let ramps = vec![None; n];
+        let mut durs = vec![intro_len];
+        durs.extend(segs.iter().map(|s| s.duration_secs));
+        durs.push(2.0);
+        let (seams, _) = concat_seams(durs.len(), true, &ramps, None);
+        let layout = crate::output_timeline::ChainLayout::new(&durs, &layout_seams(&seams), FPS);
+        let timeline = crate::output_timeline::OutputTimeline::build(
+            &layout,
+            &chain_items(&segs, &ramps, None, true, true),
+        );
+
+        // The cards are in the timeline, joined by straight cuts.
+        let intro = timeline.intro.as_ref().expect("intro card kept");
+        let outro = timeline.outro.as_ref().expect("outro card kept");
+        assert_eq!(intro.transition_secs, 0.0);
+        assert_eq!(intro.cut_secs, intro.output_end_secs);
+        assert_eq!(timeline.clips[0].start_frame, intro.end_frame);
+        assert_eq!(timeline.clips[n - 1].end_frame, outro.start_frame);
+        assert_eq!(outro.end_frame, timeline.frames);
+        // Clips play back to back: each cut is the next clip's first frame.
+        for w in timeline.clips.windows(2) {
+            assert_eq!(w[0].end_frame, w[1].start_frame);
+            assert_eq!(w[0].cut_out_secs, w[1].output_start_secs);
+            assert_eq!(w[1].transition_in_secs, 0.0);
+        }
+        // Intro → footage, five clip cuts, footage → outro: all on the beat,
+        // within half a frame.
+        let cuts = timeline.cuts();
+        assert_eq!(cuts.len(), n + 1);
+        let report = crate::beat_sync::score_cuts(&cuts, &grid, 0.0, interval as f32, FPS).unwrap();
+        assert_eq!(report.within_tolerance, report.n_cuts);
+        assert!(report.max_abs_error_ms <= 1000.0 / FPS as f32 / 2.0 + 0.1, "{report:?}");
+    }
+
+    /// Records the ffmpeg calls instead of running them.
+    #[derive(Default)]
+    struct RecordingRunner(std::sync::Mutex<Vec<Vec<String>>>);
+    impl FfmpegRunner for RecordingRunner {
+        fn run(&self, args: &[&str]) -> Result<()> {
+            self.0.lock().unwrap().push(args.iter().map(|s| s.to_string()).collect());
+            Ok(())
+        }
+        fn version(&self) -> Result<String> {
+            Ok("recording".into())
+        }
+    }
+
+    /// Intro card (3 s), three clips (the middle one speed-ramped), outro
+    /// card (2 s) at 30 fps, as the concat stage plans them.
+    fn body_concat_with_cards(xfade: Option<(&str, f32)>) -> BodyConcat {
+        use crate::video_renderer::SpeedRamp;
+        let ramp = SpeedRamp { duration_secs: 0.6, factor: 3.0, flash: false };
+        let clips: Vec<(Utf8PathBuf, f32)> =
+            vec![("seg_000.mp4".into(), 2.0), ("seg_001.mp4".into(), 2.5), ("seg_002.mp4".into(), 1.5)];
+        BodyConcat::plan(
+            Some(("intro.mp4".into(), 3.0)),
+            clips,
+            Some(("outro.mp4".into(), 2.0)),
+            &[seg(0.4), seg(0.5), seg(0.6)],
+            &[None, Some(ramp), None],
+            None,
+            xfade,
+            (0.2, 1.5),
+            30,
+        )
+    }
+
+    fn render_args(plan: &BodyConcat, dir: &str) -> Vec<String> {
+        let runner = RecordingRunner::default();
+        let hw = HwConfig::resolve(HwSupport::default(), EncoderPref::Libx264);
+        let body = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(dir).join("body.mp4")).unwrap();
+        plan.render(&runner, 64, 36, 30, 20, &hw, &body).unwrap();
+        let calls = runner.0.into_inner().unwrap();
+        assert_eq!(calls.len(), 1, "one ffmpeg pass");
+        calls.into_iter().next().unwrap()
+    }
+
+    const CARD_CHAIN: [&str; 5] = ["intro.mp4", "seg_000.mp4", "seg_001.mp4", "seg_002.mp4", "outro.mp4"];
+
+    #[test]
+    fn hard_cut_body_concat_keeps_both_cards_and_the_project_fades() {
+        // Hard-cut mode used to hand the clips alone to a stream-copy concat:
+        // the cards were rendered but never joined, and the project fades
+        // never applied. The concat stage's plan must hold [intro card],
+        // every clip, [outro card] with straight cuts, encode exactly that
+        // with the fades, and give the timeline the same list.
+        use crate::output_timeline::{ChainItem, OutputTimeline};
+        let plan = body_concat_with_cards(None);
+        let paths: Vec<&str> = plan.inputs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, CARD_CHAIN);
+        assert!(plan.seams.iter().all(|(_, d)| *d == 0.0), "{:?}", plan.seams);
+        let framed = plan.framed_inputs();
+        assert_eq!((plan.layout.len(), plan.items.len(), framed.len()), (5, 5, 5));
+        assert!(matches!(plan.items[0], ChainItem::IntroCard));
+        assert!(plan.items[1..4].iter().all(|i| matches!(i, ChainItem::Clip(_))));
+        assert!(matches!(plan.items[4], ChainItem::OutroCard));
+        let frames: Vec<u32> = framed.iter().map(|(_, f)| *f).collect();
+        assert_eq!(frames, vec![90, 60, 75, 45, 60]);
+        assert_eq!(plan.layout.start_frames, vec![0, 90, 150, 225, 270]);
+
+        // The timeline is built from the frames the concat keeps.
+        let timeline = OutputTimeline::build(&plan.layout, &plan.items);
+        assert_eq!(timeline.frames, 330);
+        let intro = timeline.intro.as_ref().expect("intro card in the timeline");
+        let outro = timeline.outro.as_ref().expect("outro card in the timeline");
+        assert_eq!((intro.start_frame, intro.end_frame, intro.transition_secs), (0, 90, 0.0));
+        assert_eq!((outro.start_frame, outro.end_frame, outro.transition_secs), (270, 330, 0.0));
+
+        // What the stage encodes: both cards, in order, each held to its
+        // timeline frames, straight cuts, the fades over the whole 11 s.
+        let args = render_args(&plan, "vc_body_concat_cut");
+        let inputs: Vec<&str> = args.windows(2).filter(|w| w[0] == "-i").map(|w| w[1].as_str()).collect();
+        assert_eq!(inputs, CARD_CHAIN);
+        let fc = args.iter().find(|a| a.contains("concat=")).expect("filter graph");
+        assert!(!fc.contains("xfade"), "{fc}");
+        assert!(fc.contains("concat=n=5:v=1:a=0[vcat]"), "{fc}");
+        for (k, f) in frames.iter().enumerate() {
+            assert!(fc.contains(&format!("[{k}:v]setsar=1,trim=end_frame={f},")), "{fc}");
+        }
+        assert!(fc.contains("fade=t=in:st=0:d=0.200000,fade=t=out:st=9.500000:d=1.500000"), "{fc}");
+        assert!(plan.describe().starts_with("concat with hard cuts (3 clips + intro and outro cards;"), "{}", plan.describe());
+    }
+
+    #[test]
+    fn crossfade_body_concat_keeps_the_same_chain() {
+        // The crossfade path plans from the same list: the cards, the
+        // crossfades, a near-cut after the ramped clip, the fades.
+        let plan = body_concat_with_cards(Some(("fade", 0.3)));
+        let paths: Vec<&str> = plan.inputs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, CARD_CHAIN);
+        let widths: Vec<f32> = plan.seams.iter().map(|(_, d)| *d).collect();
+        assert_eq!(widths, vec![0.3, 0.3, HARD_CUT_XFADE_SECS, 0.3]);
+        assert_eq!((plan.layout.len(), plan.items.len()), (5, 5));
+        let args = render_args(&plan, "vc_body_concat_xfade");
+        let inputs: Vec<&str> = args.windows(2).filter(|w| w[0] == "-i").map(|w| w[1].as_str()).collect();
+        assert_eq!(inputs, CARD_CHAIN);
+        let fc = args.iter().find(|a| a.contains("xfade=")).expect("xfade chain");
+        assert_eq!(fc.matches("xfade=transition=").count(), 4, "{fc}");
+        assert!(fc.contains("fade=t=in:st=0") && fc.contains("fade=t=out"), "{fc}");
+        assert!(plan.describe().starts_with("concat with xfade (3 clips + intro and outro cards, fade × 0.30s, 1 hard-cut"), "{}", plan.describe());
+    }
+
+    #[test]
+    fn chain_items_place_ramped_clips_and_burst_cuts_exactly() {
+        use crate::output_timeline::{ChainLayout, OutputTimeline};
+        use crate::video_renderer::SpeedRamp;
+        let clip = |path: &str, start: f64, dur: f64| Segment {
+            chapter_path: path.into(),
+            in_chapter_start_secs: start,
+            duration_secs: dur,
+            ..seg(0.5)
+        };
+        // Intro card, a speed-ramped clip, a plain clip, a folded two-cut burst.
+        let segs = vec![clip("a.mp4", 10.0, 2.0), clip("b.mp4", 5.0, 2.0), clip("work/beat_burst.mp4", 0.0, 2.0)];
+        let parts = vec![clip("p.mp4", 30.0, 1.0), clip("q.mp4", 40.0, 1.0)];
+        let ramp = SpeedRamp { duration_secs: 0.6, factor: 3.0, flash: false };
+        let ramps = vec![Some(ramp), None, None];
+        let items = chain_items(&segs, &ramps, Some((2, &parts, &[1.0, 1.0])), true, false);
+        assert_eq!(items.len(), 4);
+        // The ramped clip's seam is a 0.1 s near-cut, the others 0.4 s.
+        let layout = ChainLayout::new(&[3.0, 2.0, 2.0, 2.0], &[0.4, 0.1, 0.4], 30);
+        let t = OutputTimeline::build(&layout, &items);
+        let (starts, durs) = t.segment_windows(3);
+        // Assuming every seam overlaps 0.4 s (what duck placement used to do)
+        // puts the burst at 5.8 s; the near-cut overlaps 0.3 s less, so it —
+        // and anything ducked there — really starts at 6.1 s.
+        assert!((starts[2] - 6.1).abs() < 1e-4, "{starts:?}");
+        assert!((starts[1] - 4.5).abs() < 1e-4 && (durs[1] - 2.0).abs() < 1e-4, "{starts:?} {durs:?}");
+        // The burst's cuts carry their own footage, not the folded file.
+        let burst: Vec<_> = t.clips.iter().filter(|c| c.segment_index == 2).collect();
+        assert_eq!(burst.len(), 2);
+        assert_eq!(burst[1].source_path.as_str(), "q.mp4");
+        assert!((burst[1].source_in_secs - 40.0).abs() < 1e-9);
+        assert!((burst[0].cut_in_secs - 6.3).abs() < 1e-4 && (burst[1].cut_in_secs - 7.1).abs() < 1e-4);
+        // The ramped clip reads its ramp tail too.
+        assert!((t.clips[0].source_out_secs - (10.0 + 2.0 + 0.4)).abs() < 1e-6);
     }
 
     #[test]
