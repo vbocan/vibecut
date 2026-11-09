@@ -636,6 +636,7 @@ mod tests {
                 duration_secs: duration,
                 creation_time: creation.map(str::to_string),
                 blake3: None,
+                color: None,
             }],
             total_duration_secs: duration,
         }

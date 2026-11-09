@@ -562,6 +562,7 @@ mod tests {
                 duration_secs: dur,
                 creation_time: None,
                 blake3: None,
+                color: None,
             }],
             total_duration_secs: dur,
         }

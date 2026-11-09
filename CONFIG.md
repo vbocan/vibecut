@@ -88,6 +88,44 @@ start = "1m12s"
 end   = "1m30s"
 ```
 
+**GoPro chapters.** Long GoPro recordings are split into chapter files;
+the files of one recording in one folder are stitched back into one
+continuous source, in chapter order. Both naming schemes are recognised
+(any letter case, `.MP4` / `.mp4`):
+
+| Camera | Chapter 1 | Chapter 2 | Chapter 3 | Source id |
+|---|---|---|---|---|
+| Newer, HEVC | `GX010042.MP4` | `GX020042.MP4` | `GX030042.MP4` | `0042` |
+| Newer, H.264 | `GH010042.MP4` | `GH020042.MP4` | `GH030042.MP4` | `0042` |
+| Older | `GOPR0042.MP4` | `GP010042.MP4` | `GP020042.MP4` | `0042` |
+
+The source id (used by `[selection].source_weights` and
+`[multi_angle].groups`) is the 4-digit recording number. When two
+recordings would share it — an older and a newer camera both at 0042,
+or two cards in different folders — they stay separate sources and
+get new ids, in up to three steps until every id is unique:
+
+1. the first chapter's file name, lowercased: `gopr0042`, `gx010042`;
+2. prefixed with the first folder that differs between them:
+   `carda-gx010042` and `cardb-gx010042` for two cards copied as
+   `cardA/DCIM/100GOPRO/…` and `cardB/DCIM/100GOPRO/…`, `day2-gx010042`
+   for a copy in a `day2/` subfolder;
+3. numbered in path order (`gx010042`, `gx010042-2`) when even the
+   folders don't tell them apart.
+
+Standalone clips with the same file name (`a/clip.mp4`, `b/clip.mp4`)
+go through the same steps (`a-clip`, `b-clip`); ids that differ only in
+letter case count as the same. Generated ids use only lowercase letters,
+digits, `_` and `-` (other characters become `-`, so `Card A` →
+`card-a`), which is what "more of / less of clip …" in the app accepts.
+Ids that don't clash keep their usual form.
+
+GoPro's low-res proxies (`.LRV`: `GL010042.LRV` in the GX / GH scheme,
+`GOPR0042.LRV` / `GP010042.LRV` in the older one) and thumbnails
+(`.THM`) are never sources, even if `include` names their extension or
+a proxy was renamed to `GL…MP4`; DJI `.LRF` proxies are skipped the
+same way.
+
 ---
 
 ## `[[outputs]]` (required, ≥ 1 entry)
@@ -635,6 +673,31 @@ because vidstab needs border pixels to absorb its corrections. Only
 enable when the source is HyperSmooth-Off, an older non-GoPro camera, or
 otherwise actually shaky.
 
+**HDR and 10-bit footage** (automatic, no key). Every clip is conformed
+to 8-bit BT.709 SDR. The probe reads each file's bit depth, transfer
+and primaries, and the run log lists the clips that get converted:
+
+- **HLG** (`arib-std-b67`, GoPro "HLG HDR") and **PQ** (`smpte2084`,
+  HDR10) on BT.2020 are tone-mapped: `zscale` linearises (100-nit
+  reference), converts BT.2020 → BT.709 primaries, `tonemap=mobius`
+  rolls the highlights off, `zscale` re-applies the BT.709 curve.
+- **SDR on BT.2020 primaries** is gamut-mapped to BT.709 with `zscale`.
+- **10-bit BT.709** (GoPro 10-bit, Flat, Log) only drops to 8-bit —
+  same pixels and cache files as before. Log / Flat footage is
+  SDR-tagged, so it is *not* auto-graded: put the camera's
+  Log → Rec.709 LUT in `lut` above.
+- **Fallback**: if ffmpeg lacks `zscale` or `tonemap`, the native
+  `colorspace` filter converts primaries and matrix to BT.709 and reads
+  the HDR curve as BT.2020 gamma — brightness about right for HLG but
+  colours still muted, flat and dim for PQ. A warning is logged. With
+  neither filter, HDR clips are left as-is (washed out). `zscale` needs
+  an ffmpeg built with zimg; the Debian and Ubuntu packages (dev
+  container, Docker image) are.
+
+The conversion happens before `lut`, so a creative LUT grades HDR clips
+the same way as the rest. Each chapter's probed colour info is recorded
+in the manifest (`sources[].chapters[].color`).
+
 ---
 
 ## ML signals
@@ -763,8 +826,10 @@ or building tooling on top of it:
   seed is logged so you can lock it in later).
 - **Cache fingerprinting.** Each rendered segment's filename includes a
   blake3 hash of `(source_path, in-chapter start, duration, width,
-  height, fps, crf, lut, stabilize, speed-ramp params)`. Toggling any of
-  these forces re-encode of the affected segments only. Visual analysis
+  height, fps, crf, lut, stabilize, speed-ramp params)`, plus the colour
+  conversion for HDR / BT.2020 clips only (SDR clips keep their old
+  hashes). Toggling any of these forces re-encode of the affected
+  segments only. Visual analysis
   results live in `<output_parent>/.vibecut-cache/` keyed by source
   hash + ffprobe metadata — that 22-min cold-start cost only happens once
   per source file.
