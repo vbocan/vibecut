@@ -17,6 +17,7 @@ pub mod reformat;
 pub mod render;
 pub mod sessions;
 pub mod vibes;
+pub mod watch;
 
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -63,6 +64,10 @@ pub fn api_router() -> Router<AppState> {
         .route("/music/file", get(music::serve_music_file))
         .route("/music/pick", get(music::pick_music))
         .route("/sessions", get(sessions::list_sessions))
+        .route("/watch", get(watch::get_watch).put(watch::put_watch))
+        .route("/watch/events", get(watch::events))
+        .route("/watch/{id}/dismiss", post(watch::dismiss))
+        .route("/watch/{id}/retry", post(watch::retry))
         .route("/ws/render/{job_id}", get(crate::ws::render_progress_ws))
 }
 

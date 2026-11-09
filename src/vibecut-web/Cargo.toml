@@ -32,6 +32,10 @@ axum = { workspace = true, features = ["ws"] }
 # follows.
 vibecut-ops = { path = "../vibecut-ops" }
 
+# The folder watcher's server-sent event stream (`GET /api/watch/events`)
+# is a `Stream`; already in the tree through vibecut-ops.
+futures-util = "0.3"
+
 # Frame bytes -> data URIs for /api/frames/*, the REST equivalent of
 # how vibecut-mcp base64-encodes inline MCP image content.
 base64 = "0.22"
