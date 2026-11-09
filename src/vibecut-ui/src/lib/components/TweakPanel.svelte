@@ -20,6 +20,7 @@
 	// a stop in flight) are aria-disabled, not disabled: a disabled button
 	// drops the keyboard focus onto the page the moment it's pressed.
 	const busy = $derived(s.feedbackBusy || s.stopping);
+	let panel: HTMLDivElement | undefined = $state();
 
 	function tryRun(t: (typeof TWEAKS)[number] | 'mix') {
 		if (busy) return;
@@ -70,7 +71,7 @@
 	}
 </script>
 
-<div class="tweaks" role="group" aria-labelledby="tweaks-h">
+<div class="tweaks" role="group" aria-labelledby="tweaks-h" bind:this={panel}>
 	<p class="eyebrow" id="tweaks-h">Make it…</p>
 	<button class="mix" type="button" aria-disabled={busy} onclick={() => tryRun('mix')}>
 		<span class="mix-icon" aria-hidden="true">⤨</span>
@@ -91,7 +92,7 @@
 			</button>
 		{/each}
 	</div>
-	<PendingChangeOffer from="tweaks" />
+	<PendingChangeOffer from="tweaks" returnFocus={() => panel?.querySelector<HTMLElement>('.mix') ?? null} />
 	{#if s.lastChanges.length > 0}
 		<ul class="changes" aria-label="Last change">
 			{#each s.lastChanges as c, i (i)}

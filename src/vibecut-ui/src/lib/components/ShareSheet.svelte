@@ -3,6 +3,7 @@
 	import { ApiError, outputFileUrl, reformat, reformatStatus } from '$lib/api';
 	import type { PlatformPreset, ReformatResult } from '$lib/api';
 	import { clock } from '$lib/vibes';
+	import { radiogroup } from '$lib/radiogroup';
 
 	// Decision 2: get the video out. Download, the phone's own share sheet
 	// where the browser supports sharing files, and a ready-to-paste caption
@@ -128,6 +129,17 @@
 		}
 	}
 
+	const versionNote = $derived.by(() => {
+		if (!chosenPlatform || !current) return '';
+		const label = chosenPlatform.label;
+		if (current.state === 'working') return `Making the ${label} version…`;
+		if (current.state === 'done') {
+			const r = current.result;
+			return `${label} version ready: ${r.width} by ${r.height}, ${megabytes(r.size_bytes)}.`;
+		}
+		return `Couldn’t make the ${label} version: ${current.error}`;
+	});
+
 	function megabytes(bytes: number): string {
 		return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
 	}
@@ -170,12 +182,15 @@
 
 	<section class="formats" aria-labelledby="formats-h">
 		<span class="eyebrow" id="formats-h">Make a version for</span>
-		<div class="platforms" role="group" aria-labelledby="formats-h">
+		<!-- One platform at a time: a radio group (arrows move, Space /
+		     Enter picks — picking starts a version, so arrows alone don't). -->
+		<div class="platforms" role="radiogroup" aria-labelledby="formats-h" use:radiogroup={{ selectOnMove: false }}>
 			{#each PLATFORMS as p (p.preset)}
 				<button
 					type="button"
 					class="platform"
-					aria-pressed={chosen === p.preset}
+					role="radio"
+					aria-checked={chosen === p.preset}
 					disabled={!s.outputPath}
 					onclick={() => makeVersion(p.preset)}
 				>
@@ -185,8 +200,10 @@
 				</button>
 			{/each}
 		</div>
+		<!-- Always on the page, so the outcome is read; not every percent. -->
+		<p class="sr-only" role="status">{versionNote}</p>
 		{#if chosenPlatform && current}
-			<div class="version" aria-live="polite">
+			<div class="version">
 				{#if current.state === 'working'}
 					{@const pct = Math.round(current.progress * 100)}
 					<div
@@ -396,7 +413,7 @@
 		background: rgba(255, 255, 255, 0.07);
 	}
 
-	.platform[aria-pressed='true'] {
+	.platform[aria-checked='true'] {
 		border-color: var(--accent);
 		background: rgba(255, 122, 69, 0.1);
 	}

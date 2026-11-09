@@ -657,8 +657,13 @@ def main() -> int:
         tab_to(page, lambda a: a["tag"] == "button" and a["name"].endswith("Calmer"), "'Calmer'")
         a = press(page, "Enter", settle=800)
         check(a is not None and a["name"].endswith("Calmer"), f"tweak: focus stays on 'Calmer' while it works ({a and a['name']!r})")
+        # Mid-render the tweaks stay live: a press offers "Stop and apply
+        # this instead" (see test/new_controls_keyboard.py), so the button
+        # doesn't report itself unavailable once the re-render runs.
+        page.wait_for_selector(".overlay", timeout=30000)
+        page.wait_for_timeout(500)
         busy = page.evaluate("document.activeElement.getAttribute('aria-disabled')")
-        check(busy == "true", f"tweak: ...which reports itself unavailable meanwhile (aria-disabled {busy!r})")
+        check(busy != "true", f"tweak: ...which stays available during the re-render (aria-disabled {busy!r})")
         rerender_done()
         a = active(page)
         check(a is not None and a["name"].endswith("Calmer"), f"tweak: ...and after the re-render ({a and a['name']!r})")

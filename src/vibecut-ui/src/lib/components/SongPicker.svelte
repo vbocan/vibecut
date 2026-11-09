@@ -11,6 +11,7 @@
 
 	let { compact = false }: { compact?: boolean } = $props();
 	const uid = $props.id();
+	let list: HTMLUListElement | undefined = $state();
 
 	const MOODS: { key: Track['mood'] | 'all'; label: string }[] = [
 		{ key: 'all', label: 'All' },
@@ -133,12 +134,15 @@
 			{/each}
 		</div>
 
-		{#if inStudio}<PendingChangeOffer from="song" />{/if}
+		{#if inStudio}<PendingChangeOffer
+				from="song"
+				returnFocus={() => list?.querySelector<HTMLElement>('[role="radio"][aria-checked="true"]') ?? null}
+			/>{/if}
 
 		<!-- In the Studio a pick re-renders, so arrows only move focus there
 		     and Space / Enter picks. "Let Vibecut pick" is the first choice
 		     of the same group, so exactly one choice is always checked. -->
-		<ul class="list" role="radiogroup" aria-label="Song" use:radiogroup={{ selectOnMove: !inStudio }}>
+		<ul class="list" role="radiogroup" aria-label="Song" use:radiogroup={{ selectOnMove: !inStudio }} bind:this={list}>
 			<li class="auto-row" role="none">
 				<button
 					type="button"
@@ -190,7 +194,16 @@
 							>
 						{/if}
 					</button>
-					<button type="button" class="pick" role="radio" aria-checked={isOn} onclick={() => choose(t.path)}>
+					<!-- The licence badge is in the name; its note (hover title for
+					     the mouse) is the description, for the keyboard too. -->
+					<button
+						type="button"
+						class="pick"
+						role="radio"
+						aria-checked={isOn}
+						aria-describedby="{uid}-lic-{i}"
+						onclick={() => choose(t.path)}
+					>
 						<span class="title">{t.title}</span>
 						<span class="facts">
 							<span class="mood {t.mood}">{t.mood}</span>
@@ -204,6 +217,9 @@
 								>{/if}
 						</span>
 					</button>
+					<span class="sr-only" id="{uid}-lic-{i}"
+						>{t.licence.note}{t.attribution_required ? ' Posting it needs a credit in the caption.' : ''}</span
+					>
 					<div class="wave">
 						<EnergyBars energy={t.energy} progress={isPlaying ? progress : 0} active={isPlaying} />
 					</div>

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
 	import { tellCreate, tellStudio } from '$lib/tellit';
+	import { keepFocus } from '$lib/focus';
 
 	// Plain-language requests. Simple ones ("shorter", "new song", "drop the
 	// bit at 0:42") are understood locally and work without an API key;
@@ -143,7 +144,17 @@
 	{:else if offer}
 		<p class="why">
 			{s.rendering ? 'Still rendering the last change.' : 'The last change is ready.'}
-			<button class="btn small offer" type="button" disabled={s.stopping} onclick={() => s.applyPendingChange()}>
+			<!-- aria-disabled while stopping keeps the focus on it; once the
+			     offer is gone, the focus goes back to the command field. -->
+			<button
+				class="btn small offer"
+				type="button"
+				aria-disabled={s.stopping}
+				use:keepFocus={() => document.getElementById('cmd-input')}
+				onclick={() => {
+					if (!s.stopping) void s.applyPendingChange();
+				}}
+			>
 				{s.stopping ? 'Stopping…' : s.rendering ? 'Stop and apply this instead' : 'Apply it now'}
 			</button>
 		</p>

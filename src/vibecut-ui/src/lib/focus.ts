@@ -19,20 +19,27 @@ export function focusTransient(el: HTMLElement): void {
 export type FocusFinder = (lost: HTMLElement | null) => HTMLElement | null;
 
 /**
- * Park the focus at the top of `<main>` and move it to what `find`
- * returns once that is on the page, unless the user has moved the focus
- * elsewhere meanwhile.
+ * Park the focus at the top of `<main>` — or of the open modal dialog the
+ * lost element was in, since nothing outside a modal can take the focus —
+ * and move it to what `find` returns once that is on the page (straight
+ * away when it already is), unless the user has moved the focus elsewhere
+ * meanwhile.
  */
-function parkUntil(find: () => HTMLElement | null) {
-	const main = document.getElementById('main');
-	if (!main) return;
-	focusTransient(main);
+function parkUntil(find: () => HTMLElement | null, dialog: HTMLElement | null = null) {
+	const park = dialog?.isConnected ? dialog : document.getElementById('main');
+	if (!park) return;
+	focusTransient(park);
+	const ready = find();
+	if (ready?.isConnected) {
+		ready.focus();
+		return;
+	}
 	const stop = () => {
 		observer.disconnect();
 		clearTimeout(timer);
 	};
 	const observer = new MutationObserver(() => {
-		if (document.activeElement !== main) return stop();
+		if (document.activeElement !== park) return stop();
 		const el = find();
 		if (!el) return;
 		stop();
@@ -59,9 +66,12 @@ export const keepFocus: Action<HTMLElement, FocusFinder> = (node, initial) => {
 	let find = initial;
 	let inside = false;
 	let last: HTMLElement | null = null;
+	/** The open modal dialog this element is in, seen while it had focus. */
+	let dialog: HTMLElement | null = null;
 	const onIn = (e: FocusEvent) => {
 		inside = true;
 		last = e.target as HTMLElement;
+		dialog = node.closest<HTMLElement>('dialog[open]');
 	};
 	const onOut = (e: FocusEvent) => {
 		// Without a related target the focus went nowhere: a click on the
@@ -84,11 +94,11 @@ export const keepFocus: Action<HTMLElement, FocusFinder> = (node, initial) => {
 			if (!inside) return;
 			const gone = () => !document.activeElement || document.activeElement === document.body;
 			const back = () => find(last);
-			if (gone()) parkUntil(back);
+			if (gone()) parkUntil(back, dialog);
 			// Still in the document: look again once it has been removed.
 			else if (node.contains(document.activeElement))
 				queueMicrotask(() => {
-					if (gone()) parkUntil(back);
+					if (gone()) parkUntil(back, dialog);
 				});
 		}
 	};

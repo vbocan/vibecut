@@ -2,12 +2,14 @@
 	import { onDestroy } from 'svelte';
 	import { appState as s } from '$lib/state.svelte';
 	import type { RenderProgress } from '$lib/api';
+	import { keepFocus } from '$lib/focus';
 
 	let {
 		compact = false,
 		onBack,
 		backLabel = 'Back'
 	}: { compact?: boolean; onBack?: () => void; backLabel?: string } = $props();
+	const uid = $props.id();
 
 	const STAGES: { key: RenderProgress['stage']; label: string }[] = [
 		{ key: 'probing', label: 'Find clips' },
@@ -150,17 +152,26 @@
 					.padStart(2, '0')}{#if eta}&nbsp;·&nbsp;{eta}{/if}
 			</p>
 
+			<!-- aria-disabled, not disabled: pressing Stop must not drop the
+			     keyboard focus onto the page while the stop is on its way.
+			     When the cutting room goes away under it (back to the last
+			     version), the focus goes to the player. -->
 			<button
 				class="btn danger stop"
 				type="button"
-				disabled={!canStop}
-				aria-busy={s.stopping}
-				title={s.renderHistory.length > 0 ? 'Stop this render and go back to the last version' : 'Stop this render'}
-				onclick={() => s.stopRender()}
+				aria-disabled={!canStop}
+				aria-describedby="{uid}-stop-what"
+				use:keepFocus={() => document.querySelector<HTMLElement>('#main video')}
+				onclick={() => {
+					if (canStop) void s.stopRender();
+				}}
 			>
 				<span class="stop-icon" aria-hidden="true"></span>
 				{s.stopping ? 'Stopping…' : 'Stop'}
 			</button>
+			<span class="sr-only" id="{uid}-stop-what"
+				>{s.renderHistory.length > 0 ? 'Stops this render and goes back to the last version' : 'Stops this render'}</span
+			>
 		{/if}
 	</div>
 </section>

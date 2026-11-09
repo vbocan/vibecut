@@ -1025,7 +1025,10 @@ class AppState {
 		}
 	}
 
-	/** Stop any listed job — the current render goes through `stopRender`. */
+	/** Stop any listed job (a render or a platform version) — the current
+	 *  render goes through `stopRender`. A running job turns `cancelled`
+	 *  within about a second; the list follows it until it does, rather
+	 *  than staying on "stopping" until the next refresh. */
 	async stopJob(jobId: string) {
 		if (jobId === this.jobId) await this.stopRender();
 		else {
@@ -1035,7 +1038,12 @@ class AppState {
 				this.jobsError = e instanceof api.ApiError ? e.describe() : String(e);
 			}
 		}
-		await this.loadJobs();
+		for (let i = 0; i < 20; i++) {
+			await this.loadJobs();
+			const j = this.jobs.find((x) => x.job_id === jobId);
+			if (!j || this.jobsError || j.state === 'done' || j.state === 'failed' || j.state === 'cancelled') return;
+			await new Promise((r) => setTimeout(r, 250));
+		}
 	}
 
 	/** Show a finished render of this project in the Studio. False when it

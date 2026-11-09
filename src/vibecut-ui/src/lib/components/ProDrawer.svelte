@@ -2,6 +2,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { outputFileUrl, type JobListEntry, type PlatformPreset } from '$lib/api';
 	import ConfigWizard from './ConfigWizard.svelte';
+	import { keepFocus } from '$lib/focus';
 	import { radiogroup } from '$lib/radiogroup';
 
 	let { open = $bindable(false) }: { open?: boolean } = $props();
@@ -97,6 +98,24 @@
 		);
 	}
 
+	let refreshBtn: HTMLButtonElement | undefined = $state();
+	/** What the last action in the list did, for screen readers. */
+	let jobsNote = $state('');
+
+	async function stopJob(j: JobListEntry, what: string) {
+		if (j.cancel_requested) return;
+		jobsNote = `Stopping ${what}…`;
+		await s.stopJob(j.job_id);
+		const now = s.jobs.find((x) => x.job_id === j.job_id);
+		jobsNote = now && isFinished(now) ? `${what}: ${stateLabel(now).toLowerCase()}.` : `Stopping ${what}.`;
+	}
+
+	/** Where the focus goes when a row's Stop button goes away. */
+	function afterStop(id: string): HTMLElement | null {
+		const row = document.querySelector<HTMLElement>(`.renders li[data-job="${CSS.escape(id)}"]`);
+		return row?.querySelector<HTMLElement>('.btn') ?? refreshBtn ?? null;
+	}
+
 	async function openJob(j: JobListEntry) {
 		if (await s.openJob(j)) open = false;
 	}
@@ -178,27 +197,59 @@
 
 		<details class="logs renders" bind:open={rendersOpen}>
 			<summary>Renders</summary>
-			<button class="btn ghost small" type="button" onclick={() => s.loadJobs()} disabled={s.loadingJobs}>
+			<!-- Buttons here stay focusable while busy (aria-disabled), and a
+			     Stop whose row turns into "Stopped" hands the focus to that
+			     row's next control, else to Refresh. -->
+			<button
+				class="btn ghost small"
+				type="button"
+				aria-disabled={s.loadingJobs}
+				bind:this={refreshBtn}
+				onclick={() => {
+					if (!s.loadingJobs) void s.loadJobs();
+				}}
+			>
 				{s.loadingJobs ? 'Loading…' : 'Refresh'}
 			</button>
-			{#if s.jobsError}<p class="error">{s.jobsError}</p>{/if}
-			<ul>
+			<p class="sr-only" role="status">{jobsNote}</p>
+			{#if s.jobsError}<p class="error" role="alert">{s.jobsError}</p>{/if}
+			<ul aria-label="Recent renders and platform versions" aria-busy={s.loadingJobs}>
 				{#each s.jobs as j (j.job_id)}
 					{@const file = jobFile(j)}
-					<li>
+					{@const what = jobTitle(j)}
+					<li data-job={j.job_id}>
 						<span class="job-state {j.state}">{stateLabel(j)}{j.cancel_requested && !isFinished(j) ? ' · stopping' : ''}</span>
 						<span class="kind {j.kind}">{KIND_LABEL[j.kind] ?? j.kind}</span>
 						<span class="when mono">{clockTime(j.submitted_at)}{took(j)}</span>
 						<span class="what" title={j.kind === 'reformat' ? j.output_path : j.config_path}>{jobTitle(j)}</span>
 						{#if j.state === 'queued' || j.state === 'running'}
-							<button class="btn ghost small" type="button" disabled={j.cancel_requested} onclick={() => s.stopJob(j.job_id)}
-								>Stop</button
+							<button
+								class="btn ghost small"
+								type="button"
+								aria-label="Stop {what}"
+								aria-disabled={j.cancel_requested}
+								use:keepFocus={() => afterStop(j.job_id)}
+								onclick={() => stopJob(j, what)}>Stop</button
 							>
 						{:else if file}
 							{#if belongsHere(j)}
-								<button class="btn ghost small" type="button" disabled={s.rendering} onclick={() => openJob(j)}>Open</button>
+								<button
+									class="btn ghost small"
+									type="button"
+									aria-label="Open {what} in the Studio"
+									aria-disabled={s.rendering}
+									onclick={() => {
+										if (!s.rendering) void openJob(j);
+									}}>Open</button
+								>
 							{:else}
-								<a class="btn ghost small" href={outputFileUrl(file)} target="_blank" rel="noopener">Watch</a>
+								<a
+									class="btn ghost small"
+									href={outputFileUrl(file)}
+									target="_blank"
+									rel="noopener"
+									aria-label="Watch {what} (opens in a new tab)">Watch</a
+								>
 							{/if}
 						{/if}
 					</li>

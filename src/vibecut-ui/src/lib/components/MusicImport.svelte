@@ -6,6 +6,20 @@
 	// means for posting. Vibecut can't ship most royalty-free music (the
 	// sites forbid redistribution), so the user brings their own.
 	let open = $state(false);
+	// Unique per instance: the song picker can show this in more than one place.
+	const uid = $props.id();
+	/** The outcome of "Look again", for screen readers. */
+	let lookNote = $state('');
+
+	async function lookAgain() {
+		if (s.loadingMusic) return;
+		lookNote = 'Looking for songs…';
+		await s.loadMusic();
+		const n = s.tracks.length;
+		lookNote = `${n === 0 ? 'No songs' : n === 1 ? '1 song' : `${n} songs`} in your library${
+			s.musicWarnings.length > 0 ? `; ${s.musicWarnings.length} couldn’t be used` : ''
+		}.`;
+	}
 
 	const importDir = $derived(s.musicImportDir ?? '/projects/music');
 	const importExists = $derived(s.musicDirs.find((d) => d.path === importDir)?.exists ?? true);
@@ -27,7 +41,7 @@
 		type="button"
 		class="toggle"
 		aria-expanded={open}
-		aria-controls="music-import"
+		aria-controls="{uid}-panel"
 		onclick={() => (open = !open)}
 	>
 		<span class="plus" aria-hidden="true">{open ? '−' : '+'}</span>
@@ -41,7 +55,7 @@
 	</button>
 
 	{#if open}
-		<div id="music-import" class="panel">
+		<div id="{uid}-panel" class="panel">
 			<section>
 				<h3>Where to put your songs</h3>
 				<p>
@@ -56,9 +70,11 @@
 						{#each otherDirs as d, i (d.path)}{#if i > 0}, {/if}<code>{d.path}</code>{/each}
 					</p>
 				{/if}
-				<button class="btn ghost" type="button" onclick={() => s.loadMusic()} disabled={s.loadingMusic}
+				<!-- aria-disabled keeps the focus on the button while it looks. -->
+				<button class="btn ghost" type="button" onclick={lookAgain} aria-disabled={s.loadingMusic}
 					>{s.loadingMusic ? 'Looking…' : 'Look again'}</button
 				>
+				<p class="sr-only" role="status">{lookNote}</p>
 			</section>
 
 			<section>
@@ -77,7 +93,12 @@
 									<strong>{t.title}</strong>{#if t.artist}<span class="dim">{` · ${t.artist}`}</span>{/if}
 								</span>
 								<span class="badges">
-									<span class="badge {b.tone}">{b.text}</span>
+									<!-- The badge's colour repeats its words; the words carry it. -->
+									<span class="badge {b.tone}"
+										><span class="sr-only">Licence: </span>{b.text}{#if t.attribution_required}<span class="sr-only"
+												>, credit required</span
+											>{/if}</span
+									>
 									{#if t.collection === 'starter'}<span class="badge starter">Starter pack</span>{/if}
 								</span>
 								<span class="note">{t.licence.note}</span>
@@ -88,8 +109,8 @@
 			</section>
 
 			{#if s.musicWarnings.length > 0}
-				<section class="warn" aria-live="polite">
-					<h3>Couldn't use some of it</h3>
+				<section class="warn" aria-labelledby="{uid}-warn-h">
+					<h3 id="{uid}-warn-h">Couldn't use some of it</h3>
 					<ul>
 						{#each s.musicWarnings as w, i (i)}<li class="mono">{w}</li>{/each}
 					</ul>
