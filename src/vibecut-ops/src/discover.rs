@@ -23,8 +23,8 @@ pub struct DiscoverResult {
 }
 
 /// Scan `folder` (relative to `/footage`, or an absolute container
-/// path) and group GoPro chapters (`GH010023.MP4`, `GH020023.MP4`, …)
-/// into logical sources.
+/// path) and group GoPro chapters (`GH010023.MP4`, `GH020023.MP4`, …;
+/// `GOPR0042.MP4`, `GP010042.MP4`, … on older cameras) into logical sources.
 pub async fn discover_sources(folder: &str) -> Result<DiscoverResult, OpsError> {
     let target = resolve_footage(folder);
     if !target.exists() {
@@ -88,96 +88,55 @@ pub async fn discover_sources(folder: &str) -> Result<DiscoverResult, OpsError> 
 
 // ---------- grouping helpers ----------
 
-/// GoPro chapter filenames look like `GH010023.MP4` / `GX020023.MP4` —
-/// the trailing 4 digits identify the source, the 2 digits before them
-/// identify the chapter. Other filenames become one-chapter sources
-/// keyed by their stem.
-fn parse_chapter(name: &str) -> (String, u32) {
-    let re = regex::Regex::new(r"^(?:GH|GX)(?P<ch>\d{2})(?P<src>\d{4})\.(?:mp4|MP4)$").unwrap();
-    if let Some(caps) = re.captures(name) {
-        let src = caps.name("src").unwrap().as_str().to_string();
-        let ch: u32 = caps.name("ch").unwrap().as_str().parse().unwrap_or(1);
-        (src, ch)
-    } else {
-        let stem = Path::new(name)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| name.to_string());
-        (stem, 1)
-    }
-}
-
-struct SourceAcc {
-    source_id: String,
-    chapters: Vec<serde_json::Value>,
-    total_duration_secs: f64,
-    has_audio: bool,
-    fps: std::collections::BTreeSet<i64>,
-    codecs: std::collections::BTreeSet<String>,
-}
-
+/// Group probed files into sources exactly as the render pipeline does
+/// ([`vibecut::selection_planner::group_into_sources`]): GoPro chapters of
+/// one recording (`GX01nnnn` / `GX02nnnn`…, or `GOPRnnnn` then `GP01nnnn`…
+/// on older cameras) become one source in chapter order, `.LRV` / `.THM`
+/// sidecars are dropped, other files are one-chapter sources keyed by stem.
 fn group_sources_from_probed(folder: &Path, probed: &[media_probe::ProbedFile]) -> DiscoverResult {
-    use std::collections::BTreeMap;
-    let mut by_id: BTreeMap<String, SourceAcc> = BTreeMap::new();
+    use std::collections::{BTreeSet, HashMap};
+    let by_path: HashMap<&camino::Utf8Path, &media_probe::ProbedFile> =
+        probed.iter().map(|p| (p.path.as_path(), p)).collect();
 
-    for entry in probed {
-        let path_str = entry.path.to_string();
-        let duration = entry.media.as_ref().map(|m| m.duration_secs).unwrap_or(0.0);
-        let video = entry.media.as_ref().and_then(|m| m.video.as_ref());
-        let audio = entry.media.as_ref().and_then(|m| m.audio.as_ref());
-
-        let fname = entry
-            .path
-            .file_name()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        let (src_id, ch_idx) = parse_chapter(&fname);
-
-        let acc = by_id.entry(src_id.clone()).or_insert_with(|| SourceAcc {
-            source_id: src_id,
-            chapters: Vec::new(),
-            total_duration_secs: 0.0,
-            has_audio: false,
-            fps: std::collections::BTreeSet::new(),
-            codecs: std::collections::BTreeSet::new(),
-        });
-        acc.chapters.push(serde_json::json!({
-            "path": path_str,
-            "chapter_index": ch_idx,
-            "duration_secs": duration,
-        }));
-        acc.total_duration_secs += duration;
-        if audio.is_some() {
-            acc.has_audio = true;
-        }
-        if let Some(v) = video {
-            // VideoStream::fps is f32; quantise to integer for the rollup.
-            acc.fps.insert(v.fps.round() as i64);
-            if !v.codec.is_empty() {
-                acc.codecs.insert(v.codec.clone());
-            }
-        }
-    }
-
-    let mut sources: Vec<serde_json::Value> = Vec::with_capacity(by_id.len());
+    let grouped = vibecut::selection_planner::group_into_sources(probed);
+    let mut sources: Vec<serde_json::Value> = Vec::with_capacity(grouped.len());
     let mut total_secs = 0.0_f64;
     let mut n_audio = 0usize;
-    for (_, mut a) in by_id {
-        a.chapters.sort_by_key(|c| {
-            c.get("chapter_index").and_then(|v| v.as_u64()).unwrap_or(0)
-        });
-        if a.has_audio {
+    for s in &grouped {
+        let mut has_audio = false;
+        let mut fps = BTreeSet::new();
+        let mut codecs = BTreeSet::new();
+        let mut chapters = Vec::with_capacity(s.chapters.len());
+        for ch in &s.chapters {
+            chapters.push(serde_json::json!({
+                "path": ch.path.to_string(),
+                "chapter_index": ch.chapter_index,
+                "duration_secs": ch.duration_secs,
+            }));
+            let media = by_path.get(ch.path.as_path()).and_then(|p| p.media.as_ref());
+            if media.and_then(|m| m.audio.as_ref()).is_some() {
+                has_audio = true;
+            }
+            if let Some(v) = media.and_then(|m| m.video.as_ref()) {
+                // VideoStream::fps is f32; quantise to integer for the rollup.
+                fps.insert(v.fps.round() as i64);
+                if !v.codec.is_empty() {
+                    codecs.insert(v.codec.clone());
+                }
+            }
+        }
+        if has_audio {
             n_audio += 1;
         }
-        total_secs += a.total_duration_secs;
+        total_secs += s.total_duration_secs;
         sources.push(serde_json::json!({
-            "source_id": a.source_id,
-            "chapters": a.chapters,
-            "n_chapters": a.chapters.len(),
-            "total_duration_secs": (a.total_duration_secs * 100.0).round() / 100.0,
-            "has_audio": a.has_audio,
-            "fps": a.fps.into_iter().collect::<Vec<_>>(),
-            "codecs": a.codecs.into_iter().collect::<Vec<_>>(),
+            "source_id": s.id,
+            "chapters": chapters,
+            "n_chapters": chapters.len(),
+            "total_duration_secs": (s.total_duration_secs * 100.0).round() / 100.0,
+            "has_audio": has_audio,
+            "fps": fps.into_iter().collect::<Vec<_>>(),
+            "codecs": codecs.into_iter().collect::<Vec<_>>(),
         }));
     }
     let n_sources = sources.len();
@@ -211,13 +170,78 @@ fn footage_summary(n_sources: usize, total_secs: f64, n_audio: usize) -> String 
 mod tests {
     use super::*;
 
+    fn probed(path: &str, dur: f64, audio: bool) -> media_probe::ProbedFile {
+        media_probe::ProbedFile {
+            path: path.into(),
+            size_bytes: 0,
+            blake3: None,
+            media: Some(media_probe::MediaInfo {
+                container: "mov,mp4".into(),
+                duration_secs: dur,
+                creation_time: None,
+                video: Some(media_probe::VideoStream {
+                    codec: "hevc".into(),
+                    width: 1920,
+                    height: 1080,
+                    fps: 29.97,
+                    color: Default::default(),
+                }),
+                audio: audio.then(|| media_probe::AudioStream {
+                    codec: "aac".into(),
+                    sample_rate: 48_000,
+                    channels: 2,
+                }),
+            }),
+            probe_error: None,
+        }
+    }
+
+    fn chapters_of(r: &DiscoverResult) -> Vec<(String, Vec<String>)> {
+        r.sources
+            .iter()
+            .map(|s| {
+                let paths = s["chapters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["path"].as_str().unwrap().to_string())
+                    .collect();
+                (s["source_id"].as_str().unwrap().to_string(), paths)
+            })
+            .collect()
+    }
+
     #[test]
-    fn chapter_regex() {
-        assert_eq!(parse_chapter("GH010023.MP4"), ("0023".into(), 1));
-        assert_eq!(parse_chapter("GX020023.MP4"), ("0023".into(), 2));
-        let (sid, ch) = parse_chapter("DJI_0042.MP4");
-        assert_eq!(sid, "DJI_0042");
-        assert_eq!(ch, 1);
+    fn groups_every_gopro_naming_scheme_and_ignores_proxies() {
+        let files = vec![
+            probed("f/GH020023.MP4", 20.0, true),
+            probed("f/GH010023.MP4", 10.0, true),
+            probed("f/GP010042.mp4", 20.0, false),
+            probed("f/GOPR0042.MP4", 10.0, false),
+            probed("f/GOPR0042.LRV", 10.0, false),
+            probed("f/GL010023.LRV", 10.0, true),
+            probed("f/GOPR0042.THM", 0.0, false),
+            probed("f/DJI_0042.MP4", 5.0, false),
+        ];
+        let r = group_sources_from_probed(Path::new("f"), &files);
+        assert_eq!(
+            chapters_of(&r),
+            vec![
+                ("0023".into(), vec!["f/GH010023.MP4".into(), "f/GH020023.MP4".into()]),
+                ("0042".into(), vec!["f/GOPR0042.MP4".into(), "f/GP010042.mp4".into()]),
+                ("DJI_0042".into(), vec!["f/DJI_0042.MP4".into()]),
+            ]
+        );
+        assert_eq!(r.n_sources, 3);
+        assert_eq!(r.total_secs, 65.0);
+        let gopr = &r.sources[1];
+        assert_eq!(gopr["n_chapters"], 2);
+        assert_eq!(gopr["chapters"][0]["chapter_index"], 1);
+        assert_eq!(gopr["chapters"][1]["chapter_index"], 2);
+        assert_eq!(gopr["has_audio"], false);
+        assert_eq!(r.sources[0]["has_audio"], true);
+        assert_eq!(r.sources[0]["fps"], serde_json::json!([30]));
+        assert!(r.summary.contains("1 of 3 with audio"), "{}", r.summary);
     }
 
     #[test]

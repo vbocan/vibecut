@@ -204,6 +204,21 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         })
         .collect();
 
+    // Per-chapter colour plan: HDR (HLG / PQ) chapters are tone-mapped to
+    // BT.709 SDR in normalize; everything else keeps its old command line.
+    let chapter_color: std::collections::HashMap<
+        Utf8PathBuf,
+        crate::video_renderer::ColorConversion,
+    > = probed
+        .iter()
+        .filter_map(|p| {
+            let info = &p.media.as_ref()?.video.as_ref()?.color;
+            let plan = crate::video_renderer::plan_color_conversion(info, &hw.support);
+            Some((p.path.clone(), plan))
+        })
+        .collect();
+    print_color_plan(&probed, &chapter_color);
+
     // 2. Group into sources (chapter-stitching).
     let sources = group_into_sources(&probed);
     if !sources.is_empty() {
@@ -1253,6 +1268,17 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             )
         })
         .collect();
+    // Colour conversion per segment (HDR tone mapping). It joins the
+    // fingerprint only for converted clips, so SDR clips keep their cache.
+    let seg_colors: Vec<crate::video_renderer::ColorConversion> = segments
+        .iter()
+        .map(|s| chapter_color.get(&s.chapter_path).copied().unwrap_or_default())
+        .collect();
+    let seg_hashes: Vec<String> = seg_hashes
+        .into_iter()
+        .zip(&seg_colors)
+        .map(|(h, c)| with_color_tag(h, c))
+        .collect();
 
     if stabilize {
         println!("\nstabilization detect pass on {} segments...", segments.len());
@@ -1489,6 +1515,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 overlays: &overlays,
                 image_overlays: &image_overlays,
                 input_has_audio,
+                color: seg_colors[i],
                 outgoing_ramp: seg_ramps[i],
                 is_image: crate::media_probe::is_image_path(&s.chapter_path),
                 image_effect: image_effect_map.get(&s.chapter_path).copied(),
@@ -2179,6 +2206,53 @@ fn segment_fingerprint(
     hex[..8].to_string()
 }
 
+/// Fold a segment's colour conversion into its [`segment_fingerprint`].
+/// Clips that need none keep the fingerprint unchanged, so turning HDR
+/// support on never invalidates cached SDR clips.
+fn with_color_tag(fingerprint: String, color: &crate::video_renderer::ColorConversion) -> String {
+    match color.cache_tag() {
+        None => fingerprint,
+        Some(tag) => {
+            let mut h = blake3::Hasher::new();
+            h.update(fingerprint.as_bytes());
+            h.update(tag.as_bytes());
+            h.finalize().to_hex()[..8].to_string()
+        }
+    }
+}
+
+/// Log the chapters normalize will colour-convert (HDR / wide gamut /
+/// high bit depth). Silent for all-8-bit-SDR projects.
+fn print_color_plan(
+    probed: &[crate::media_probe::ProbedFile],
+    plans: &std::collections::HashMap<Utf8PathBuf, crate::video_renderer::ColorConversion>,
+) {
+    use crate::video_renderer::ColorConversion;
+    let mut header = false;
+    for p in probed {
+        let Some(plan) = plans.get(&p.path) else { continue };
+        if *plan == ColorConversion::None {
+            continue;
+        }
+        let Some(info) = p.media.as_ref().and_then(|m| m.video.as_ref()).map(|v| &v.color) else {
+            continue;
+        };
+        if !header {
+            println!("\ncolour:");
+            header = true;
+        }
+        println!(
+            "  · {}  {} → {}",
+            p.path.file_name().unwrap_or("?"),
+            info.summary(),
+            plan.describe()
+        );
+        if matches!(plan, ColorConversion::Approximate(_) | ColorConversion::Unsupported) {
+            tracing::warn!(file = %p.path, "{}", plan.describe());
+        }
+    }
+}
+
 /// Bridge from `multi_angle`'s offset-refinement callback signature to the
 /// existing `audio_analysis::sync_two_files` API.
 fn audio_xcorr_refine(
@@ -2716,6 +2790,30 @@ mod tests {
             reason: String::new(),
             score: Some(score),
         }
+    }
+
+    #[test]
+    fn colour_tag_changes_the_fingerprint_only_for_converted_clips() {
+        use crate::media_probe::ColorInfo;
+        use crate::video_renderer::{plan_color_conversion, ColorConversion};
+        let fp = segment_fingerprint(&seg(0.5), 1920, 1080, 30, 20, None, false, None, None);
+        assert_eq!(with_color_tag(fp.clone(), &ColorConversion::None), fp);
+        assert_eq!(with_color_tag(fp.clone(), &ColorConversion::PixelFormat), fp);
+        let support = HwSupport { zscale: true, tonemap: true, colorspace: true, ..Default::default() };
+        let hlg = ColorInfo {
+            bit_depth: Some(10),
+            transfer: Some("arib-std-b67".into()),
+            primaries: Some("bt2020".into()),
+            ..Default::default()
+        };
+        let tm = plan_color_conversion(&hlg, &support);
+        let tagged = with_color_tag(fp.clone(), &tm);
+        assert_ne!(tagged, fp);
+        assert_eq!(tagged.len(), 8);
+        // Deterministic, and the fallback path gets its own key.
+        assert_eq!(with_color_tag(fp.clone(), &tm), tagged);
+        let approx = plan_color_conversion(&hlg, &HwSupport { colorspace: true, ..Default::default() });
+        assert_ne!(with_color_tag(fp, &approx), tagged);
     }
 
     #[test]

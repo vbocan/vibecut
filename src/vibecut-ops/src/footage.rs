@@ -122,6 +122,11 @@ fn walk(dir: &Path, depth: usize, t: &mut Tally) {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+            // A GoPro `GL…` proxy renamed to .MP4 is not a clip.
+            && !p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(vibecut::media_probe::is_gopro_sidecar)
         {
             let meta = std::fs::metadata(&p).ok();
             t.n += 1;
@@ -160,6 +165,35 @@ mod tests {
         let folders = list_folders_in(&root);
         assert_eq!(folders[0].name, "All footage");
         assert_eq!(folders[0].n_videos, 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proxies_and_thumbnails_are_not_counted_as_videos() {
+        let root = std::env::temp_dir().join(format!("vibecut_footage_proxies_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("hero7")).unwrap();
+        std::fs::create_dir_all(root.join("hero10")).unwrap();
+        for (f, bytes) in [
+            ("hero7/GOPR0042.MP4", &b"12345"[..]),
+            ("hero7/GP010042.MP4", b"12345"),
+            ("hero7/GOPR0042.LRV", b"1"),
+            ("hero7/GP010042.LRV", b"1"),
+            ("hero7/GOPR0042.THM", b"1"),
+            ("hero10/GL010007.MP4", b"1"), // proxy renamed to .MP4
+            ("hero10/GL010007.LRV", b"1"),
+            ("hero10/GX010007.THM", b"1"),
+            ("hero10/GX010007.MP4", b"1234"),
+        ] {
+            std::fs::write(root.join(f), bytes).unwrap();
+        }
+        let folders = list_folders_in(&root);
+        let by_name = |n: &str| folders.iter().find(|f| f.name == n).unwrap();
+        assert_eq!(by_name("hero7").n_videos, 2);
+        assert_eq!(by_name("hero7").total_bytes, 10);
+        assert_eq!(by_name("hero10").n_videos, 1, "{folders:?}");
+        assert_eq!(by_name("hero10").total_bytes, 4);
+        assert!(by_name("hero10").sample_video.as_deref().unwrap().ends_with("GX010007.MP4"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

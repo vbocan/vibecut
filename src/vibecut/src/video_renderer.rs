@@ -172,6 +172,13 @@ pub struct HwSupport {
     /// 480×270 output to CPU memory. Eliminates the 24 MB-per-frame PCIe
     /// memcpy that the CPU `scale` filter forces.
     pub scale_cuda: bool,
+    /// `zscale` (zimg) + `tonemap` filters: normalize tone-maps HDR (HLG /
+    /// PQ) sources to BT.709 SDR with them. See [`plan_color_conversion`].
+    pub zscale: bool,
+    pub tonemap: bool,
+    /// Native `colorspace` filter — the approximate fallback when `zscale`
+    /// is missing.
+    pub colorspace: bool,
 }
 
 impl HwSupport {
@@ -212,6 +219,9 @@ impl HwSupport {
             h264_qsv:     qsv_works  && enc.contains(" h264_qsv "),
             hevc_qsv:     qsv_works  && enc.contains(" hevc_qsv "),
             scale_cuda:   cuda_works && filt.lines().any(|l| l.contains(" scale_cuda ")),
+            zscale:       lists_filter(&filt, "zscale"),
+            tonemap:      lists_filter(&filt, "tonemap"),
+            colorspace:   lists_filter(&filt, "colorspace"),
         })
     }
 
@@ -235,6 +245,16 @@ impl HwSupport {
             bits.join(" + ")
         }
     }
+}
+
+/// Whether `ffmpeg -filters` output lists the filter `name` exactly. Rows
+/// look like ` .SC zscale            V->V       Apply resizing, …`: flags,
+/// then the name — so `tonemap` does not match `tonemap_opencl`, and a
+/// name inside another filter's description does not count.
+fn lists_filter(filters: &str, name: &str) -> bool {
+    filters
+        .lines()
+        .any(|l| l.split_whitespace().nth(1) == Some(name))
 }
 
 fn capture(binary: &str, args: &[&str]) -> Result<String> {
@@ -553,6 +573,186 @@ fn letterbox_filter(w: u32, h: u32) -> String {
     )
 }
 
+// ---------- Colour conversion (HDR → SDR) ----------
+
+/// A source's colour parameters in zscale / colorspace option syntax.
+/// Untagged fields fall back to what HDR cameras record (BT.2020 primaries,
+/// BT.2020 non-constant-luminance matrix, limited range).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorIn {
+    pub transfer: &'static str,
+    pub primaries: &'static str,
+    pub matrix: &'static str,
+    /// `tv` (limited) or `pc` (full).
+    pub range: &'static str,
+}
+
+/// How normalize brings a clip into the shared 8-bit BT.709 working space
+/// every normalized clip is in. Decided per chapter by
+/// [`plan_color_conversion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorConversion {
+    /// 8-bit SDR (or untagged): nothing to do.
+    #[default]
+    None,
+    /// High-bit-depth SDR (10-bit BT.709, GoPro Flat / Log): only the pixel
+    /// format drops to 8-bit — the `-pix_fmt yuv420p` every clip gets.
+    /// Same filter graph, and cache key, as `None`.
+    PixelFormat,
+    /// HDR (HLG / PQ) → BT.709 SDR: zscale linearises (100-nit reference,
+    /// the scale `tonemap` assumes), maps BT.2020 → BT.709 primaries,
+    /// `tonemap=mobius` rolls highlights off above the SDR range, zscale
+    /// re-applies the BT.709 curve.
+    ToneMap(ColorIn),
+    /// SDR on BT.2020 primaries: zscale maps the gamut to BT.709; no tone
+    /// mapping.
+    Gamut(ColorIn),
+    /// HDR or BT.2020 without zscale / tonemap: the native `colorspace`
+    /// filter converts primaries + matrix to BT.709 and reads an HDR
+    /// transfer as BT.2020 gamma. HLG keeps about the right brightness
+    /// (it is built to look passable on SDR screens) but stays muted; PQ
+    /// comes out flat and dim.
+    Approximate(ColorIn),
+    /// HDR, but ffmpeg has none of zscale / colorspace: left as-is apart
+    /// from the pixel format (renders washed out).
+    Unsupported,
+}
+
+/// Decide how normalize converts a chapter with colour `info`, given the
+/// filters this ffmpeg has (`support.zscale` / `tonemap` / `colorspace`).
+pub fn plan_color_conversion(
+    info: &crate::media_probe::ColorInfo,
+    support: &HwSupport,
+) -> ColorConversion {
+    let hdr = info.hdr_transfer();
+    if hdr.is_none() && !info.is_bt2020() {
+        return if info.is_high_bit_depth() {
+            ColorConversion::PixelFormat
+        } else {
+            ColorConversion::None
+        };
+    }
+    let mut cin = ColorIn {
+        transfer: match (hdr, info.transfer.as_deref()) {
+            (Some(t), _) => t.ffmpeg_name(),
+            (None, Some("bt2020-12")) => "bt2020-12",
+            (None, Some("bt2020-10")) => "bt2020-10",
+            (None, _) => "bt709",
+        },
+        primaries: match info.primaries.as_deref() {
+            Some("bt709") => "bt709",
+            _ => "bt2020",
+        },
+        matrix: match info.matrix.as_deref() {
+            Some("bt709") => "bt709",
+            Some("bt2020c") => "bt2020c",
+            _ => "bt2020nc",
+        },
+        range: match info.range.as_deref() {
+            Some("pc") => "pc",
+            _ => "tv",
+        },
+    };
+    if support.zscale && (hdr.is_none() || support.tonemap) {
+        return match hdr {
+            Some(_) => ColorConversion::ToneMap(cin),
+            None => ColorConversion::Gamut(cin),
+        };
+    }
+    if support.colorspace {
+        if hdr.is_some() {
+            // `colorspace` has no HLG / PQ curve; BT.2020 gamma is the
+            // SDR-compatible reading of HLG.
+            cin.transfer = "bt2020-10";
+        }
+        if cin.matrix == "bt2020c" {
+            cin.matrix = "bt2020nc";
+        }
+        return ColorConversion::Approximate(cin);
+    }
+    match hdr {
+        Some(_) => ColorConversion::Unsupported,
+        None => ColorConversion::PixelFormat,
+    }
+}
+
+impl ColorConversion {
+    /// Filter-chain fragment that converts the clip, inserted right after
+    /// the letterbox scale (so the float tone-map runs at output size).
+    /// `None` when the clip needs no colour filter.
+    pub fn filter(&self) -> Option<String> {
+        match self {
+            ColorConversion::None | ColorConversion::PixelFormat | ColorConversion::Unsupported => {
+                None
+            }
+            ColorConversion::ToneMap(c) => Some(format!(
+                "zscale=tin={t}:pin={p}:min={m}:rin={r}:t=linear:npl=100,\
+                 format=gbrpf32le,zscale=p=bt709,\
+                 tonemap=tonemap=mobius:desat=0,\
+                 zscale=t=bt709:m=bt709:r=tv,format=yuv420p",
+                t = c.transfer,
+                p = c.primaries,
+                m = c.matrix,
+                r = c.range,
+            )),
+            ColorConversion::Gamut(c) => Some(format!(
+                "zscale=tin={t}:pin={p}:min={m}:rin={r}:t=bt709:p=bt709:m=bt709:r=tv,\
+                 format=yuv420p",
+                t = c.transfer,
+                p = c.primaries,
+                m = c.matrix,
+                r = c.range,
+            )),
+            ColorConversion::Approximate(c) => Some(format!(
+                "colorspace=all=bt709:range=tv:itrc={t}:iprimaries={p}:ispace={m}:irange={r}:\
+                 format=yuv420p",
+                t = c.transfer,
+                p = c.primaries,
+                m = c.matrix,
+                r = c.range,
+            )),
+        }
+    }
+
+    /// Encoder options that tag a converted clip's bitstream BT.709. ffmpeg 7
+    /// already copies the tags zscale / colorspace set on the frames; older
+    /// builds may not, so they are spelled out. Empty when nothing is
+    /// converted, so SDR clips keep their exact command line.
+    pub fn output_tags(&self) -> &'static [&'static str] {
+        if self.filter().is_none() {
+            return &[];
+        }
+        &[
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-colorspace", "bt709",
+            "-color_range", "tv",
+        ]
+    }
+
+    /// Extra input for the normalize cache key: `Some` only when the
+    /// conversion changes the pixels, so unaffected clips keep their key.
+    pub fn cache_tag(&self) -> Option<String> {
+        self.filter().map(|f| format!("color-v1:{f}"))
+    }
+
+    /// One-line description for the run log.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            ColorConversion::None => "8-bit SDR, as-is",
+            ColorConversion::PixelFormat => "high bit depth SDR → 8-bit",
+            ColorConversion::ToneMap(_) => "HDR → BT.709 SDR (zscale + tonemap)",
+            ColorConversion::Gamut(_) => "BT.2020 → BT.709 gamut (zscale)",
+            ColorConversion::Approximate(_) => {
+                "→ BT.709 via colorspace filter (approximate: ffmpeg has no zscale/tonemap)"
+            }
+            ColorConversion::Unsupported => {
+                "HDR left unconverted: ffmpeg has neither zscale nor colorspace"
+            }
+        }
+    }
+}
+
 // ---------- Stage 1: normalize ----------
 
 #[derive(Debug, Clone)]
@@ -623,6 +823,9 @@ pub struct NormalizeArgs<'a> {
     /// audio). GoPro HERO5/6 files where the mic was off, or any source
     /// without an audio track, fall in this bucket.
     pub input_has_audio: bool,
+    /// Colour conversion into 8-bit BT.709 (HDR tone mapping); see
+    /// [`plan_color_conversion`].
+    pub color: ColorConversion,
     /// When `Some`, apply an outgoing speed-ramp to the last
     /// `duration_secs` of this segment. The renderer reads
     /// `extra = duration_secs * (1 - 1/factor)` extra seconds from the
@@ -856,11 +1059,17 @@ pub fn normalize_segment(
     // hwdownload roundtrip per segment.
     //
     // Filter order:
-    //   scale → pad → [stabilize] → [lut3d] → setsar → fps
+    //   scale → pad → [tone-map] → [stabilize] → [lut3d] → setsar → fps
     // Stabilize after scale so its transforms file (built at the same scale)
     // matches; LUT after stabilize so any pixel-cropping from zoom doesn't
-    // affect the colour mapping.
+    // affect the colour mapping. HDR tone mapping right after the scale:
+    // the float maths runs at output size, and a LUT then grades SDR
+    // footage the same way it grades every other clip.
     let mut chain = letterbox_filter(args.width, args.height);
+    if let Some(f) = args.color.filter() {
+        chain.push(',');
+        chain.push_str(&f);
+    }
     if let Some(trf) = args.stabilize_transforms {
         // vidstab requires forward slashes and quoted paths.
         chain.push_str(&format!(
@@ -1090,6 +1299,8 @@ pub fn normalize_segment(
         arg("-t"), format!("{out_t:.6}"),
         arg("-pix_fmt"), arg("yuv420p"),
     ]);
+    // Tone-mapped / gamut-mapped clips are tagged BT.709 explicitly.
+    cmd.extend(args.color.output_tags().iter().map(|s| s.to_string()));
     cmd.extend(hw.encode_args(args.crf));
     cmd.extend([
         arg("-c:a"), arg("aac"),
@@ -2455,6 +2666,7 @@ mod tests {
                 overlays: &[],
                 image_overlays: &[],
                 input_has_audio: true,
+                color: ColorConversion::None,
                 outgoing_ramp: None,
                 is_image: false,
                 image_effect: None,
@@ -2518,6 +2730,7 @@ mod tests {
                 overlays: &[],
                 image_overlays: &[],
                 input_has_audio: true,
+                color: ColorConversion::None,
                 outgoing_ramp: Some(SpeedRamp { duration_secs: 0.350, factor: 2.5, flash: false }),
                 is_image: false,
                 image_effect: None,
@@ -2581,6 +2794,7 @@ mod tests {
                 overlays: &[],
                 image_overlays: &[],
                 input_has_audio: true,
+                color: ColorConversion::None,
                 outgoing_ramp: Some(SpeedRamp { duration_secs: 0.600, factor: 3.0, flash: true }),
                 is_image: false,
                 image_effect: None,
@@ -2611,6 +2825,219 @@ mod tests {
             fc.contains(":color=white[vfast]"),
             "expected flash filter output to feed [vfast]: {fc}"
         );
+    }
+
+    fn color(depth: u32, transfer: Option<&str>, primaries: Option<&str>) -> crate::media_probe::ColorInfo {
+        crate::media_probe::ColorInfo {
+            pix_fmt: Some(if depth > 8 { "yuv420p10le" } else { "yuv420p" }.into()),
+            bit_depth: Some(depth),
+            transfer: transfer.map(str::to_string),
+            primaries: primaries.map(str::to_string),
+            matrix: primaries.map(|p| if p == "bt2020" { "bt2020nc" } else { p }.to_string()),
+            range: Some("tv".into()),
+        }
+    }
+
+    fn full_filters() -> HwSupport {
+        HwSupport { zscale: true, tonemap: true, colorspace: true, ..Default::default() }
+    }
+
+    #[test]
+    fn colour_plan_leaves_sdr_alone_and_tone_maps_hdr() {
+        let s = full_filters();
+        // 8-bit SDR, tagged or not: nothing.
+        assert_eq!(plan_color_conversion(&color(8, None, None), &s), ColorConversion::None);
+        assert_eq!(
+            plan_color_conversion(&color(8, Some("bt709"), Some("bt709")), &s),
+            ColorConversion::None
+        );
+        // 10-bit BT.709 (GoPro 10-bit SDR, Flat/Log): pixel format only.
+        assert_eq!(
+            plan_color_conversion(&color(10, Some("bt709"), Some("bt709")), &s),
+            ColorConversion::PixelFormat
+        );
+        assert_eq!(plan_color_conversion(&color(10, None, None), &s), ColorConversion::PixelFormat);
+        // HLG and PQ on BT.2020: tone-mapped with the source's own tags.
+        let hlg = plan_color_conversion(&color(10, Some("arib-std-b67"), Some("bt2020")), &s);
+        assert_eq!(
+            hlg,
+            ColorConversion::ToneMap(ColorIn {
+                transfer: "arib-std-b67",
+                primaries: "bt2020",
+                matrix: "bt2020nc",
+                range: "tv",
+            })
+        );
+        let pq = plan_color_conversion(&color(10, Some("smpte2084"), Some("bt2020")), &s);
+        assert!(matches!(pq, ColorConversion::ToneMap(c) if c.transfer == "smpte2084"));
+        // HLG tagged on the transfer only: primaries / matrix default to BT.2020.
+        let partial = plan_color_conversion(&color(10, Some("arib-std-b67"), None), &s);
+        assert!(matches!(
+            partial,
+            ColorConversion::ToneMap(c) if c.primaries == "bt2020" && c.matrix == "bt2020nc"
+        ));
+        // SDR on BT.2020 primaries: gamut map, no tone map.
+        assert!(matches!(
+            plan_color_conversion(&color(10, Some("bt2020-10"), Some("bt2020")), &s),
+            ColorConversion::Gamut(c) if c.transfer == "bt2020-10"
+        ));
+    }
+
+    #[test]
+    fn colour_plan_falls_back_without_zscale() {
+        let hlg = color(10, Some("arib-std-b67"), Some("bt2020"));
+        // No zscale (or no tonemap): colorspace filter, transfer read as BT.2020 gamma.
+        for s in [
+            HwSupport { colorspace: true, ..Default::default() },
+            HwSupport { zscale: true, colorspace: true, ..Default::default() },
+        ] {
+            assert_eq!(
+                plan_color_conversion(&hlg, &s),
+                ColorConversion::Approximate(ColorIn {
+                    transfer: "bt2020-10",
+                    primaries: "bt2020",
+                    matrix: "bt2020nc",
+                    range: "tv",
+                })
+            );
+        }
+        // Nothing usable: HDR is left alone, SDR BT.2020 just changes pixel format.
+        let none = HwSupport::default();
+        assert_eq!(plan_color_conversion(&hlg, &none), ColorConversion::Unsupported);
+        assert_eq!(
+            plan_color_conversion(&color(10, Some("bt2020-10"), Some("bt2020")), &none),
+            ColorConversion::PixelFormat
+        );
+        assert_eq!(ColorConversion::Unsupported.filter(), None);
+    }
+
+    #[test]
+    fn colour_filter_strings() {
+        let s = full_filters();
+        let tm = plan_color_conversion(&color(10, Some("arib-std-b67"), Some("bt2020")), &s);
+        assert_eq!(
+            tm.filter().unwrap(),
+            "zscale=tin=arib-std-b67:pin=bt2020:min=bt2020nc:rin=tv:t=linear:npl=100,\
+             format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=mobius:desat=0,\
+             zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+        );
+        let approx = plan_color_conversion(
+            &color(10, Some("smpte2084"), Some("bt2020")),
+            &HwSupport { colorspace: true, ..Default::default() },
+        );
+        assert_eq!(
+            approx.filter().unwrap(),
+            "colorspace=all=bt709:range=tv:itrc=bt2020-10:iprimaries=bt2020:ispace=bt2020nc:\
+             irange=tv:format=yuv420p"
+        );
+        let gamut = plan_color_conversion(&color(10, Some("bt2020-10"), Some("bt2020")), &s);
+        assert!(gamut.filter().unwrap().starts_with("zscale=tin=bt2020-10:pin=bt2020:"));
+        // Only converting plans touch the cache key.
+        assert_eq!(ColorConversion::None.cache_tag(), None);
+        assert_eq!(ColorConversion::PixelFormat.cache_tag(), None);
+        assert!(tm.cache_tag().unwrap().contains("tonemap=mobius"));
+        assert_ne!(tm.cache_tag(), approx.cache_tag());
+        // Only converting plans retag the output.
+        assert!(ColorConversion::None.output_tags().is_empty());
+        assert!(ColorConversion::PixelFormat.output_tags().is_empty());
+        assert!(ColorConversion::Unsupported.output_tags().is_empty());
+        for plan in [tm, approx, gamut] {
+            assert!(plan.output_tags().windows(2).any(|w| w == ["-color_trc", "bt709"]));
+        }
+    }
+
+    fn normalize_args_for<'a>(
+        input: &'a camino::Utf8Path,
+        output: &'a camino::Utf8Path,
+        color: ColorConversion,
+    ) -> NormalizeArgs<'a> {
+        NormalizeArgs {
+            input,
+            output,
+            start_secs: 0.0,
+            duration_secs: 2.0,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            crf: 20,
+            lut3d: None,
+            stabilize_transforms: None,
+            overlays: &[],
+            image_overlays: &[],
+            input_has_audio: true,
+            color,
+            outgoing_ramp: None,
+            is_image: false,
+            image_effect: None,
+            image_effect_seed: 0,
+        }
+    }
+
+    #[test]
+    fn normalize_tone_maps_hdr_after_the_scale() {
+        let dir = std::env::temp_dir().join("sv_render_test_tonemap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = camino::Utf8PathBuf::from_path_buf(dir.join("in.mp4")).unwrap();
+        let output = camino::Utf8PathBuf::from_path_buf(dir.join("out.mp4")).unwrap();
+        let hw = HwConfig::resolve(HwSupport::default(), EncoderPref::Libx264);
+        let plan = plan_color_conversion(&color(10, Some("arib-std-b67"), Some("bt2020")), &full_filters());
+
+        let runner = MockRunner::new();
+        normalize_segment(&runner, &normalize_args_for(&input, &output, plan), &hw).unwrap();
+        let args = &runner.calls.borrow()[0];
+        let vf = args.iter().skip_while(|a| *a != "-vf").nth(1).expect("-vf value");
+        let scale_at = vf.find("scale=1920:1080").expect("letterbox scale");
+        let tm_at = vf.find("tonemap=tonemap=mobius").expect("tone map in chain");
+        assert!(scale_at < tm_at, "tone map runs after the downscale: {vf}");
+        assert!(tm_at < vf.find("fps=fps=30").unwrap(), "{vf}");
+        // The chain ends on BT.709 8-bit frames (zscale sets the frame tags
+        // the encoder writes).
+        assert!(vf.contains("zscale=t=bt709:m=bt709:r=tv,format=yuv420p"), "{vf}");
+        let after = |flag: &str| args.iter().skip_while(|a| *a != flag).nth(1).cloned();
+        assert_eq!(after("-pix_fmt").as_deref(), Some("yuv420p"));
+        // ...and the bitstream is tagged BT.709 explicitly.
+        assert_eq!(after("-color_primaries").as_deref(), Some("bt709"));
+        assert_eq!(after("-color_trc").as_deref(), Some("bt709"));
+        assert_eq!(after("-colorspace").as_deref(), Some("bt709"));
+        assert_eq!(after("-color_range").as_deref(), Some("tv"));
+        // Output options: after the input, before the output path.
+        let tag_at = args.iter().position(|a| a == "-color_trc").unwrap();
+        assert!(tag_at > args.iter().position(|a| a == "-i").unwrap());
+        assert_eq!(args.last().map(String::as_str), Some(output.as_str()));
+
+        // SDR (8-bit or 10-bit) gets exactly the old command line.
+        let plain = MockRunner::new();
+        normalize_segment(&plain, &normalize_args_for(&input, &output, ColorConversion::None), &hw).unwrap();
+        let deep = MockRunner::new();
+        normalize_segment(&deep, &normalize_args_for(&input, &output, ColorConversion::PixelFormat), &hw)
+            .unwrap();
+        let plain_args = plain.calls.borrow()[0].clone();
+        assert_eq!(plain_args, deep.calls.borrow()[0]);
+        assert!(!plain_args.iter().any(|a| a.contains("zscale") || a.contains("colorspace")));
+        assert!(!plain_args.iter().any(|a| a.starts_with("-color_")));
+    }
+
+    #[test]
+    fn filter_list_parsing_matches_whole_names() {
+        // Excerpt of `ffmpeg -filters` (7.1), lower-cased as `detect` does.
+        let full = " T.. = Timeline support\n\
+                    ... = Source or sink filter\n\
+                    TS. colorspace        V->V       Convert between colorspaces.\n\
+                    ... colorspace_cuda   V->V       CUDA accelerated video color converter\n\
+                    .S. tonemap           V->V       Conversion to/from different dynamic ranges.\n\
+                    ... tonemap_opencl    V->V       Perform HDR to SDR conversion with tonemapping.\n\
+                    .SC zscale            V->V       Apply resizing, colorspace and bit depth conversion.\n";
+        assert!(lists_filter(full, "zscale"));
+        assert!(lists_filter(full, "tonemap"));
+        assert!(lists_filter(full, "colorspace"));
+        // A build without zimg: only the GPU tone mappers and words in descriptions.
+        let no_zimg = " ... tonemap_opencl    V->V       Perform HDR to SDR conversion with tonemapping.\n\
+                       ... tonemap_vaapi     V->V       VAAPI VPP for tone-mapping\n\
+                       TS. colorspace        V->V       Convert between colorspaces.\n\
+                       ... scale             V->V       Scale the input video size, not zscale.\n";
+        assert!(!lists_filter(no_zimg, "zscale"));
+        assert!(!lists_filter(no_zimg, "tonemap"));
+        assert!(lists_filter(no_zimg, "colorspace"));
     }
 
     #[test]

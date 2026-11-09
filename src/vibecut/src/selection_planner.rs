@@ -6,10 +6,11 @@
 //!
 //! # Phases of planning
 //!
-//! 1. **Source assembly** ([`group_into_sources`]) — files matching the
-//!    GoPro pattern `GX{NN}{ID}.MP4` with a shared `ID` are stitched into
-//!    one virtual [`Source`] with multiple [`Chapter`]s. Standalone clips
-//!    become single-chapter sources.
+//! 1. **Source assembly** ([`group_into_sources`]) — GoPro chapter files
+//!    of one recording (`GX{NN}{ID}.MP4` / `GH{NN}{ID}.MP4`, or
+//!    `GOPR{ID}.MP4` + `GP{NN}{ID}.MP4` on older cameras) in one folder are
+//!    stitched into one virtual [`Source`] with multiple [`Chapter`]s. Standalone clips
+//!    become single-chapter sources; `.LRV` / `.THM` sidecars are dropped.
 //! 2. **Telemetry harvesting** ([`extract_telemetry`] /
 //!    [`extract_telemetry_with`] → [`SourceTelemetry`]) — for each source,
 //!    extract GPMF accelerometer / HiLight tags, scan the MP4 udta atom for
@@ -42,8 +43,11 @@ use crate::media_probe::ProbedFile;
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export))]
 pub struct Source {
-    /// Recording id. For GoPro: the trailing 4-digit number in `GX{NN}{ID}.MP4`.
-    /// For standalone clips: the file stem.
+    /// Recording id. For GoPro: the 4-digit recording number (`0042` for
+    /// `GX010042.MP4` or `GOPR0042.MP4`). For standalone clips: the file
+    /// stem. When two sources would share an id (two cameras both at
+    /// recording 0042, or two folders), the first chapter's file stem is
+    /// used instead, then `<folder>/<stem>`.
     pub id: String,
     pub chapters: Vec<Chapter>,
     pub total_duration_secs: f64,
@@ -62,6 +66,11 @@ pub struct Chapter {
     /// `None` when probed in metadata-only mode (the render pipeline doesn't
     /// need hashes; only `probe`/cache do).
     pub blake3: Option<String>,
+    /// The chapter's colour description (bit depth, transfer, primaries) as
+    /// probed — what decided whether normalize tone-mapped it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub color: Option<crate::media_probe::ColorInfo>,
 }
 
 impl Source {
@@ -85,63 +94,61 @@ impl Source {
 
 /// Parse a GoPro chapter filename. Returns `(chapter_index, recording_id)`.
 ///
-/// GoPro names look like `GX{NN}{XXXX}.MP4` where `NN` is the chapter index
-/// (incremented as the recording continues) and `XXXX` is the recording id
-/// (constant across chapters). Examples: `GX010384` → (1, "0384"),
-/// `GX020384` → (2, "0384"), `GH010001` → (1, "0001") (older Hero models).
+/// Both naming schemes are understood (see
+/// [`crate::media_probe::parse_gopro_name`]): `GX{NN}{XXXX}.MP4` /
+/// `GH{NN}{XXXX}.MP4` where `NN` is the chapter, and the older
+/// `GOPR{XXXX}.MP4` (chapter 1) followed by `GP{NN}{XXXX}.MP4` (chapter
+/// `NN + 1`). Examples:
+/// `GX010384` → (1, "0384"), `GX020384` → (2, "0384"), `GOPR0384` →
+/// (1, "0384"), `GP010384` → (2, "0384"). Proxies (`.LRV`, `GL…`) and
+/// thumbnails (`.THM`) are not chapters.
 pub fn parse_gopro_filename(name: &str) -> Option<(u32, String)> {
-    let stem = name
-        .strip_suffix(".MP4")
-        .or_else(|| name.strip_suffix(".mp4"))
-        .or_else(|| name.strip_suffix(".LRV"))
-        .or_else(|| name.strip_suffix(".lrv"))?;
-    if stem.len() != 8 {
-        return None;
-    }
-    let bytes = stem.as_bytes();
-    // First two chars: 'G' followed by camera-specific letter (X, H, P, ...).
-    if bytes[0] != b'G' || !bytes[1].is_ascii_uppercase() {
-        return None;
-    }
-    let chapter_str = &stem[2..4];
-    let id_str = &stem[4..];
-    let chapter: u32 = chapter_str.parse().ok()?;
-    if chapter == 0 {
-        return None;
-    }
-    if !id_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some((chapter, id_str.to_string()))
+    crate::media_probe::parse_gopro_name(name).map(|n| (n.chapter, n.recording))
 }
 
-/// Group probed files into Sources, stitching GoPro chapters that share a
-/// recording id. Chapters are sorted by their numeric index.
+/// Group probed files into Sources, stitching GoPro chapters of one
+/// recording. Chapters group by folder + naming family + recording number,
+/// so an older camera's `GOPR0042` and a newer one's `GX010042` in one
+/// folder (or two cards both at recording 0042) stay separate takes; within a take they
+/// sort by chapter index (`GOPR` before `GP01`). Camera sidecars
+/// (`.LRV` proxies, `.THM` thumbnails) are dropped. Source ids are unique.
 pub fn group_into_sources(files: &[ProbedFile]) -> Vec<Source> {
     use std::collections::BTreeMap;
 
-    let mut groups: BTreeMap<String, Vec<(u32, &ProbedFile)>> = BTreeMap::new();
+    // (folder, family, recording) → chapters.
+    type Key<'a> = (&'a str, String, String);
+    let mut groups: BTreeMap<Key<'_>, Vec<(u32, &ProbedFile)>> = BTreeMap::new();
     let mut other: Vec<&ProbedFile> = Vec::new();
 
     for f in files {
         let name = f.path.file_name().unwrap_or("");
-        match parse_gopro_filename(name) {
-            Some((idx, id)) => groups.entry(id).or_default().push((idx, f)),
+        if crate::media_probe::is_gopro_sidecar(name) {
+            tracing::debug!(file = %f.path, "skipping camera proxy / thumbnail");
+            continue;
+        }
+        match crate::media_probe::parse_gopro_name(name) {
+            Some(n) => {
+                let folder = f.path.parent().map(|p| p.as_str()).unwrap_or("");
+                groups
+                    .entry((folder, n.family, n.recording))
+                    .or_default()
+                    .push((n.chapter, f));
+            }
             None => other.push(f),
         }
     }
 
     let mut sources = Vec::new();
 
-    for (id, mut chs) in groups {
-        chs.sort_by_key(|(c, _)| *c);
+    for ((_, _, recording), mut chs) in groups {
+        chs.sort_by(|(a, fa), (b, fb)| a.cmp(b).then_with(|| fa.path.cmp(&fb.path)));
         let chapters: Vec<Chapter> = chs
             .into_iter()
             .map(|(idx, f)| chapter_from(f, idx))
             .collect();
         let total = chapters.iter().map(|c| c.duration_secs).sum();
         sources.push(Source {
-            id,
+            id: recording,
             chapters,
             total_duration_secs: total,
         });
@@ -161,9 +168,72 @@ pub fn group_into_sources(files: &[ProbedFile]) -> Vec<Source> {
         });
     }
 
+    make_ids_unique(&mut sources);
     // Stable-ish ordering: by id ascending.
     sources.sort_by(|a, b| a.id.cmp(&b.id));
     sources
+}
+
+/// Give every source a distinct id. Ids are what `[selection]
+/// source_weights`, `[multi_angle]` groups and the manifest refer to, so a
+/// clash (recording 0042 on two cameras or two cards) must not silently
+/// alias two takes. Unclashed ids are left alone; clashing ones become the
+/// first chapter's file stem (`GX010042`, `GOPR0042`), then
+/// `<folder>/<stem>`, then get a numeric suffix.
+fn make_ids_unique(sources: &mut [Source]) {
+    use std::collections::HashMap;
+
+    fn first_stem(s: &Source) -> String {
+        s.chapters
+            .first()
+            .and_then(|c| c.path.file_stem())
+            .map(str::to_string)
+            .unwrap_or_else(|| s.id.clone())
+    }
+    fn folder_stem(s: &Source) -> String {
+        let folder = s
+            .chapters
+            .first()
+            .and_then(|c| c.path.parent())
+            .and_then(|p| p.file_name())
+            .unwrap_or("");
+        if folder.is_empty() {
+            first_stem(s)
+        } else {
+            format!("{folder}/{}", first_stem(s))
+        }
+    }
+    fn clashing(sources: &[Source]) -> Vec<bool> {
+        let mut n: HashMap<&str, usize> = HashMap::new();
+        for s in sources {
+            *n.entry(s.id.as_str()).or_default() += 1;
+        }
+        sources.iter().map(|s| n[s.id.as_str()] > 1).collect()
+    }
+
+    for rename in [first_stem as fn(&Source) -> String, folder_stem] {
+        let clash = clashing(sources);
+        if !clash.contains(&true) {
+            return;
+        }
+        for (s, c) in sources.iter_mut().zip(clash) {
+            if c {
+                s.id = rename(s);
+            }
+        }
+    }
+    // Still clashing (same folder name and file name): number them in path order.
+    let clash = clashing(sources);
+    let mut order: Vec<usize> = (0..sources.len()).filter(|&i| clash[i]).collect();
+    order.sort_by_key(|&i| sources[i].chapters.first().map(|c| c.path.clone()));
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    for i in order {
+        let n = seen.entry(sources[i].id.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            sources[i].id = format!("{}-{}", sources[i].id, n);
+        }
+    }
 }
 
 fn chapter_from(f: &ProbedFile, idx: u32) -> Chapter {
@@ -173,6 +243,11 @@ fn chapter_from(f: &ProbedFile, idx: u32) -> Chapter {
         duration_secs: f.media.as_ref().map(|m| m.duration_secs).unwrap_or(0.0),
         creation_time: f.media.as_ref().and_then(|m| m.creation_time.clone()),
         blake3: f.blake3.clone(),
+        color: f
+            .media
+            .as_ref()
+            .and_then(|m| m.video.as_ref())
+            .map(|v| v.color.clone()),
     }
 }
 
@@ -900,6 +975,7 @@ mod tests {
                     width: 3840,
                     height: 2160,
                     fps: 50.0,
+                    color: Default::default(),
                 }),
                 audio: Some(AudioStream {
                     codec: "aac".into(),
@@ -920,6 +996,171 @@ mod tests {
         assert_eq!(parse_gopro_filename("video.mp4"), None);
         assert_eq!(parse_gopro_filename("GX00abcd.MP4"), None);
         assert_eq!(parse_gopro_filename("GX001234.MP4"), None); // chapter 0 invalid
+        // Older scheme: GOPR is the first chapter, GP01 the second.
+        assert_eq!(parse_gopro_filename("GOPR0042.MP4"), Some((1, "0042".into())));
+        assert_eq!(parse_gopro_filename("GP010042.MP4"), Some((2, "0042".into())));
+        assert_eq!(parse_gopro_filename("gp020042.mp4"), Some((3, "0042".into())));
+        // Proxies are not chapters.
+        assert_eq!(parse_gopro_filename("GL010384.LRV"), None);
+        assert_eq!(parse_gopro_filename("GX010384.LRV"), None);
+        assert_eq!(parse_gopro_filename("GOPR0042.LRV"), None);
+    }
+
+    fn ids_and_chapters(sources: &[Source]) -> Vec<(String, Vec<String>)> {
+        sources
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.chapters.iter().map(|c| c.path.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_chapters_stitch_gopr_first() {
+        let files = vec![
+            fake("card/GP020042.MP4", 30.0),
+            fake("card/GP010042.MP4", 20.0),
+            fake("card/GOPR0042.MP4", 10.0),
+        ];
+        let sources = group_into_sources(&files);
+        assert_eq!(sources.len(), 1, "{:?}", ids_and_chapters(&sources));
+        let s = &sources[0];
+        assert_eq!(s.id, "0042");
+        assert_eq!(
+            s.chapters.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            vec!["card/GOPR0042.MP4", "card/GP010042.MP4", "card/GP020042.MP4"]
+        );
+        assert_eq!(s.chapters.iter().map(|c| c.chapter_index).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!((s.total_duration_secs - 60.0).abs() < 1e-9);
+        // The first chapter starts the virtual timeline.
+        let (ch, off) = s.locate(5.0).unwrap();
+        assert_eq!(ch.path, "card/GOPR0042.MP4");
+        assert!((off - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lowercase_and_mixed_case_names_stitch() {
+        let files = vec![
+            fake("card/gp010042.mp4", 20.0),
+            fake("card/GOPR0042.mp4", 10.0),
+            fake("card/gx020007.MP4", 5.0),
+            fake("card/GX010007.mp4", 5.0),
+        ];
+        let sources = group_into_sources(&files);
+        assert_eq!(
+            ids_and_chapters(&sources),
+            vec![
+                ("0007".into(), vec!["card/GX010007.mp4".into(), "card/gx020007.MP4".into()]),
+                ("0042".into(), vec!["card/GOPR0042.mp4".into(), "card/gp010042.mp4".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn proxies_and_thumbnails_never_join_a_source() {
+        let files = vec![
+            fake("card/GX010384.MP4", 100.0),
+            fake("card/GL010384.LRV", 100.0),
+            fake("card/GX010384.THM", 0.04),
+            fake("card/GX020384.MP4", 50.0),
+            fake("card/GL020384.LRV", 50.0),
+            fake("card/GL020384.MP4", 50.0), // proxy renamed to .MP4
+            fake("old/GOPR0042.MP4", 10.0),
+            fake("old/GOPR0042.LRV", 10.0),
+            fake("old/GOPR0042.THM", 0.04),
+            fake("old/GP010042.MP4", 10.0),
+            fake("old/GP010042.LRV", 10.0),
+        ];
+        let sources = group_into_sources(&files);
+        assert_eq!(
+            ids_and_chapters(&sources),
+            vec![
+                ("0042".into(), vec!["old/GOPR0042.MP4".into(), "old/GP010042.MP4".into()]),
+                ("0384".into(), vec!["card/GX010384.MP4".into(), "card/GX020384.MP4".into()]),
+            ]
+        );
+        assert!((sources[1].total_duration_secs - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mixed_cameras_with_the_same_recording_number_stay_separate() {
+        // An older camera (GOPR/GP), a newer one in HEVC (GX) and one in AVC (GH) all
+        // at recording 0042 in one folder, plus a second card's GX 0042 in
+        // another folder: four takes, none merged.
+        let files = vec![
+            fake("trip/GOPR0042.MP4", 10.0),
+            fake("trip/GP010042.MP4", 10.0),
+            fake("trip/GX010042.MP4", 20.0),
+            fake("trip/GX020042.MP4", 20.0),
+            fake("trip/GH010042.MP4", 30.0),
+            fake("trip/day2/GX010042.MP4", 40.0),
+            fake("trip/GX010099.MP4", 50.0),
+        ];
+        let sources = group_into_sources(&files);
+        assert_eq!(
+            ids_and_chapters(&sources),
+            vec![
+                ("0099".into(), vec!["trip/GX010099.MP4".into()]),
+                ("GH010042".into(), vec!["trip/GH010042.MP4".into()]),
+                ("GOPR0042".into(), vec!["trip/GOPR0042.MP4".into(), "trip/GP010042.MP4".into()]),
+                ("day2/GX010042".into(), vec!["trip/day2/GX010042.MP4".into()]),
+                ("trip/GX010042".into(), vec!["trip/GX010042.MP4".into(), "trip/GX020042.MP4".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn standalone_clips_with_the_same_name_get_distinct_ids() {
+        let files = vec![
+            fake("a/clip.mp4", 10.0),
+            fake("b/clip.mp4", 10.0),
+            fake("b/other.mp4", 10.0),
+        ];
+        let ids: Vec<String> = group_into_sources(&files).into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["a/clip", "b/clip", "other"]);
+    }
+
+    #[test]
+    fn two_cards_with_the_same_dcim_layout_stay_separate() {
+        // Same folder name and file names on both cards: chapters still
+        // only stitch within their own folder, and the ids get numbered.
+        let files = vec![
+            fake("cardA/DCIM/100GOPRO/GX010042.MP4", 10.0),
+            fake("cardA/DCIM/100GOPRO/GX020042.MP4", 10.0),
+            fake("cardB/DCIM/100GOPRO/GX010042.MP4", 20.0),
+        ];
+        assert_eq!(
+            ids_and_chapters(&group_into_sources(&files)),
+            vec![
+                (
+                    "100GOPRO/GX010042".into(),
+                    vec![
+                        "cardA/DCIM/100GOPRO/GX010042.MP4".into(),
+                        "cardA/DCIM/100GOPRO/GX020042.MP4".into()
+                    ]
+                ),
+                ("100GOPRO/GX010042-2".into(), vec!["cardB/DCIM/100GOPRO/GX010042.MP4".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn chapters_record_probed_colour() {
+        let mut f = fake("card/GX010001.MP4", 10.0);
+        f.media.as_mut().unwrap().video.as_mut().unwrap().color = crate::media_probe::ColorInfo {
+            bit_depth: Some(10),
+            transfer: Some("arib-std-b67".into()),
+            primaries: Some("bt2020".into()),
+            ..Default::default()
+        };
+        let sources = group_into_sources(&[f]);
+        let c = sources[0].chapters[0].color.as_ref().unwrap();
+        assert_eq!(c.summary(), "10-bit HLG BT.2020");
+        let json = serde_json::to_value(&sources[0].chapters[0]).unwrap();
+        assert_eq!(json["color"]["transfer"], "arib-std-b67");
     }
 
     #[test]
