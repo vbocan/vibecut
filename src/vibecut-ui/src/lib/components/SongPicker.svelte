@@ -1,12 +1,13 @@
 <script lang="ts">
 	import { onDestroy, tick } from 'svelte';
 	import { appState as s } from '$lib/state.svelte';
+	import * as api from '$lib/api';
 	import { musicFileUrl, type Track } from '$lib/api';
 	import { clock } from '$lib/vibes';
 	import { radiogroup } from '$lib/radiogroup';
 	import EnergyBars from './EnergyBars.svelte';
 	import MusicImport from './MusicImport.svelte';
-	import MusicFolderButton from './MusicFolderButton.svelte';
+	import BrowseDialog from './BrowseDialog.svelte';
 	import PendingChangeOffer from './PendingChangeOffer.svelte';
 	import { collectionLabel, licenceBadge } from '$lib/music';
 
@@ -27,7 +28,83 @@
 	let progress = $state(0);
 	let audio: HTMLAudioElement | undefined;
 
-	const shown = $derived(mood === 'all' ? s.tracks : s.tracks.filter((t) => t.mood === mood));
+	// ---- music folders, like the footage step: the library's folders
+	// (yours, the library's, those picked on a drive) filter the list.
+	let folder = $state('all');
+	let browsing = $state(false);
+	let showManual = $state(false);
+	let manual = $state('');
+	let adding = $state(false);
+	let addError = $state<string | null>(null);
+
+	/** The music folder a track came from (the deepest that holds it). */
+	function dirOf(t: Track): string | null {
+		let best: string | null = null;
+		for (const d of s.musicDirs) {
+			const p = d.path.replace(/\/+$/, '');
+			if (t.path.startsWith(p + '/') && (!best || p.length > best.length)) best = d.path;
+		}
+		return best;
+	}
+
+	function folderName(d: api.MusicDir): string {
+		if (d.path === s.musicImportDir) return 'Your music';
+		const shownPath = (d.display ?? d.path).replace(/[\\/]+$/, '');
+		return shownPath.split(/[\\/]/).pop() || shownPath;
+	}
+
+	const folders = $derived(
+		s.musicDirs
+			.map((d) => ({ dir: d, name: folderName(d), n: s.tracks.filter((t) => dirOf(t) === d.path).length }))
+			.filter((f) => f.n > 0 || f.dir.picked)
+	);
+	// One folder only: the row would just repeat "All songs".
+	const showFolders = $derived(folders.length >= 2 || folders.some((f) => f.dir.picked));
+	const current = $derived(folders.find((f) => f.dir.path === folder) ?? null);
+	$effect(() => {
+		if (folder !== 'all' && !current) folder = 'all';
+	});
+
+	const inFolder = $derived(folder === 'all' ? s.tracks : s.tracks.filter((t) => dirOf(t) === folder));
+	const shown = $derived(mood === 'all' ? inFolder : inFolder.filter((t) => t.mood === mood));
+
+	async function addFolder(path: string) {
+		if (adding) return;
+		adding = true;
+		addError = null;
+		lookNote = `Adding ${path}… Vibecut is reading its songs.`;
+		const before = s.tracks.length;
+		try {
+			const r = await s.addMusicFolder(path);
+			const n = s.tracks.length - before;
+			lookNote = r.already
+				? `${r.path} is already in your library.`
+				: `Added ${r.path}: ${n === 1 ? '1 song' : `${n} songs`}.`;
+			if (!r.already && r.container_path) folder = r.container_path;
+			showManual = false;
+			manual = '';
+			if (s.tracks.length > 0) {
+				await tick();
+				list?.querySelector<HTMLElement>('[role="radio"][aria-checked="true"], [role="radio"]')?.focus();
+			}
+		} catch (e) {
+			addError = e instanceof api.ApiError ? e.describe() : String(e);
+			lookNote = addError;
+		} finally {
+			adding = false;
+		}
+	}
+
+	async function removeFolder(d: api.MusicDir) {
+		const name = d.display ?? d.path;
+		try {
+			await s.removeMusicFolder(d.path);
+			folder = 'all';
+			lookNote = `Removed ${name} from your library. Its songs are still on the drive.`;
+		} catch (e) {
+			lookNote = e instanceof api.ApiError ? e.describe() : String(e);
+		}
+	}
 	// The server picks the song ("Picked for you"); this only shows it.
 	const auto = $derived(s.autoPick);
 	const autoTrack = $derived(auto ? (s.tracks.find((t) => t.path === auto.path) ?? null) : null);
@@ -96,13 +173,6 @@
 	// it was pressed on, so the focus moves to the song that is picked and
 	// the outcome is read from this component's own status line.
 	let lookNote = $state('');
-	async function folderAdded(message: string) {
-		lookNote = message;
-		if (s.tracks.length > 0) {
-			await tick();
-			list?.querySelector<HTMLElement>('[role="radio"][aria-checked="true"], [role="radio"]')?.focus();
-		}
-	}
 	/** The "Add music" panel, opened from the empty state too. */
 	let importOpen = $state(false);
 	let root: HTMLElement | undefined = $state();
@@ -137,8 +207,33 @@
 			<span class="num" aria-hidden="true">3</span>
 			<h2 id="song-h">Pick a song</h2>
 			<span class="hint">Every cut lands on its beat.</span>
+			<span class="head-actions">
+				<button class="btn small browse" type="button" aria-haspopup="dialog" aria-disabled={adding} onclick={() => {
+						if (!adding) browsing = true;
+					}}>{adding ? 'Adding…' : 'Browse your drives…'}</button
+				>
+				<button class="btn ghost small" type="button" aria-expanded={showManual} onclick={() => (showManual = !showManual)}>
+					{showManual ? 'Hide' : 'Type a folder'}
+				</button>
+			</span>
 		</div>
 	{/if}
+	<BrowseDialog bind:open={browsing} mode="music" onpick={(c) => void addFolder(c.path)} />
+
+	{#if showManual}
+		<form
+			class="manual"
+			onsubmit={(e) => {
+				e.preventDefault();
+				if (manual.trim()) void addFolder(manual.trim());
+			}}
+		>
+			<label class="sr-only" for="{uid}-manual">A folder of songs on a drive, such as D:\Music</label>
+			<input id="{uid}-manual" placeholder="A folder of songs, e.g. D:\Music\Road trip" bind:value={manual} />
+			<button class="btn" type="submit" disabled={!manual.trim() || adding}>Add</button>
+		</form>
+	{/if}
+	{#if addError}<p class="add-error">{addError}</p>{/if}
 
 	<!-- Placeholders for the first read only: a later "Look again" keeps
 	     what is on screen (and the focus on it) while it looks. -->
@@ -155,7 +250,10 @@
 				energy automatically. Without a song, videos keep their own sound.</span
 			>
 			<div class="empty-actions">
-				<MusicFolderButton variant="primary" onresult={folderAdded} />
+				<button class="btn primary" type="button" aria-haspopup="dialog" aria-disabled={adding} onclick={() => {
+						if (!adding) browsing = true;
+					}}>{adding ? 'Adding the folder…' : 'Pick a music folder…'}</button
+				>
 				<button class="btn ghost" type="button" onclick={showSources}>Where to get free music</button>
 				<!-- aria-disabled keeps the focus on the button while it looks. -->
 				<button class="btn ghost" type="button" aria-disabled={s.loadingMusic} onclick={lookAgain}
@@ -164,6 +262,43 @@
 			</div>
 		</div>
 	{:else}
+		{#if showFolders}
+			<div class="folders-row">
+				<div class="folders" role="radiogroup" aria-label="Music folder" use:radiogroup>
+					<button
+						type="button"
+						role="radio"
+						aria-checked={folder === 'all'}
+						class="folder-chip"
+						class:on={folder === 'all'}
+						onclick={() => (folder = 'all')}
+						><span class="f-icon" aria-hidden="true">♫</span> All songs <span class="n">{s.tracks.length}</span></button
+					>
+					{#each folders as f (f.dir.path)}
+						<button
+							type="button"
+							role="radio"
+							aria-checked={folder === f.dir.path}
+							class="folder-chip"
+							class:on={folder === f.dir.path}
+							title={f.dir.display ?? f.dir.path}
+							onclick={() => (folder = f.dir.path)}
+							><span class="f-icon" aria-hidden="true">{f.dir.picked ? '⛁' : '▣'}</span>
+							{f.name} <span class="n">{f.n}</span></button
+						>
+					{/each}
+				</div>
+				{#if current?.dir.picked}
+					<button class="btn ghost small" type="button" onclick={() => current && removeFolder(current.dir)}
+						>Remove this folder</button
+					>
+				{/if}
+			</div>
+			{#if current}<p class="folder-path mono" title={current.dir.display ?? current.dir.path}>
+					{current.dir.display ?? current.dir.path}
+				</p>{/if}
+		{/if}
+
 		<div class="moods" role="radiogroup" aria-label="Filter by mood" use:radiogroup>
 			{#each MOODS as m (m.key)}
 				<button
@@ -377,6 +512,105 @@
 		display: flex;
 		flex-wrap: wrap;
 		gap: 6px;
+	}
+
+	.head-actions {
+		display: flex;
+		gap: 8px;
+		margin-left: auto;
+	}
+
+	.manual {
+		display: flex;
+		gap: 8px;
+	}
+
+	.manual input {
+		flex: 1;
+		min-width: 0;
+		padding: 8px 12px;
+		border-radius: var(--r-md);
+		border: 1px solid var(--line-strong);
+		background: rgba(0, 0, 0, 0.25);
+		color: var(--text);
+		font: inherit;
+		font-size: var(--fs-sm);
+	}
+
+	.add-error {
+		margin: 0;
+		color: var(--bad);
+		font-size: var(--fs-sm);
+	}
+
+	.folders-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px 12px;
+	}
+
+	.folders {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+	}
+
+	.folder-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		max-width: 260px;
+		padding: 7px 12px;
+		border-radius: var(--r-md);
+		border: 1px solid var(--line);
+		background: rgba(255, 255, 255, 0.03);
+		color: var(--text-dim);
+		font-size: var(--fs-sm);
+		font-weight: 600;
+		cursor: pointer;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.folder-chip:hover {
+		border-color: var(--line-strong);
+		color: var(--text);
+	}
+
+	.folder-chip.on {
+		color: var(--text);
+		border-color: var(--magenta);
+		background: color-mix(in srgb, var(--magenta) 14%, transparent);
+	}
+
+	.folder-chip .n {
+		padding: 0 7px;
+		border-radius: 999px;
+		background: rgba(255, 255, 255, 0.08);
+		font-size: var(--fs-xs);
+		color: var(--text-dim);
+	}
+
+	.f-icon {
+		opacity: 0.8;
+	}
+
+	.folder-path {
+		margin: -6px 0 0;
+		font-size: var(--fs-xs);
+		color: var(--text-faint);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	@media (max-width: 640px) {
+		.head-actions {
+			margin-left: 0;
+			width: 100%;
+		}
 	}
 
 	.mood-chip {

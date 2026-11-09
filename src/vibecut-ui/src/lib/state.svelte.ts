@@ -279,13 +279,17 @@ class AppState {
 
 	/** Add a folder on a drive to the library (its songs are analysed, so
 	 *  this can take a while for a big folder). Returns what was added. */
-	async addMusicFolder(path: string): Promise<{ path: string; already: boolean }> {
+	async addMusicFolder(path: string): Promise<{ path: string; container_path: string | null; already: boolean }> {
 		this.loadingMusic = true;
 		this.musicError = null;
 		try {
 			const lib = await api.addMusicFolder(path);
 			this.setLibrary(lib);
-			return { path: lib.added?.path ?? path, already: !!lib.added?.already };
+			return {
+				path: lib.added?.path ?? path,
+				container_path: lib.added?.container_path ?? null,
+				already: !!lib.added?.already
+			};
 		} finally {
 			this.loadingMusic = false;
 			this.musicLoaded = true;

@@ -3,6 +3,8 @@
 - an empty library offers "Pick a music folder…" and "Where to get free
   music"; the latter opens the Add music panel on its first site link,
   every site link opens a new tab (https, noopener);
+- the song step's header has "Browse your drives…" and "Type a folder",
+  like the footage step; the folders become chips that filter the list;
 - "Pick a music folder…" opens the drive dialog in music mode: song
   counts, no video wording; it walks to `--path` and "Use this folder"
   adds it: the songs are listed, the folder shows under "Also reading" as
@@ -92,6 +94,9 @@ def main() -> int:
         page.wait_for_selector(".act .empty")
         empty = page.locator(".act .empty")
         check(empty.get_by_role("button", name="Pick a music folder…").count() == 1, "the empty state offers Pick a music folder…")
+        song_sec = page.locator("section", has=page.locator("#song-h"))
+        check(song_sec.get_by_role("button", name="Browse your drives…").count() == 1, "the song step has Browse your drives…")
+        check(song_sec.get_by_role("button", name="Type a folder").count() == 1, "…and Type a folder")
         empty.get_by_role("button", name="Where to get free music").click()
         page.wait_for_timeout(400)
         focused = page.evaluate("() => document.activeElement?.closest('.find') && document.activeElement.tagName")
@@ -138,6 +143,9 @@ def main() -> int:
         page.wait_for_selector(".act .list [role=radio]", timeout=30000)
         n_songs = page.locator(".act .list [role=radio]").count()
         check(n_songs >= 1, f"the songs are listed ({n_songs})")
+        chip = page.get_by_role("radiogroup", name="Music folder").get_by_role("radio", name=below[-1])
+        check(chip.count() == 1 and chip.get_attribute("aria-checked") == "true", "the new folder is the chosen music folder")
+        check(page.get_by_role("button", name="Remove this folder").count() == 1, "…and can be removed from right there")
 
         st, lib = api("/music")
         picked = [d for d in lib["dirs"] if d.get("picked")]

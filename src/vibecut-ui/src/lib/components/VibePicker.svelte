@@ -2,6 +2,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { vibeLook, prettyDuration } from '$lib/vibes';
 	import { radiogroup } from '$lib/radiogroup';
+	import VibeIcon from './VibeIcon.svelte';
 
 	function pick(key: string) {
 		s.selectedVibe = key;
@@ -21,12 +22,19 @@
 		},
 		{ label: 'Long', value: '5m', note: '5 min' }
 	]);
+
+	/** Cut strip: shot widths in % of the strip. */
+	function strip(cuts: number[]): number[] {
+		const total = cuts.reduce((a, b) => a + b, 0) || 1;
+		return cuts.map((c) => (c / total) * 100);
+	}
 </script>
 
 <section class="act" aria-labelledby="vibe-h">
 	<div class="act-head">
 		<span class="num" aria-hidden="true">2</span>
 		<h2 id="vibe-h">Choose a vibe</h2>
+		<span class="hint">How your video is cut and how it sounds.</span>
 	</div>
 
 	{#if s.vibesError}
@@ -37,36 +45,45 @@
 		{#each s.vibes as v, i (v.key)}
 			{@const look = vibeLook(v.key)}
 			{@const isAuto = !s.selectedVibe && s.autoVibe === v.key}
+			{@const on = s.effectiveVibe === v.key}
 			<!-- Named by the vibe alone; the rest of the card is its description. -->
 			<button
 				type="button"
 				role="radio"
-				aria-checked={s.effectiveVibe === v.key}
+				aria-checked={on}
 				aria-labelledby="vibe-{v.key}-name"
-				aria-describedby="{isAuto ? `vibe-${v.key}-auto ` : ''}vibe-{v.key}-len vibe-{v.key}-tag vibe-{v.key}-best"
-				class="vibe {look.motion}"
-				class:selected={s.effectiveVibe === v.key}
+				aria-describedby="{isAuto ? `vibe-${v.key}-auto ` : ''}vibe-{v.key}-tag vibe-{v.key}-facts vibe-{v.key}-best"
+				class="vibe"
+				class:selected={on}
 				style="--a: {look.colors[0]}; --b: {look.colors[1]}; --c: {look.colors[2]}; --i: {i}"
 				onclick={() => pick(v.key)}
 			>
-				<span class="art" aria-hidden="true">
-					<span class="blob b1"></span>
-					<span class="blob b2"></span>
-					<span class="blob b3"></span>
-					<span class="lines"></span>
-				</span>
-				{#if isAuto}
-					<span class="auto-badge" id="vibe-{v.key}-auto"><span aria-hidden="true">✦</span> Picked for your footage</span>
-				{/if}
-				<span class="body">
-					<span class="row">
+				<span class="top">
+					<span class="icon"><VibeIcon icon={look.icon} /></span>
+					<span class="titles">
 						<span class="name" id="vibe-{v.key}-name">{v.name}</span>
-						<span class="len" id="vibe-{v.key}-len">{prettyDuration(v.default_target_duration)}</span>
+						<span class="tagline" id="vibe-{v.key}-tag">{look.tagline}</span>
 					</span>
-					<span class="tagline" id="vibe-{v.key}-tag">{look.tagline}</span>
-					<span class="best" id="vibe-{v.key}-best">
-						{#each look.best as b (b)}<span>{b}</span>{/each}
-					</span>
+				</span>
+
+				<!-- The cut rhythm: one block per shot, as long as the shot. -->
+				<span class="cuts" aria-hidden="true">
+					{#each strip(look.cuts) as w, k (k)}<span class="shot" style="flex-basis: {w}%; --k: {k % 3}"></span>{/each}
+				</span>
+
+				<span class="facts" id="vibe-{v.key}-facts">
+					<span class="fact"><span class="k">Cuts</span> {look.pace}</span>
+					<span class="fact"><span class="k">Sound</span> {look.sound}</span>
+					<span class="fact"><span class="k">Length</span> about {prettyDuration(v.default_target_duration)}</span>
+				</span>
+
+				<span class="foot">
+					<span class="best" id="vibe-{v.key}-best">Good for {look.best.join(', ').toLowerCase()}</span>
+					{#if on}
+						<span class="state on-state" aria-hidden="true">✓ Selected</span>
+					{:else if isAuto}
+						<span class="state" id="vibe-{v.key}-auto"><span aria-hidden="true">✦</span> Suits your footage</span>
+					{/if}
 				</span>
 			</button>
 		{/each}
@@ -101,6 +118,7 @@
 	.act-head {
 		display: flex;
 		align-items: center;
+		flex-wrap: wrap;
 		gap: 12px;
 	}
 
@@ -124,9 +142,14 @@
 		letter-spacing: -0.02em;
 	}
 
+	.hint {
+		color: var(--text-faint);
+		font-size: var(--fs-sm);
+	}
+
 	.vibes {
 		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+		grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
 		gap: 14px;
 	}
 
@@ -134,17 +157,19 @@
 		position: relative;
 		display: flex;
 		flex-direction: column;
-		min-height: 196px;
-		padding: 0;
+		gap: 14px;
+		padding: 16px;
 		border-radius: var(--r-lg);
-		overflow: hidden;
 		border: 1px solid var(--line);
-		background: #0d0f16;
+		/* A thin band of the vibe's colour along the top. */
+		background:
+			linear-gradient(90deg, var(--a), var(--b), var(--c)) top / 100% 3px no-repeat,
+			linear-gradient(180deg, color-mix(in srgb, var(--b) 10%, #10121a), #0d0f16 70%);
+		color: var(--text);
 		cursor: pointer;
 		text-align: left;
-		isolation: isolate;
 		animation: rise var(--dur-3) var(--ease-out) both;
-		animation-delay: calc(var(--i, 0) * 60ms);
+		animation-delay: calc(var(--i, 0) * 50ms);
 		transition:
 			transform var(--dur-2) var(--ease-out),
 			box-shadow var(--dur-2) var(--ease-out),
@@ -152,217 +177,117 @@
 	}
 
 	.vibe:hover {
-		transform: translateY(-4px);
+		transform: translateY(-2px);
 		border-color: var(--line-strong);
 	}
 
 	.vibe.selected {
-		border-color: transparent;
+		border-color: var(--b);
 		box-shadow:
-			0 0 0 2px var(--b),
-			0 22px 60px -18px var(--b);
-		transform: translateY(-4px);
+			0 0 0 1px var(--b),
+			0 18px 50px -20px var(--b);
 	}
 
-	/* ---- living art ---- */
-	.art {
-		position: absolute;
-		inset: 0;
-		z-index: -1;
-		background: radial-gradient(120% 90% at 0% 0%, color-mix(in srgb, var(--a) 40%, transparent), transparent 60%),
-			radial-gradient(120% 90% at 100% 20%, color-mix(in srgb, var(--c) 45%, transparent), transparent 60%),
-			#0d0f16;
-		opacity: 0.85;
-		transition: opacity var(--dur-2);
+	.top {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr);
+		gap: 4px 12px;
+		align-items: start;
 	}
 
-	.vibe:hover .art,
-	.vibe.selected .art {
-		opacity: 1;
+	.icon {
+		display: grid;
+		place-items: center;
+		width: 44px;
+		height: 44px;
+		border-radius: 12px;
+		color: var(--a);
+		background: color-mix(in srgb, var(--b) 16%, transparent);
+		border: 1px solid color-mix(in srgb, var(--b) 40%, transparent);
 	}
 
-	.art::after {
-		content: '';
-		position: absolute;
-		inset: 0;
-		background: linear-gradient(to top, rgba(8, 9, 14, 0.95) 18%, rgba(8, 9, 14, 0.35) 70%, rgba(8, 9, 14, 0.1));
-	}
-
-	.blob {
-		position: absolute;
-		border-radius: 50%;
-		filter: blur(18px);
-		opacity: 0.9;
-	}
-
-	.b1 {
-		width: 120px;
-		height: 120px;
-		left: 8%;
-		top: 6%;
-		background: var(--a);
-	}
-
-	.b2 {
-		width: 90px;
-		height: 90px;
-		right: 12%;
-		top: 14%;
-		background: var(--b);
-	}
-
-	.b3 {
-		width: 70px;
-		height: 70px;
-		left: 46%;
-		top: 30%;
-		background: var(--c);
-	}
-
-	.lines {
-		position: absolute;
-		inset: 0;
-		opacity: 0;
-	}
-
-	/* Personalities — slow at rest, livelier on hover/selection. */
-	.bounce .b1 {
-		animation: bounce 1.6s var(--ease-spring) infinite alternate;
-	}
-	.bounce .b2 {
-		animation: bounce 1.2s var(--ease-spring) infinite alternate-reverse;
-	}
-	.bounce .b3 {
-		animation: bounce 1.9s var(--ease-spring) infinite alternate;
-	}
-
-	.drift .b1,
-	.drift .b2,
-	.drift .b3 {
-		animation: drift 12s var(--ease-in-out) infinite alternate;
-	}
-	.drift .b2 {
-		animation-duration: 16s;
-	}
-
-	.glide .lines {
-		opacity: 0.5;
-		background: repeating-linear-gradient(
-			180deg,
-			transparent 0 18px,
-			color-mix(in srgb, var(--a) 35%, transparent) 18px 19px
-		);
-		mask-image: linear-gradient(to bottom, transparent, black 40%, transparent 80%);
-		animation: glide 9s linear infinite;
-	}
-	.glide .b1,
-	.glide .b2 {
-		animation: drift 18s var(--ease-in-out) infinite alternate;
-	}
-
-	.strobe .lines {
-		opacity: 0.55;
-		background: repeating-linear-gradient(
-			115deg,
-			transparent 0 22px,
-			color-mix(in srgb, var(--a) 55%, transparent) 22px 30px
-		);
-		animation: sweep 1.1s linear infinite;
-	}
-	.strobe .b1,
-	.strobe .b2,
-	.strobe .b3 {
-		animation: flash 0.9s steps(2) infinite;
-	}
-	.strobe .b2 {
-		animation-delay: 0.3s;
-	}
-
-	.calm .b1,
-	.calm .b2,
-	.calm .b3 {
-		animation: breathe 6s var(--ease-in-out) infinite alternate;
-		opacity: 0.6;
-	}
-
-	.float .b1,
-	.float .b2,
-	.float .b3 {
-		animation: float 10s var(--ease-in-out) infinite;
-	}
-	.float .b2 {
-		animation-delay: -3s;
-	}
-	.float .b3 {
-		animation-delay: -6s;
-	}
-
-	.vibe:not(:hover):not(.selected) .blob,
-	.vibe:not(:hover):not(.selected) .lines {
-		animation-play-state: paused;
-	}
-
-	/* ---- copy ---- */
-	.body {
-		margin-top: auto;
+	.titles {
 		display: flex;
 		flex-direction: column;
-		gap: 6px;
-		padding: 18px;
-	}
-
-	.row {
-		display: flex;
-		align-items: baseline;
-		justify-content: space-between;
-		gap: 8px;
+		gap: 3px;
+		min-width: 0;
 	}
 
 	.name {
-		font-size: 21px;
+		font-size: 18px;
 		font-weight: 700;
-		letter-spacing: -0.02em;
-	}
-
-	.len {
-		font-family: var(--mono);
-		font-size: var(--fs-xs);
-		color: var(--text-dim);
+		letter-spacing: -0.01em;
 	}
 
 	.tagline {
-		font-family: var(--serif);
-		font-size: 18px;
-		line-height: 1.25;
-		color: #e9e4ff;
+		font-size: var(--fs-sm);
+		color: var(--text-dim);
+		line-height: 1.4;
 	}
 
-	.best {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 6px;
-		margin-top: 4px;
-	}
-
-	.best span {
-		font-size: 11.5px;
-		padding: 2px 8px;
+	.state {
+		flex-shrink: 0;
+		padding: 2px 10px;
 		border-radius: 999px;
-		background: rgba(255, 255, 255, 0.08);
+		font-size: var(--fs-xs);
+		font-weight: 700;
+		border: 1px solid var(--line-strong);
 		color: var(--text-dim);
 	}
 
-	.auto-badge {
-		position: absolute;
-		top: 12px;
-		left: 12px;
-		padding: 3px 10px;
-		border-radius: 999px;
-		font-size: 11.5px;
+	.on-state {
+		color: var(--ink);
+		background: var(--b);
+		border-color: var(--b);
+	}
+
+	.cuts {
+		display: flex;
+		gap: 3px;
+		height: 14px;
+	}
+
+	.shot {
+		flex-grow: 0;
+		flex-shrink: 1;
+		min-width: 3px;
+		border-radius: 3px;
+		background: var(--b);
+		opacity: calc(0.55 + var(--k) * 0.18);
+	}
+
+	.facts {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		font-size: var(--fs-sm);
+		color: var(--text);
+	}
+
+	.fact .k {
+		display: inline-block;
+		width: 58px;
+		color: var(--text-faint);
+		font-size: var(--fs-xs);
 		font-weight: 700;
-		background: rgba(7, 8, 12, 0.6);
-		border: 1px solid rgba(255, 255, 255, 0.25);
-		backdrop-filter: blur(6px);
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+	}
+
+	.foot {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		margin-top: auto;
+		padding-top: 10px;
+		border-top: 1px solid var(--line);
+		min-height: 22px;
+	}
+
+	.best {
+		font-size: var(--fs-xs);
+		color: var(--text-dim);
 	}
 
 	.lengths {
@@ -408,28 +333,21 @@
 		color: var(--bad);
 	}
 
-	/* Phones: a compact two-up grid instead of six tall tiles. */
 	@media (max-width: 640px) {
 		.vibes {
-			grid-template-columns: repeat(2, minmax(0, 1fr));
+			grid-template-columns: 1fr;
 			gap: 10px;
 		}
 		.vibe {
-			min-height: 150px;
+			padding: 14px;
+			gap: 10px;
 		}
-		.body {
-			padding: 12px;
-			gap: 4px;
-		}
-		.name {
-			font-size: 16px;
-		}
-		.len,
-		.best {
-			display: none;
-		}
-		.tagline {
-			font-size: 14.5px;
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.vibe {
+			animation: none;
+			transition: none;
 		}
 	}
 
@@ -437,62 +355,6 @@
 		from {
 			opacity: 0;
 			transform: translateY(14px) scale(0.98);
-		}
-	}
-	@keyframes bounce {
-		from {
-			transform: translateY(0) scale(1);
-		}
-		to {
-			transform: translateY(26px) scale(1.15);
-		}
-	}
-	@keyframes drift {
-		from {
-			transform: translate(0, 0) scale(1);
-		}
-		to {
-			transform: translate(40px, 20px) scale(1.3);
-		}
-	}
-	@keyframes glide {
-		from {
-			background-position: 0 0;
-		}
-		to {
-			background-position: 0 190px;
-		}
-	}
-	@keyframes sweep {
-		from {
-			background-position: 0 0;
-		}
-		to {
-			background-position: 140px 0;
-		}
-	}
-	@keyframes flash {
-		50% {
-			opacity: 0.35;
-		}
-	}
-	@keyframes breathe {
-		to {
-			transform: scale(1.25);
-			opacity: 0.85;
-		}
-	}
-	@keyframes float {
-		0% {
-			transform: translateY(40px) scale(0.8);
-			opacity: 0;
-		}
-		30% {
-			opacity: 0.9;
-		}
-		100% {
-			transform: translateY(-70px) scale(1.2);
-			opacity: 0;
 		}
 	}
 </style>

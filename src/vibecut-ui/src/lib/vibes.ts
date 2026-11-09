@@ -4,58 +4,85 @@
 
 export interface VibeLook {
 	tagline: string;
-	/** Three colours for the tile's living gradient. */
+	/** Accent colours: the card's band and its cut strip. */
 	colors: [string, string, string];
-	/** Motion personality of the tile animation. */
-	motion: 'bounce' | 'drift' | 'glide' | 'strobe' | 'calm' | 'float';
-	/** What it's best for, as short chips. */
+	/** What it's best for, in a few words. */
 	best: string[];
+	/** The card's pictogram (see VibeIcon). */
+	icon: 'kids' | 'family' | 'drone' | 'action' | 'talk' | 'memory';
+	/** How the edit moves, in words ("Fast cuts on every beat"). */
+	pace: string;
+	/** A sketch of the cut rhythm: relative shot lengths, left to right. */
+	cuts: number[];
+	/** How the sound is mixed ("Music up front"). */
+	sound: string;
 }
 
 export const VIBE_LOOKS: Record<string, VibeLook> = {
 	kid_reel: {
 		tagline: 'Fast, funny and full of whip-ups.',
 		colors: ['#ffb627', '#ff7a45', '#ff3d81'],
-		motion: 'bounce',
-		best: ['Kids', 'Playground', 'Birthdays']
+		best: ['Kids', 'Playground', 'Birthdays'],
+		icon: 'kids',
+		pace: 'Quick cuts on the beat',
+		cuts: [3, 2, 4, 2, 3, 1.5, 2, 3, 2, 4, 2],
+		sound: 'Music, dips for voices'
 	},
 	family_chronicle: {
 		tagline: 'The whole day, in order, voices kept.',
 		colors: ['#ffcf99', '#ff8f6b', '#c2537a'],
-		motion: 'drift',
-		best: ['Trips', 'Holidays', 'Gatherings']
+		best: ['Trips', 'Holidays', 'Gatherings'],
+		icon: 'family',
+		pace: 'Steady cuts, in time order',
+		cuts: [6, 5, 7, 5, 6, 6],
+		sound: 'Music dips when people talk'
 	},
 	drone_cinematic: {
 		tagline: 'Long, slow and sweeping. Let the view breathe.',
 		colors: ['#38d6ff', '#2a6cf6', '#14204a'],
-		motion: 'glide',
-		best: ['Drone', 'Landscapes', 'Sunsets']
+		best: ['Drone', 'Landscapes', 'Sunsets'],
+		icon: 'drone',
+		pace: 'Long, sweeping shots',
+		cuts: [14, 11, 16],
+		sound: 'Music only'
 	},
 	action_highlight: {
 		tagline: 'Punchy cuts on every beat. Pure adrenaline.',
 		colors: ['#ff3d81', '#ff5e3a', '#7b5cff'],
-		motion: 'strobe',
-		best: ['Bike', 'Ski', 'Surf']
+		best: ['Bike', 'Ski', 'Surf'],
+		icon: 'action',
+		pace: 'Fast cuts on every beat',
+		cuts: [2, 2, 1.5, 2, 1, 2, 2, 1.5, 2, 1, 2, 2, 1.5, 2],
+		sound: 'Music up front'
 	},
 	documentary: {
 		tagline: 'Voices first. The music steps back when people talk.',
-		colors: ['#d8c3a5', '#8e8d8a', '#3b4252'],
-		motion: 'calm',
-		best: ['Interviews', 'Stories', 'Tours']
+		colors: ['#d8c3a5', '#a3a19c', '#5b6478'],
+		best: ['Interviews', 'Stories', 'Tours'],
+		icon: 'talk',
+		pace: 'Long takes for talking',
+		cuts: [10, 8, 12, 9],
+		sound: 'Voices first, music dips'
 	},
 	memory_keeper: {
 		tagline: 'Long, gentle and soundtrack-led. Made to rewatch.',
 		colors: ['#c3a6ff', '#ff9ad5', '#ffcf99'],
-		motion: 'float',
-		best: ['Vacations', 'Year recaps', 'Weddings']
+		best: ['Vacations', 'Year recaps', 'Weddings'],
+		icon: 'memory',
+		pace: 'Long, gentle shots',
+		cuts: [9, 11, 10, 12],
+		sound: 'Music led'
 	}
 };
 
 const FALLBACK: VibeLook = {
 	tagline: 'A fresh take on your footage.',
 	colors: ['#ff7a45', '#ff3d81', '#7b5cff'],
-	motion: 'drift',
-	best: []
+	best: [],
+	icon: 'memory',
+	pace: 'Cuts to the music',
+	cuts: [5, 5, 5, 5],
+	sound: 'Music and voices'
 };
 
 export function vibeLook(key: string): VibeLook {
