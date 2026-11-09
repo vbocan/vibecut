@@ -103,11 +103,24 @@ Renders list like any render; Stop works the same way.
 
 **What it leaves alone.** The first time it runs it only takes note of
 what is already there (footage that arrives while it is switched off is
-picked up when it is switched back on). Folders that already have a project (a
-`/projects/*.toml` whose `[input].folder` is that folder) are listed as
-skipped ("Make it anyway" renders them). A trip folder is handled once;
-a card is handled once per set of clips, so the same card plugged in
-again is ignored, but brought back with new footage it makes a new reel.
+picked up when it is switched back on, four folders at most — see
+below); a folder with no clips yet, like an empty `Import`, becomes a
+trip once clips arrive. That first look waits until a
+watched folder exists, so a missing mount doesn't make the whole library
+"new" once it appears. Likewise, more than four new trips or cards
+turning up in a single look are a library appearing (a mount fixed, a
+share back), not a copy: they are noted as already there, not rendered
+one by one. Folders that already have a project (a `/projects/*.toml`
+whose `[input].folder` is that folder) are listed as skipped ("Make it
+anyway" renders them); the projects the watcher wrote itself don't
+count. A trip folder is handled once: clips added to it later make no
+new reel (make one from Create). A trip folder deleted and made again
+with other clips — a recurring `Import` folder — is new footage; the
+same clips moved away and back are not. A card is handled once per set
+of clips, so the same card plugged in again is ignored, but brought back
+with new footage it makes a new reel, at the same mount point every time.
+Dismissing a folder that is still being copied holds for the rest of
+that copy.
 
 **State.** `/projects/.vibecut-watch.json` records every folder handled
 (and the switch), so a restart never renders a folder twice; a render
@@ -169,7 +182,9 @@ running container — for example
 **Routes.** `GET /api/watch` (switch, watched folders, the list),
 `PUT /api/watch` with `{"enabled": true|false}`,
 `POST /api/watch/{id}/dismiss` (a waiting or queued folder is then not
-rendered) and `POST /api/watch/{id}/retry`, both with a JSON body (`{}`),
+rendered, however its copy goes on) and `POST /api/watch/{id}/retry`
+(a dismissed copy still in progress waits for the copy again), both
+with a JSON body (`{}`),
 and `GET /api/watch/events`, a server-sent event stream: `snapshot` (the
 `GET /api/watch` body, first and after any gap), then `status`, `entry`,
 `removed` and `reel_ready`.

@@ -62,6 +62,10 @@ services:
       # DOCKER.md, "Auto-reel: watched footage folders".
       VIBECUT_WATCH: ${VIBECUT_WATCH:-}
       VIBECUT_WATCH_DIRS: ${VIBECUT_WATCH_DIRS:-}
+      VIBECUT_WATCH_INTERVAL: ${VIBECUT_WATCH_INTERVAL:-}
+      VIBECUT_WATCH_SETTLE: ${VIBECUT_WATCH_SETTLE:-}
+      VIBECUT_WATCH_VIBE: ${VIBECUT_WATCH_VIBE:-}
+      VIBECUT_WATCH_LENGTH: ${VIBECUT_WATCH_LENGTH:-}
       VIBECUT_WATCH_WEBHOOK: ${VIBECUT_WATCH_WEBHOOK:-}
       VIBECUT_PUBLIC_URL: ${VIBECUT_PUBLIC_URL:-}
       # Container paths of your own title-card fonts and ONNX models,

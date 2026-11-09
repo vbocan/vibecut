@@ -6,6 +6,7 @@
 //! the whole watch → queue → render → notify flow with a stand-in, and
 //! [`OpsReelMaker`] does it for real through the same ops the web UI uses.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -131,12 +132,20 @@ pub fn rewrite_output(toml: &str, old: &str, new: &str) -> Result<String, String
 /// footage, if any — the watcher leaves those folders alone. Matches
 /// `[input].folder` against the unit's path and its footage folder;
 /// relative folders are read from `footage_root` and `projects_root`.
-pub fn existing_project(projects_root: &Path, footage_root: &Path, unit_paths: &[&Path]) -> Option<String> {
+/// `ours` are the projects the watcher wrote itself: they never count, or
+/// a card mounted at the same place would only ever make one reel.
+pub fn existing_project(
+    projects_root: &Path,
+    footage_root: &Path,
+    unit_paths: &[&Path],
+    ours: &HashSet<PathBuf>,
+) -> Option<String> {
     let mut configs: Vec<PathBuf> = std::fs::read_dir(projects_root)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml")) && p.is_file())
+        .filter(|p| !ours.contains(p))
         .collect();
     configs.sort();
     configs.into_iter().find_map(|cfg| {
@@ -199,8 +208,16 @@ impl ReelMaker for OpsReelMaker {
         };
         let output = unique_output(&Path::new(PROJECTS_ROOT).join("out"), &base).to_string_lossy().into_owned();
         if output != r.output_path {
-            let toml = rewrite_output(&r.config_toml, &r.output_path, &output)?;
-            config_io::write_config_toml(&r.config_path, &toml).await.map_err(|e| e.to_string())?;
+            let written = match rewrite_output(&r.config_toml, &r.output_path, &output) {
+                Ok(toml) => config_io::write_config_toml(&r.config_path, &toml).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = written {
+                // Not left behind: the watcher only knows its own projects
+                // by the proposals it stored, and this one never will be.
+                let _ = tokio::fs::remove_file(&r.config_path).await;
+                return Err(e);
+            }
         }
         let summary = json!({
             "vibe": r.vibe,
@@ -334,17 +351,23 @@ mod tests {
         // Only the top level counts.
         std::fs::write(dir.join("sub/deep.toml"), cfg("/footage/Deep")).unwrap();
         let footage = Path::new("/footage");
+        let none = HashSet::new();
         let alps = Path::new("/footage/Alps Ski Day");
-        assert_eq!(existing_project(&dir, footage, &[alps]).as_deref(), Some("proposal_alps_1.toml"));
+        assert_eq!(existing_project(&dir, footage, &[alps], &none).as_deref(), Some("proposal_alps_1.toml"));
         let coast = Path::new("/footage/Coastline");
-        assert_eq!(existing_project(&dir, footage, &[coast]).as_deref(), Some("relative.toml"));
-        assert_eq!(existing_project(&dir, footage, &[Path::new("/footage/Deep")]), None);
+        assert_eq!(existing_project(&dir, footage, &[coast], &none).as_deref(), Some("relative.toml"));
+        assert_eq!(existing_project(&dir, footage, &[Path::new("/footage/Deep")], &none), None);
         // A card: its root or its DCIM.
         let card = Path::new("/cards/A");
         let dcim = Path::new("/cards/A/DCIM");
         std::fs::write(dir.join("card.toml"), cfg("/cards/A/DCIM")).unwrap();
-        assert_eq!(existing_project(&dir, footage, &[card, dcim]).as_deref(), Some("card.toml"));
-        assert_eq!(existing_project(&dir.join("missing"), footage, &[alps]), None);
+        assert_eq!(existing_project(&dir, footage, &[card, dcim], &none).as_deref(), Some("card.toml"));
+        assert_eq!(existing_project(&dir.join("missing"), footage, &[alps], &none), None);
+        // The watcher's own projects don't count; anyone else's still do.
+        let ours: HashSet<PathBuf> = [dir.join("card.toml")].into();
+        assert_eq!(existing_project(&dir, footage, &[card, dcim], &ours), None);
+        std::fs::write(dir.join("my_edit.toml"), cfg("/cards/A")).unwrap();
+        assert_eq!(existing_project(&dir, footage, &[card, dcim], &ours).as_deref(), Some("my_edit.toml"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

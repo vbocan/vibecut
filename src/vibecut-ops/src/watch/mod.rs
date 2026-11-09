@@ -11,8 +11,10 @@
 //!
 //! What has been handled is kept in `/projects/.vibecut-watch.json`, so
 //! a restart neither renders a folder again nor forgets one it queued.
-//! The first time the watcher runs it only takes note of what is already
-//! there (`baseline`); folders that already have a project are skipped.
+//! The first look at a watched folder that exists only takes note of what
+//! is already there (`baseline`), as does a look where a whole library
+//! turns up at once; folders that already have a project (other than one
+//! the watcher wrote) are skipped.
 //!
 //! Off by default: `VIBECUT_WATCH=1` turns it on at start, and the UI's
 //! toggle (`PUT /api/watch`) switches it at runtime and is remembered.
@@ -23,7 +25,7 @@ pub mod scan;
 pub mod state;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,12 +41,16 @@ pub use scan::UnitKind;
 pub use state::{EntryStatus, WatchEntry, WatchFile};
 
 use scan::{find_units, snapshot, Settling, Unit};
-use state::entry_id;
 
 /// The state file's name, in the projects folder.
 pub const STATE_FILE: &str = ".vibecut-watch.json";
 /// Entries the list shows at most.
 const LIST_LIMIT: usize = 30;
+/// More new trips or cards than this turning up in a single look is not a
+/// copy (those arrive a folder or two at a time) but a library appearing —
+/// a mount fixed, a share back: they are taken as already there, like the
+/// baseline, instead of being rendered one after another.
+const MAX_NEW_AT_ONCE: usize = 4;
 
 /// How the watcher is set up (from the environment, see [`WatchSettings::from_vars`]).
 #[derive(Debug, Clone)]
@@ -261,6 +267,9 @@ impl WatchService {
             match e.status {
                 EntryStatus::Rendering => return Err("it is rendering — stop its render first"),
                 EntryStatus::Waiting | EntryStatus::Queued => {
+                    // Still being copied: the dismissal holds for the rest
+                    // of the copy, however the clips change meanwhile.
+                    e.follow_copy = e.status == EntryStatus::Waiting;
                     e.set(EntryStatus::Skipped, Some("Dismissed — no reel made.".into()))
                 }
                 _ => {}
@@ -274,7 +283,8 @@ impl WatchService {
         Ok(Some(entry))
     }
 
-    /// Queue a failed, stopped or skipped entry again.
+    /// Queue a failed, stopped or skipped entry again (one dismissed while
+    /// its copy is still going waits for the copy to finish first).
     pub async fn retry(&self, id: &str) -> Result<Option<WatchEntry>, &'static str> {
         let entry = {
             let mut g = self.shared.inner.lock().await;
@@ -284,7 +294,8 @@ impl WatchService {
             if !matches!(e.status, EntryStatus::Failed | EntryStatus::Stopped | EntryStatus::Skipped) {
                 return Err("only a failed, stopped or skipped folder can be tried again");
             }
-            e.set(EntryStatus::Queued, None);
+            let copying = std::mem::take(&mut e.follow_copy);
+            e.set(if copying { EntryStatus::Waiting } else { EntryStatus::Queued }, None);
             e.attempts = 0;
             e.dismissed = false;
             e.job_id = None;
@@ -300,31 +311,40 @@ impl WatchService {
     /// One look at the watched folders (nothing while off): new folders
     /// start waiting, settled ones are queued (or skipped when they
     /// already have a project), vanished ones that were still being
-    /// copied leave the list. The first look ever only takes the baseline.
+    /// copied leave the list. The first look at an existing watched folder
+    /// only takes the baseline.
     pub async fn tick(&self, now: Instant) {
         let settings = &self.shared.settings;
-        let (baseline, handled_folders) = {
+        let (baseline, handled_trips) = {
             let g = self.shared.inner.lock().await;
             if !g.enabled {
                 return;
             }
-            let handled: HashSet<String> =
-                g.file.entries.iter().filter(|e| e.status.is_settled()).map(|e| e.id.clone()).collect();
-            (!g.file.baseline_taken, handled)
+            // Trip folders dealt with (a trip is handled once, whatever is
+            // added to it later) need no walk — once their clips are known.
+            let trips: HashSet<PathBuf> = g
+                .file
+                .entries
+                .iter()
+                .filter(|e| e.kind == UnitKind::Folder && e.status.is_settled())
+                .filter(|e| !e.gone && !e.follow_copy && !e.content_id.is_empty())
+                .map(|e| PathBuf::from(&e.path))
+                .collect();
+            (!g.file.baseline_taken, trips)
         };
         // Walk outside the lock: a card or a big copy can take a moment.
         let roots = settings.roots.clone();
-        let looked = tokio::task::spawn_blocking(move || {
-            find_units(&roots)
+        let (listed, looked) = tokio::task::spawn_blocking(move || {
+            let listed: Vec<PathBuf> = roots.iter().filter(|r| r.is_dir()).cloned().collect();
+            let looked = find_units(&roots)
                 .into_iter()
                 .map(|u| {
-                    // A trip folder dealt with before (or at the baseline)
-                    // needs no walk: its id is its path.
-                    let skip = u.kind == UnitKind::Folder && (baseline || handled_folders.contains(&entry_id(&u, "")));
+                    let skip = u.kind == UnitKind::Folder && handled_trips.contains(&u.path);
                     let snap = (!skip).then(|| snapshot(&u.footage));
                     (u, snap)
                 })
-                .collect::<Vec<(Unit, Option<scan::Snapshot>)>>()
+                .collect::<Vec<(Unit, Option<scan::Snapshot>)>>();
+            (listed, looked)
         })
         .await
         .unwrap_or_default();
@@ -333,44 +353,97 @@ impl WatchService {
         if !g.enabled {
             return;
         }
+        if baseline && listed.is_empty() {
+            // Nothing mounted yet: a baseline of nothing would make the
+            // whole library new footage the moment it shows up.
+            return;
+        }
         let mut changed: Vec<String> = Vec::new();
+        let mut dirty = false;
         let mut present = HashSet::new();
         let mut current = HashSet::new();
+        let mut fresh: Vec<String> = Vec::new();
         let mut queued = false;
+        let mut ours: Option<HashSet<PathBuf>> = None;
         for (unit, snap) in looked {
             present.insert(unit.path.clone());
-            let content = snap.as_ref().map(scan::Snapshot::content_id).unwrap_or_default();
-            let id = entry_id(&unit, &content);
+            let Some(snap) = snap else { continue };
+            let content = snap.content_id();
+            let found = g.file.find_for(&unit, &content);
             if baseline {
-                if g.file.handled(&id).is_none() {
+                // Only footage: an empty folder becomes a trip when clips arrive.
+                if found.is_none() && snap.n_videos > 0 {
                     let mut e = WatchEntry::new(&unit, &content, &settings.footage_root, EntryStatus::Baseline);
-                    e.n_videos = snap.as_ref().map_or(0, |s| s.n_videos);
+                    e.id = g.file.unique_id(e.id);
+                    (e.n_videos, e.total_bytes) = (snap.n_videos, snap.video_bytes);
                     g.file.entries.push(e);
                 }
                 continue;
             }
-            let Some(snap) = snap else { continue };
-            if g.file.handled(&id).is_some() || snap.n_videos == 0 {
+            if let Some(i) = found {
+                let e = &mut g.file.entries[i];
+                if e.status.is_settled() && !e.follow_copy {
+                    // Dealt with. A trip folder back with the same clips is
+                    // that one again; older entries learn their clips.
+                    if e.gone || e.content_id.is_empty() {
+                        e.gone = false;
+                        e.content_id = content;
+                        dirty = true;
+                    }
+                    continue;
+                }
+            }
+            let settled = g.settling.settled(&unit.path, snap.fingerprint(), now, settings.settle) && !snap.partial;
+            if let Some(i) = found.filter(|&i| g.file.entries[i].follow_copy) {
+                // Dismissed while being copied: it follows the copy, quietly,
+                // until the copy settles.
+                let e = &mut g.file.entries[i];
+                let follow = !settled;
+                let same = e.content_id == content && (e.n_videos, e.total_bytes) == (snap.n_videos, snap.video_bytes);
+                if !same || e.follow_copy != follow {
+                    (e.content_id, e.n_videos, e.total_bytes, e.follow_copy) = (content, snap.n_videos, snap.video_bytes, follow);
+                    dirty = true;
+                }
                 continue;
             }
-            current.insert(id.clone());
-            let settled = g.settling.settled(&unit.path, snap.fingerprint(), now, settings.settle) && !snap.partial;
-            if g.file.get_mut(&id).is_none() {
-                g.file.entries.push(WatchEntry::new(&unit, &content, &settings.footage_root, EntryStatus::Waiting));
-                changed.push(id.clone());
+            if snap.n_videos == 0 {
+                continue; // nothing to cut (a waiting copy emptied leaves the list)
             }
+            let i = match found {
+                Some(i) => i,
+                None => {
+                    let mut e = WatchEntry::new(&unit, &content, &settings.footage_root, EntryStatus::Waiting);
+                    e.id = g.file.unique_id(e.id);
+                    fresh.push(e.id.clone());
+                    changed.push(e.id.clone());
+                    g.file.entries.push(e);
+                    g.file.entries.len() - 1
+                }
+            };
+            let id = g.file.entries[i].id.clone();
+            current.insert(id.clone());
+            // An earlier reel of this path still rendering (a card's earlier
+            // clips): wait for it, so its project is known as the watcher's.
+            let path = unit.path.to_string_lossy();
+            let busy = g.file.entries.iter().any(|e| e.path == path && e.status == EntryStatus::Rendering);
+            let settled = settled && !busy;
             let skip_for = if settled {
+                let ours = ours.get_or_insert_with(|| g.file.own_projects());
                 let paths = [unit.path.as_path(), unit.footage.as_path()];
-                maker::existing_project(&settings.projects_root, &settings.footage_root, &paths)
+                maker::existing_project(&settings.projects_root, &settings.footage_root, &paths, ours)
             } else {
                 None
             };
-            let e = g.file.get_mut(&id).expect("just inserted");
+            let e = &mut g.file.entries[i];
             if (e.n_videos, e.total_bytes) != (snap.n_videos, snap.video_bytes) {
                 e.n_videos = snap.n_videos;
                 e.total_bytes = snap.video_bytes;
                 e.updated_at = chrono::Utc::now().to_rfc3339();
                 changed.push(id.clone());
+            }
+            if e.content_id != content {
+                e.content_id = content;
+                dirty = true;
             }
             if !settled {
                 continue;
@@ -384,8 +457,26 @@ impl WatchService {
             }
             changed.push(id);
         }
-        // Copies that vanished (a card pulled mid-read), or whose clips
-        // changed under a new id, leave the list.
+        g.settling.keep_only(&present);
+        if baseline {
+            g.file.baseline_taken = true;
+            self.save(&g);
+            return;
+        }
+        if fresh.len() > MAX_NEW_AT_ONCE {
+            tracing::warn!(
+                n = fresh.len(),
+                "watched folders: {} new folders at once — taken as already there (a library appearing), no reels made",
+                fresh.len()
+            );
+            for e in g.file.entries.iter_mut().filter(|e| fresh.contains(&e.id)) {
+                e.set(EntryStatus::Baseline, None);
+            }
+            changed.retain(|id| !fresh.contains(id));
+            dirty = true;
+        }
+        // Copies that vanished (a card pulled mid-read) or emptied leave
+        // the list; one dismissed mid-copy stops following it.
         let mut removed = Vec::new();
         g.file.entries.retain(|e| {
             let gone = e.status == EntryStatus::Waiting && !current.contains(&e.id);
@@ -394,13 +485,29 @@ impl WatchService {
             }
             !gone
         });
-        g.settling.keep_only(&present);
-        if baseline {
-            g.file.baseline_taken = true;
-            self.save(&g);
-            return;
+        for e in &mut g.file.entries {
+            let path = Path::new(&e.path);
+            if present.contains(path) {
+                continue;
+            }
+            if e.follow_copy {
+                e.follow_copy = false;
+                dirty = true;
+            }
+            // A handled trip folder no longer in a watched folder that is
+            // itself still there: deleted (or moved away) — remember that,
+            // so one made again at its path with other clips is new.
+            let finished = matches!(
+                e.status,
+                EntryStatus::Baseline | EntryStatus::Done | EntryStatus::Failed | EntryStatus::Stopped | EntryStatus::Skipped
+            );
+            let root_there = path.parent().is_some_and(|p| listed.iter().any(|r| r == p));
+            if e.kind == UnitKind::Folder && finished && !e.gone && root_there {
+                e.gone = true;
+                dirty = true;
+            }
         }
-        if changed.is_empty() && removed.is_empty() {
+        if changed.is_empty() && removed.is_empty() && !dirty {
             return;
         }
         self.save(&g);

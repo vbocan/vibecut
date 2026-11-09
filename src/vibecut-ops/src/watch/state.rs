@@ -1,7 +1,8 @@
 //! What the watcher has already seen, kept in `/projects/.vibecut-watch.json`
 //! so a restart neither renders a folder twice nor forgets one it queued.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +89,17 @@ pub struct WatchEntry {
     /// Hidden from the list (still remembered as handled).
     #[serde(default)]
     pub dismissed: bool,
+    /// Dismissed while still being copied: it stands for that copy until
+    /// the copy settles, however its clips change meanwhile (a card's
+    /// clips are part of what it is, so each new clip would otherwise look
+    /// like new footage).
+    #[serde(default)]
+    pub follow_copy: bool,
+    /// A handled trip folder that has since disappeared. One made again at
+    /// its path with other clips is new footage; with the same clips (moved
+    /// away and back, a share reconnecting) it is this one again.
+    #[serde(default)]
+    pub gone: bool,
 }
 
 impl WatchEntry {
@@ -116,6 +128,8 @@ impl WatchEntry {
             render: None,
             poster_path: None,
             dismissed: false,
+            follow_copy: false,
+            gone: false,
         }
     }
 
@@ -136,8 +150,10 @@ impl WatchEntry {
     }
 }
 
-/// A trip folder is one entry for good; a card is one entry per set of
-/// clips, so the same card coming back with new footage makes a new reel.
+/// The id a new entry for `unit` gets: from a trip folder's path, from a
+/// card's path and clips (the clips it had when first seen, if it was
+/// still being copied). Made unique by [`WatchFile::unique_id`]; entries
+/// are matched to what is on disk by [`WatchFile::find_for`], not by id.
 pub fn entry_id(unit: &Unit, content_id: &str) -> String {
     let key = match unit.kind {
         UnitKind::Folder => unit.path.to_string_lossy().into_owned(),
@@ -241,6 +257,55 @@ impl WatchFile {
 
     pub fn get_mut(&mut self, id: &str) -> Option<&mut WatchEntry> {
         self.entries.iter_mut().find(|e| e.id == id)
+    }
+
+    /// The entry `unit`, holding the clips `content`, belongs to (its index):
+    ///
+    /// - a copy still in progress at its path — waiting, or dismissed while
+    ///   waiting — whatever its clips are now;
+    /// - a trip folder: the one handled at its path (a trip is handled
+    ///   once), or, when that folder had gone, one with the same clips;
+    /// - a card: the one handled at its path with these very clips (so the
+    ///   same card back with new footage is new).
+    ///
+    /// `None`: new footage.
+    pub fn find_for(&self, unit: &Unit, content: &str) -> Option<usize> {
+        let path = unit.path.to_string_lossy();
+        let here = |e: &WatchEntry| e.path == path && e.kind == unit.kind;
+        let copying = |e: &WatchEntry| here(e) && (e.status == EntryStatus::Waiting || e.follow_copy);
+        if let Some(i) = self.entries.iter().position(copying) {
+            return Some(i);
+        }
+        let handled = |e: &WatchEntry| here(e) && e.status.is_settled();
+        match unit.kind {
+            UnitKind::Folder => self.entries.iter().position(|e| handled(e) && !e.gone).or_else(|| {
+                // Entries from before clips were recorded for folders: same.
+                let same = |e: &WatchEntry| e.content_id.is_empty() || e.content_id == content;
+                self.entries.iter().position(|e| handled(e) && e.gone && same(e))
+            }),
+            UnitKind::Card => self.entries.iter().position(|e| handled(e) && e.content_id == content),
+        }
+    }
+
+    /// `base`, or `base-2`, `base-3`, … when an entry already has that id
+    /// (a folder made again, a card first seen with the clips an earlier
+    /// copy was first seen with).
+    pub fn unique_id(&self, base: String) -> String {
+        let taken = |id: &str| self.entries.iter().any(|e| e.id == id);
+        if !taken(&base) {
+            return base;
+        }
+        (2..).map(|n| format!("{base}-{n}")).find(|id| !taken(id)).expect("an unused id")
+    }
+
+    /// The projects the watcher wrote itself (`config_path` of every
+    /// entry's proposal): never "already in your projects".
+    pub fn own_projects(&self) -> HashSet<PathBuf> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.proposal.as_ref()?.get("config_path")?.as_str())
+            .map(PathBuf::from)
+            .collect()
     }
 
     /// Entries for the list, newest first.
