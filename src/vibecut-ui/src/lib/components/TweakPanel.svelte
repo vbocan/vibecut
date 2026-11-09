@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
 	import type { FeedbackAction } from '$lib/api';
+	import PendingChangeOffer from './PendingChangeOffer.svelte';
 
 	// Six one-tap changes. Each rewrites the project deterministically and
 	// re-renders straight away — no settings to understand.
@@ -14,12 +15,11 @@
 	];
 
 	// Tweaks stay live during a render: picking one offers to stop it.
-	// The offer is shared: keyboard shortcuts and song picks made
-	// mid-render show up here too. Busy buttons (a change being written,
+	// The offer is shared: keyboard shortcuts made mid-render show up
+	// here too (song picks show theirs in the song list). Busy buttons (a change being written,
 	// a stop in flight) are aria-disabled, not disabled: a disabled button
 	// drops the keyboard focus onto the page the moment it's pressed.
 	const busy = $derived(s.feedbackBusy || s.stopping);
-	const offer = $derived(s.pendingChange?.from === 'tweaks' ? s.pendingChange : null);
 
 	function tryRun(t: (typeof TWEAKS)[number] | 'mix') {
 		if (busy) return;
@@ -91,19 +91,7 @@
 			</button>
 		{/each}
 	</div>
-	{#if offer}
-		<div class="offer" role="status">
-			<span>{s.rendering ? 'Still rendering the last change.' : 'The last change is ready.'}</span>
-			<button class="btn primary small" type="button" disabled={s.stopping} onclick={() => s.applyPendingChange()}>
-				{s.stopping
-					? 'Stopping…'
-					: `${s.rendering ? 'Stop and apply' : 'Apply'} “${offer.label}”${s.rendering ? ' instead' : ''}`}
-			</button>
-			<button class="btn ghost small" type="button" disabled={s.stopping} onclick={() => (s.pendingChange = null)}
-				>{s.rendering ? 'Keep rendering' : 'Never mind'}</button
-			>
-		</div>
-	{/if}
+	<PendingChangeOffer from="tweaks" />
 	{#if s.lastChanges.length > 0}
 		<ul class="changes" aria-label="Last change">
 			{#each s.lastChanges as c, i (i)}
@@ -119,23 +107,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
-	}
-
-	.offer {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 8px;
-		padding: 10px 12px;
-		border-radius: var(--r-md);
-		border: 1px solid var(--line-strong);
-		color: var(--text-dim);
-		font-size: var(--fs-sm);
-	}
-
-	.offer .small {
-		padding: 6px 12px;
-		font-size: var(--fs-xs);
 	}
 
 	.eyebrow {

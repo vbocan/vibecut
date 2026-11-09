@@ -2,6 +2,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { outputFileUrl } from '$lib/api';
 	import { clock } from '$lib/vibes';
+	import { isTweakKey } from '$lib/changes';
 	import Player from './Player.svelte';
 	import BeatTimeline from './BeatTimeline.svelte';
 	import MomentInspector from './MomentInspector.svelte';
@@ -65,6 +66,7 @@
 		seek(s.segmentLayout[i].startSecs + 0.05);
 	}
 
+
 	function onKey(e: KeyboardEvent) {
 		const t = e.target as HTMLElement | null;
 		if (t?.closest('input, textarea, select, [contenteditable="true"]')) return;
@@ -115,7 +117,11 @@
 		else if (k === 'l') seek(currentTime + 5);
 		else if ((k === 'ArrowLeft' || k === 'ArrowRight') && !inTimeline && !onVideo) moveMoment(k === 'ArrowLeft' ? -1 : 1);
 		else if (k === 'd') onOpenPro?.();
-		else if (busy) handled = false;
+		else if (busy && isTweakKey(k, s.selectedSegmentIndex !== null)) {
+			// A change is being written or a Stop is on its way: say so
+			// rather than drop the key without a word.
+			s.showNotice(s.stopping ? 'Still stopping the render — try again in a moment.' : 'Still applying the last change — try again in a moment.');
+		} else if (busy) handled = false;
 		else if (k === '[') ask('Shorter', () => s.tweakAndRender({ kind: 'scale_duration', factor: 0.75 }, 'Shorter'));
 		else if (k === ']') ask('Longer', () => s.tweakAndRender({ kind: 'scale_duration', factor: 1.25 }, 'Longer'));
 		else if (k === 'e') ask('More energy', () => s.tweakAndRender({ kind: 'punchier' }, 'More energy'));

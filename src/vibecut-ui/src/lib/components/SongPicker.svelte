@@ -6,6 +6,7 @@
 	import { radiogroup } from '$lib/radiogroup';
 	import EnergyBars from './EnergyBars.svelte';
 	import MusicImport from './MusicImport.svelte';
+	import PendingChangeOffer from './PendingChangeOffer.svelte';
 	import { collectionLabel, licenceBadge } from '$lib/music';
 
 	let { compact = false }: { compact?: boolean } = $props();
@@ -66,9 +67,10 @@
 	function choose(path: string | null) {
 		if (inStudio) {
 			if (s.rendering) {
-				// Mid-render: offer to stop it and switch songs instead.
+				// Mid-render: offer to stop it and switch songs instead,
+				// right here above the list (the pick doesn't vanish).
 				const title = s.tracks.find((t) => t.path === path)?.title ?? 'Vibecut’s pick';
-				s.requestChange(`Song: ${title}`, () => choose(path));
+				s.requestChange(`Song: ${title}`, () => choose(path), 'song');
 				return;
 			}
 			const target = path ?? s.autoPick?.path ?? null;
@@ -130,6 +132,8 @@
 				>
 			{/each}
 		</div>
+
+		{#if inStudio}<PendingChangeOffer from="song" />{/if}
 
 		<!-- In the Studio a pick re-renders, so arrows only move focus there
 		     and Space / Enter picks. "Let Vibecut pick" is the first choice

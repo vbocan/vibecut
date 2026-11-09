@@ -9,6 +9,7 @@ import type { Manifest } from './types/generated/Manifest';
 import type { Segment } from './types/generated/Segment';
 import type { Config } from './types/generated/Config';
 import { captionMusicLines, labelsFollowProject, projectSongPath, trackForPath } from './music';
+import { decideChange } from './changes';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
 
@@ -78,6 +79,9 @@ const STORAGE_KEY = 'vibecut.session.v1';
 
 /** Where the one-tap flow is. */
 export type MakeStep = 'idle' | 'scanning' | 'planning' | 'scoring' | 'rendering' | 'done' | 'failed';
+
+/** Which control shows a pending "Stop and apply this instead" offer. */
+export type PendingFrom = 'tweaks' | 'command' | 'song';
 
 class AppState {
 	// ---------- Server ----------
@@ -967,16 +971,22 @@ class AppState {
 
 	// ---------- Stop and apply this instead ----------
 	/** A change asked for while a render runs, waiting on "Stop and apply
-	 *  this instead". `from`: the control showing the offer — the command
-	 *  bar shows its own; the tweak panel shows the rest (tweak buttons,
-	 *  keyboard shortcuts, song picks). */
-	pendingChange = $state.raw<{ label: string; from: 'tweaks' | 'command'; run: () => unknown } | null>(null);
+	 *  this instead". `from`: the control showing the offer, next to where
+	 *  it was asked for — the command bar and the song list show their
+	 *  own; the tweak panel shows the rest (tweak buttons, keyboard
+	 *  shortcuts). */
+	pendingChange = $state.raw<{ label: string; from: PendingFrom; run: () => unknown } | null>(null);
 
 	/** Run a change now, or — mid-render — offer to stop the render and
-	 *  run it instead. */
-	requestChange(label: string, run: () => unknown, from: 'tweaks' | 'command' = 'tweaks') {
-		if (this.stopping) return;
-		if (this.rendering) {
+	 *  run it instead. While a Stop is already on its way the request
+	 *  isn't kept, and a notice says so instead of dropping it silently. */
+	requestChange(label: string, run: () => unknown, from: PendingFrom = 'tweaks') {
+		const decision = decideChange(this);
+		if (decision === 'busy') {
+			this.showNotice(`Still stopping the render — try “${label}” again in a moment.`);
+			return;
+		}
+		if (decision === 'offer') {
 			this.pendingChange = { label, from, run };
 			return;
 		}
