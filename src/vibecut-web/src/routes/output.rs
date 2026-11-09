@@ -113,7 +113,7 @@ fn content_type_for(ext: &str) -> Option<&'static str> {
 /// unconditionally, not deferred to a platform-native primitive. A
 /// dev-host unit test running on Windows caught this; see
 /// `rejects_absolute_paths_outside_projects` below.
-fn is_safe_projects_path(user_path: &str) -> bool {
+pub(crate) fn is_safe_projects_path(user_path: &str) -> bool {
     use std::path::{Component, Path};
 
     if Path::new(user_path)

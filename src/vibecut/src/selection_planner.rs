@@ -813,6 +813,11 @@ pub struct Manifest {
     pub resolution: String,
     pub fps: u32,
     pub seed: Option<u64>,
+    /// Output-time `[start, end]` spans that carry the intro/outro titles
+    /// (card or overlay mode). A reframe of this render to a narrower shape
+    /// keeps these spans inside its safe area (`output_format`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub card_windows: Vec<[f64; 2]>,
     pub sources: Vec<Source>,
     pub segments: Vec<Segment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

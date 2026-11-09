@@ -113,7 +113,7 @@
 	}
 
 	/** Shared by every optional-string field below (image timestamp,
-	 *  output preset): empty input means "unset", not "set to empty
+	 *  output encoder preset and audio bitrate): empty input means "unset", not "set to empty
 	 *  string" — the two are different values to a Rust `Option<T>`. */
 	function optionalString(value: string): string | null {
 		return value.trim() === '' ? null : value;
@@ -163,9 +163,23 @@
 			resolution: last?.resolution ?? '1920x1080',
 			encoder: last?.encoder ?? 'auto',
 			crf: last?.crf ?? 20,
-			preset: null,
+			preset: last?.preset ?? null,
 			audio_bitrate: last?.audio_bitrate ?? '192k'
 		});
+	}
+	/** Pick a platform preset (`''` = the master). A platform decides its
+	 *  own size, quality and audio unless a key is set explicitly, so
+	 *  choosing one clears those keys; back on the master, an output needs
+	 *  a resolution again. */
+	function setPlatform(out: NonNullable<typeof s.configStructured>['outputs'][number], value: string) {
+		out.preset = value || null;
+		if (out.preset) {
+			out.resolution = null;
+			out.crf = null;
+			out.audio_bitrate = null;
+		} else if (!out.resolution) {
+			out.resolution = '1920x1080';
+		}
 	}
 	function removeOutput(i: number) {
 		const outs = s.configStructured?.outputs;
@@ -390,8 +404,9 @@
 
 				<h3>Outputs</h3>
 				<p class="dim">
-					The body renders once at the highest resolution among these, then transcodes to each one's own
-					resolution/encoder — a second output is typically the same cut at a different delivery size.
+					The body renders once at the largest master-shaped size among these, then transcodes to each one's own
+					resolution/encoder — a second output is typically the same cut at a different delivery size, or a
+					platform version (Reels, Square, WhatsApp) reframed with a blurred fill, a crop or black bars.
 				</p>
 				{#each cfg.outputs as out, i (i)}
 					<div class="output-card">
@@ -405,11 +420,36 @@
 						</div>
 						<div class="field-grid">
 							<label class="field narrow">
+								<span>Platform</span>
+								<select
+									class="text-input"
+									value={out.preset ?? ''}
+									onchange={(e) => setPlatform(out, (e.currentTarget as HTMLSelectElement).value)}
+								>
+									<option value="">Master</option>
+									<option value="youtube">YouTube 16:9</option>
+									<option value="reels">Reels / TikTok / Shorts 9:16</option>
+									<option value="square">Square 1:1</option>
+									<option value="whatsapp">WhatsApp 9:16 small</option>
+								</select>
+							</label>
+							<label class="field narrow">
+								<span>Fit</span>
+								<select class="text-input" bind:value={out.fit}>
+									<option value={undefined}>Blur fill</option>
+									<option value="crop">Crop</option>
+									<option value="pad">Black bars</option>
+								</select>
+							</label>
+							<label class="field narrow">
 								<span>Resolution</span>
 								<select class="text-input" bind:value={out.resolution}>
+									<option value={null}>From platform</option>
 									<option value="1920x1080">1920×1080</option>
 									<option value="3840x2160">3840×2160 (4K)</option>
 									<option value="1280x720">1280×720</option>
+									<option value="1080x1920">1080×1920 (vertical)</option>
+									<option value="1080x1080">1080×1080 (square)</option>
 								</select>
 							</label>
 							<label class="field narrow">
@@ -425,19 +465,31 @@
 							</label>
 							<label class="field narrow">
 								<span>Quality (CRF)</span>
-								<input class="text-input mono" type="number" min="0" max="51" bind:value={out.crf} />
+								<input
+									class="text-input mono"
+									type="number"
+									min="0"
+									max="51"
+									placeholder="auto"
+									bind:value={out.crf}
+								/>
 							</label>
 							<label class="field narrow">
 								<span>Audio bitrate</span>
-								<input class="text-input mono" placeholder="e.g. 192k" bind:value={out.audio_bitrate} />
+								<input
+									class="text-input mono"
+									placeholder="auto"
+									value={out.audio_bitrate ?? ''}
+									oninput={(e) => (out.audio_bitrate = optionalString((e.target as HTMLInputElement).value))}
+								/>
 							</label>
 							<label class="field narrow">
 								<span>Encoder preset</span>
 								<input
 									class="text-input mono"
 									placeholder="auto"
-									value={out.preset ?? ''}
-									oninput={(e) => (out.preset = optionalString((e.target as HTMLInputElement).value))}
+									value={out.encoder_preset ?? ''}
+									oninput={(e) => (out.encoder_preset = optionalString((e.target as HTMLInputElement).value) ?? undefined)}
 								/>
 							</label>
 						</div>

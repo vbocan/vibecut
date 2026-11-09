@@ -12,7 +12,7 @@ The MCP/LLM workflow never required knowing TOML — you'd describe what you wan
 
 ### 1. Basics
 
-Project name, target duration, FPS, seed, video fade in/out, and the output list (path, resolution, encoder, quality, audio bitrate, encoder preset). Outputs are a real list — add more than one and the body renders once at the highest resolution among them, then transcodes to each; a second output is typically the same cut at a different delivery size, so a new row starts by cloning the last one's settings.
+Project name, target duration, FPS, seed, video fade in/out, and the output list (path, platform, fit, resolution, encoder, quality, audio bitrate, encoder preset). Outputs are a real list — add more than one and the body renders once in the master shape, then transcodes to each; a second output is typically the same cut at a different delivery size, so a new row starts by cloning the last one's settings. Picking a platform (YouTube, Reels / TikTok / Shorts, Square, WhatsApp) clears that row's resolution, quality and audio bitrate so the platform preset decides them, and the fit (blur fill, crop or black bars) says how a different aspect is filled; see [CONFIG.md](CONFIG.md#platform-presets-preset).
 
 ### 2. Sources
 

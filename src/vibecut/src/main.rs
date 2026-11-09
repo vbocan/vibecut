@@ -28,6 +28,7 @@
 //! - `gpmf <file>` — dump the GPMF metadata tree of a GoPro MP4.
 //! - `beats <audio>` — analyze tempo, beat times, and the loud region.
 //! - `sync <a> <b>` — cross-correlate two audio tracks for multi-cam alignment.
+//! - `reformat <video> --preset reels` — a platform version of a finished render.
 
 // The 14 modules below now live in `src/lib.rs` (so vibecut-mcp and
 // any other consumer can call them directly). The binary uses them via
@@ -168,6 +169,22 @@ enum Cmd {
         #[arg(long, default_value_t = 60.0)]
         max_lag: f32,
     },
+    /// Make a platform version of a finished render in one fast ffmpeg
+    /// pass, no re-render: a vertical Reel, a square post, a WhatsApp clip.
+    /// Writes `<stem>.<preset>.mp4` next to the render.
+    Reformat {
+        /// The finished render (its manifest, if next to it, keeps titles safe).
+        input: Utf8PathBuf,
+        /// youtube | reels | tiktok | shorts | square | whatsapp | master
+        #[arg(long)]
+        preset: String,
+        /// blur (default) | crop | pad — how a different aspect is filled.
+        #[arg(long)]
+        fit: Option<String>,
+        /// Where to write it. Default: `<stem>.<preset>.mp4` next to the input.
+        #[arg(long)]
+        out: Option<Utf8PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -185,6 +202,7 @@ fn main() -> Result<()> {
         Cmd::Sync { file_a, file_b, start_a, start_b, window, max_lag } => {
             sync_cmd(&file_a, &file_b, start_a, start_b, window, max_lag)
         }
+        Cmd::Reformat { input, preset, fit, out } => reformat_cmd(&input, &preset, fit.as_deref(), out),
         Cmd::Benchmark {
             threads, repeats, num_files, duration_secs, resolution, codec, apply, force,
         } => vibecut::benchmark::run(vibecut::benchmark::BenchmarkArgs {
@@ -198,6 +216,44 @@ fn main() -> Result<()> {
             force_fixtures: force,
         }),
     }
+}
+
+fn reformat_cmd(input: &Utf8Path, preset: &str, fit: Option<&str>, out: Option<Utf8PathBuf>) -> Result<()> {
+    use vibecut::output_format::{self as of, Fit, OutputPreset};
+    if !input.is_file() {
+        anyhow::bail!("file does not exist: {input}");
+    }
+    let preset = OutputPreset::parse(preset)
+        .with_context(|| format!("unknown preset {preset:?} (one of: {})", OutputPreset::names()))?;
+    let fit = fit
+        .map(|f| Fit::parse(f).with_context(|| format!("unknown fit {f:?} (blur, crop or pad)")))
+        .transpose()?;
+    let output = match out {
+        Some(o) => o,
+        None => Utf8PathBuf::from_path_buf(of::version_path(input.as_std_path(), preset, fit))
+            .map_err(|p| anyhow::anyhow!("non-UTF-8 path: {}", p.display()))?,
+    };
+    if output == input {
+        anyhow::bail!("{input} already is the {} version", preset.name());
+    }
+    let opts = of::ReformatOptions {
+        preset,
+        fit,
+        card_windows: of::manifest_card_windows(input.as_std_path()),
+    };
+    let started = std::time::Instant::now();
+    let done = of::reformat_video(input, &output, &opts, &mut |_| {})?;
+    let spec = preset.spec();
+    println!(
+        "{output}\n  {} · {}x{}{} · {} · {:.1}s",
+        preset.name(),
+        spec.width,
+        spec.height,
+        done.plan.fit.map(|f| format!(" ({} fit)", f.name())).unwrap_or_default(),
+        done.encoder,
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
 }
 
 fn sync_cmd(

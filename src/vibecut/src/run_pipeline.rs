@@ -25,7 +25,7 @@ use crate::progress::{report as progress, Stage};
 use crate::project_config::Config;
 use crate::selection_planner::{
     DuckWindow, ExtractOpts, Manifest, MANIFEST_SCHEMA_VERSION, Segment, build_score_curve,
-    extract_telemetry_with, group_into_sources, parse_resolution, select_duck_windows,
+    extract_telemetry_with, group_into_sources, select_duck_windows,
     select_multi_source,
 };
 use crate::video_renderer::{
@@ -67,11 +67,30 @@ pub fn run_cmd(
     println!("  project:        {}", cfg.project.name);
     let (body_w, body_h) = cfg.body_resolution();
     println!("  body render:    {body_w}x{body_h}  ({} output{})", cfg.outputs.len(), plural(cfg.outputs.len()));
-    for (i, o) in cfg.outputs.iter().enumerate() {
+    for (i, o) in cfg.resolved_outputs().iter().enumerate() {
+        let shape = match crate::output_format::reframe_fit((body_w, body_h), (o.width, o.height), o.fit) {
+            Some(fit) => format!("  fit={}", fit.name()),
+            None => String::new(),
+        };
         println!(
-            "    [{i}] {}  {}  enc={:?} crf={} a={}",
-            o.path, o.resolution, o.encoder, o.crf, o.audio_bitrate
+            "    [{i}] {}  {}{}  enc={:?} crf={} a={}{}{shape}",
+            o.path,
+            o.resolution(),
+            o.preset.map(|p| format!(" ({})", p.name())).unwrap_or_default(),
+            o.encoder,
+            o.crf,
+            o.audio_bitrate,
+            o.max_bitrate.map(|b| format!(" max={}", crate::output_format::format_bitrate(b))).unwrap_or_default(),
         );
+    }
+    for (i, o) in cfg.outputs.iter().enumerate() {
+        if let Some(p) = o.preset.as_deref().filter(|p| crate::output_format::is_encoder_preset_name(p)) {
+            tracing::warn!(
+                "outputs[{i}].preset = {p:?} is an encoder preset; read as encoder_preset \
+                 (rename it — `preset` now names a platform: {})",
+                crate::output_format::OutputPreset::names()
+            );
+        }
     }
     println!(
         "  target:         {}s @ {} fps",
@@ -141,10 +160,11 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // Body render uses CRF chosen for high quality if we'll re-transcode to
     // multiple outputs (avoids generation-loss artifacts), otherwise the
     // single output's configured CRF.
-    let body_crf: u32 = if cfg.outputs.len() == 1 {
-        cfg.outputs[0].crf
+    let outputs = cfg.resolved_outputs();
+    let body_crf: u32 = if direct_single_output(cfg) {
+        outputs[0].crf
     } else {
-        cfg.outputs[0].crf.min(18)
+        outputs[0].crf.min(18)
     };
 
     // 1. Probe inputs.
@@ -1717,8 +1737,8 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     progress(Stage::Mixing, 0.0, None);
     // 7. Mux soundtrack into a body+audio file. Per-output transcoding to
     // each `[[outputs]]` target happens after.
-    let muxed_body: Utf8PathBuf = if cfg.outputs.len() == 1 {
-        // Single output: write straight to the user's chosen path.
+    let muxed_body: Utf8PathBuf = if direct_single_output(cfg) {
+        // Single output in the body's shape: write straight to the user's chosen path.
         let p = cfg.outputs[0].path.clone();
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -1905,40 +1925,69 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             .with_context(|| format!("copying {body} to {muxed_body}"))?;
     }
 
-    // 7b. Per-output transcode pass. With a single output, the muxed body IS
-    // the user's output (no extra pass). With multiple, transcode each.
-    let final_outputs: Vec<Utf8PathBuf> = if cfg.outputs.len() == 1 {
+    // Output-time spans of the intro/outro titles: a reframe to a narrower
+    // shape keeps them whole, and a portrait one inside its safe area. Kept
+    // in the manifest so a later reformat of this render does the same.
+    let card_windows = {
+        let total = crate::media_probe::probe_video_duration(&muxed_body);
+        crate::output_format::card_windows(
+            intro_dur.max(intro_overlay_dur) as f64,
+            outro_dur.max(outro_overlay_dur) as f64,
+            total,
+        )
+    };
+
+    // 7b. Per-output transcode pass. A single output in the body's shape IS
+    // the muxed body (no extra pass). Otherwise transcode each, reframing
+    // any whose aspect differs from the body's.
+    let final_outputs: Vec<Utf8PathBuf> = if direct_single_output(cfg) {
         vec![muxed_body.clone()]
     } else {
-        let mut paths = Vec::with_capacity(cfg.outputs.len());
-        println!("\ntranscoding to {} output{}...", cfg.outputs.len(), plural(cfg.outputs.len()));
-        for (i, o) in cfg.outputs.iter().enumerate() {
+        let mut paths = Vec::with_capacity(outputs.len());
+        println!("\ntranscoding to {} output{}...", outputs.len(), plural(outputs.len()));
+        for (i, o) in outputs.iter().enumerate() {
             progress(
                 Stage::Encoding,
-                i as f32 / cfg.outputs.len() as f32,
-                Some(format!("output {} of {}", i + 1, cfg.outputs.len())),
+                i as f32 / outputs.len() as f32,
+                Some(format!("output {} of {}", i + 1, outputs.len())),
             );
             if let Some(parent) = o.path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            let (ow, oh) = parse_resolution(&o.resolution)
-                .with_context(|| format!("outputs[{i}].resolution"))?;
+            let (ow, oh) = (o.width, o.height);
+            let fit = crate::output_format::reframe_fit((width, height), (ow, oh), o.fit);
             let pref = encoder_pref_from_cfg(&o.encoder);
             let out_hw = HwConfig::resolve(hw.support.clone(), pref);
             let started = std::time::Instant::now();
             println!(
-                "  [{i}] {} → {ow}x{oh}  enc={}  crf={}  a={}",
-                o.path, out_hw.encoder.name(), o.crf, o.audio_bitrate
+                "  [{i}] {} → {ow}x{oh}{}  enc={}  crf={}  a={}",
+                o.path,
+                fit.map(|f| format!(" ({} fit)", f.name())).unwrap_or_default(),
+                out_hw.encoder.name(),
+                o.crf,
+                o.audio_bitrate
+            );
+            let graph = crate::output_format::reframe_graph(
+                (width, height),
+                ow,
+                oh,
+                fit,
+                &card_windows,
+                cfg.project.fps as f64,
+            );
+            let video_args = crate::output_format::output_encode_args(
+                &out_hw,
+                o.crf,
+                o.encoder_preset.as_deref(),
+                o.max_bitrate,
             );
             crate::video_renderer::transcode_output(
                 &runner,
                 &muxed_body,
                 &o.path,
-                ow,
-                oh,
-                o.crf,
+                &graph,
+                &video_args,
                 &o.audio_bitrate,
-                &out_hw,
             )
             .with_context(|| format!("transcoding output {i} → {}", o.path))?;
             println!("    done ({:.1}s)", started.elapsed().as_secs_f32());
@@ -1976,9 +2025,10 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         output: primary_output.clone(),
         target_duration_secs: target,
         actual_duration_secs: segments.iter().map(|s: &Segment| s.duration_secs).sum(),
-        resolution: cfg.outputs[0].resolution.clone(),
+        resolution: outputs[0].resolution(),
         fps: cfg.project.fps,
         seed: cfg.project.seed,
+        card_windows,
         sources,
         segments,
         duck_windows,
@@ -2308,6 +2358,13 @@ pub fn short_hash(full: &str) -> String {
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+/// One output in the body's own shape, with no cap of its own: the mux
+/// writes it directly, with no extra encode pass.
+fn direct_single_output(cfg: &Config) -> bool {
+    let outs = cfg.resolved_outputs();
+    outs.len() == 1 && !crate::output_format::needs_own_pass(cfg.body_resolution(), &outs[0])
 }
 
 fn encoder_pref_from_cfg(e: &crate::project_config::Encoder) -> EncoderPref {
