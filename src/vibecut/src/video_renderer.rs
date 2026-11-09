@@ -107,10 +107,16 @@ impl NativeRunner {
 impl FfmpegRunner for NativeRunner {
     fn run(&self, args: &[&str]) -> Result<()> {
         tracing::debug!(binary = %self.binary, ?args, "ffmpeg invoke");
-        let output = Command::new(&self.binary)
-            .args(args)
-            .output()
-            .with_context(|| format!("spawning {} (is it on PATH?)", self.binary))?;
+        // Cancellable: a stopped render kills this ffmpeg mid-encode.
+        use crate::cancel::CancellableCommand as _;
+        let output = match Command::new(&self.binary).args(args).cancellable_output() {
+            Ok(o) => o,
+            Err(e) if crate::cancel::is_cancelled(&e) => {
+                remove_killed_output(args);
+                return Err(e);
+            }
+            Err(e) => return Err(e.context(format!("spawning {} (is it on PATH?)", self.binary))),
+        };
         // Surface non-empty stderr at warn level even on success — ffmpeg
         // prints warnings (e.g. "input X ended before xfade range") with a
         // 0 exit code that would otherwise be invisible.
@@ -148,6 +154,108 @@ impl FfmpegRunner for NativeRunner {
             .next()
             .unwrap_or("")
             .to_string())
+    }
+}
+
+/// The output file a killed ffmpeg was writing, if it wrote one: by
+/// ffmpeg's argument grammar the last argument is the output (`-` for
+/// stdout / `-f null -`, which have nothing to clean up).
+fn killed_output<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let last = *args.last()?;
+    (last != "-" && !last.starts_with('-') && !last.contains("://")).then_some(last)
+}
+
+/// Delete what a killed ffmpeg left half-written, so a later render can't
+/// take it for a finished intermediate.
+fn remove_killed_output(args: &[&str]) {
+    if let Some(p) = killed_output(args) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::cancel::{is_cancelled, CancelToken};
+    use std::time::{Duration, Instant};
+
+    fn tmp(name: &str) -> Utf8PathBuf {
+        let d = std::env::temp_dir().join(format!("vibecut_runner_cancel_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Utf8PathBuf::from_path_buf(d).unwrap()
+    }
+
+    #[test]
+    fn killed_output_is_the_last_argument_unless_stdout() {
+        assert_eq!(killed_output(&["-i", "in.mp4", "-c", "copy", "out.mp4"]), Some("out.mp4"));
+        assert_eq!(killed_output(&["-i", "in.mp4", "-f", "null", "-"]), None);
+        assert_eq!(killed_output(&[]), None);
+    }
+
+    #[test]
+    fn a_cancelled_encode_is_killed_and_its_partial_output_removed() {
+        if NativeRunner::new().version().is_err() {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        }
+        let d = tmp("encode");
+        let out = d.join("body.mp4");
+        let out_s = out.to_string();
+        let token = CancelToken::new();
+        let stop = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            stop.cancel();
+        });
+        let started = Instant::now();
+        let r = crate::progress::with_sink_and_cancel(|_| {}, token, || {
+            NativeRunner::new().run(&[
+                "-y", "-v", "error", "-nostdin",
+                "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
+                "-t", "600",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                &out_s,
+            ])
+        });
+        assert!(is_cancelled(&r.unwrap_err()));
+        assert!(started.elapsed() < Duration::from_secs(5), "encode wasn't stopped");
+        assert!(!out.exists(), "half-written output left behind");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A runner that writes a partial transforms file and then fails, as a
+    /// vidstabdetect killed mid-pass does.
+    struct HalfTrfRunner(Utf8PathBuf);
+    impl FfmpegRunner for HalfTrfRunner {
+        fn run(&self, _args: &[&str]) -> Result<()> {
+            std::fs::write(&self.0, b"VID.STAB 1\nFrame 1 (List 0 [])\n").unwrap();
+            Err(crate::cancel::Cancelled.into())
+        }
+        fn version(&self) -> Result<String> {
+            Ok("mock".into())
+        }
+    }
+
+    /// Detection runs at the start of every render (several ffmpeg runs
+    /// and encoder smoke tests): a Stop must not wait for it to finish.
+    #[test]
+    fn hardware_detection_obeys_a_stop() {
+        let token = CancelToken::new();
+        token.cancel();
+        let r = crate::progress::with_sink_and_cancel(|_| {}, token, || HwSupport::detect("ffmpeg"));
+        assert!(is_cancelled(&r.expect_err("detection ran its ffmpeg probes after a Stop")));
+    }
+
+    #[test]
+    fn stabilize_detect_never_leaves_a_partial_trf() {
+        let d = tmp("trf");
+        let trf = d.join("seg_001_abcd.trf");
+        let hw = HwConfig::resolve(HwSupport::default(), EncoderPref::Libx264);
+        let r = stabilize_detect(&HalfTrfRunner(trf.clone()), Utf8Path::new("in.mp4"), 0.0, 2.0, 640, 360, &trf, &hw);
+        assert!(r.is_err());
+        assert!(!trf.exists(), "a partial .trf would be a cache hit next render");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 
@@ -239,9 +347,11 @@ impl HwSupport {
 }
 
 fn capture(binary: &str, args: &[&str]) -> Result<String> {
+    // Runs at the start of every render: a Stop must not wait for it.
+    use crate::cancel::CancellableCommand as _;
     let out = std::process::Command::new(binary)
         .args(args)
-        .output()
+        .cancellable_output()
         .with_context(|| format!("spawning {binary}"))?;
     if !out.status.success() {
         anyhow::bail!(
@@ -262,6 +372,10 @@ fn capture(binary: &str, args: &[&str]) -> Result<String> {
 ///
 /// Returns `true` if the encoder is genuinely usable, `false` otherwise.
 fn probe_encoder(binary: &str, encoder: &str) -> bool {
+    // Cancellable (a stuck driver can hold it for seconds). A killed probe
+    // reads as "unusable", but the pipeline's check right after detection
+    // stops the render before that answer is used.
+    use crate::cancel::CancellableCommand as _;
     let result = std::process::Command::new(binary)
         .args([
             "-v", "error",
@@ -272,7 +386,7 @@ fn probe_encoder(binary: &str, encoder: &str) -> bool {
             "-f", "null",
             "-",
         ])
-        .output();
+        .cancellable_output();
     match result {
         Ok(o) => {
             if !o.status.success() {
@@ -1150,7 +1264,13 @@ pub fn stabilize_detect(
         arg("-"),
     ]);
     let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    runner.run(&refs)
+    let r = runner.run(&refs);
+    // vidstabdetect writes the .trf as it goes, and a non-empty .trf is a
+    // cache hit next run: never leave a partial one (failed or cancelled).
+    if r.is_err() {
+        let _ = std::fs::remove_file(transforms_out.as_std_path());
+    }
+    r
 }
 
 // ---------- Stage 2: concat ----------

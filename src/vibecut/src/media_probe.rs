@@ -397,6 +397,7 @@ pub fn extract_gpmf_bytes(path: &Utf8Path) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     };
     // We pipe via ffmpeg → stdout because gpmd payloads are concatenated raw.
+    use crate::cancel::CancellableCommand as _;
     let map_arg = format!("0:{idx}");
     let output = Command::new("ffmpeg")
         .args([
@@ -407,7 +408,8 @@ pub fn extract_gpmf_bytes(path: &Utf8Path) -> Result<Option<Vec<u8>>> {
             "-f", "data",
             "-",
         ])
-        .output()
+        // Reads the whole chapter (GBs on a real card): keep it stoppable.
+        .cancellable_output()
         .with_context(|| "spawning ffmpeg for GPMF extraction")?;
     if !output.status.success() {
         anyhow::bail!(

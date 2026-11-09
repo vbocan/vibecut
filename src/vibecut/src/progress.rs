@@ -7,6 +7,9 @@
 //! sink installed every report is a no-op, so the CLI is unaffected.
 //! Work fanned out to other threads (the visual-analysis pool) reports
 //! through a [`Reporter`] cloned from [`current`] before the fan-out.
+//! The reporter also carries the render's cancel token
+//! ([`with_sink_and_cancel`], see [`crate::cancel`]); the pipeline thread
+//! reports through [`checkpoint`], so every report is also a cancel point.
 //!
 //! `overall` is a 0..1 estimate built from fixed per-stage weights (a
 //! typical render's time split). It never goes backwards, even when a
@@ -16,6 +19,8 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+
+use crate::cancel::CancelToken;
 
 /// Render stages, in pipeline order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -109,15 +114,23 @@ pub struct Progress {
 
 type Sink = dyn Fn(&Progress) + Send + Sync;
 
-/// Cloneable handle that delivers reports to the installed sink.
+/// Cloneable handle that delivers reports to the installed sink. It also
+/// carries the render's [`CancelToken`], so cloning it into worker threads
+/// (and [`Reporter::enter`]ing it there) makes their ffmpeg runs
+/// cancellable too.
 #[derive(Clone)]
 pub struct Reporter {
     sink: Arc<Sink>,
     high_water: Arc<Mutex<f32>>,
+    cancel: CancelToken,
 }
 
 impl Reporter {
     pub fn report(&self, stage: Stage, stage_fraction: f32, detail: Option<String>) {
+        // A stopped render's bar stays where it was.
+        if self.cancel.is_cancelled() {
+            return;
+        }
         let f = stage_fraction.clamp(0.0, 1.0);
         let raw = (stage.start() + f * stage.weight()).clamp(0.0, 1.0);
         // Deliver under the lock: parallel workers (the analysis stage
@@ -130,6 +143,24 @@ impl Reporter {
         *hw = raw;
         (self.sink)(&Progress { stage, label: stage.label(), stage_fraction: f, overall: raw, detail });
     }
+
+    /// This render's cancel token.
+    pub fn cancel_token(&self) -> &CancelToken {
+        &self.cancel
+    }
+
+    /// Install this reporter (and its cancel token) on the current thread
+    /// until the guard drops — for work running on a pool thread.
+    pub fn enter(&self) -> Entered {
+        let prev = CURRENT.with(|c| c.replace(Some(self.clone())));
+        Entered { _restore: Restore(prev) }
+    }
+}
+
+/// Guard from [`Reporter::enter`]; restores the thread's previous reporter.
+#[must_use = "the reporter is only installed while the guard lives"]
+pub struct Entered {
+    _restore: Restore,
 }
 
 thread_local! {
@@ -150,7 +181,18 @@ impl Drop for Restore {
 /// Run `f` with `sink` receiving every progress report made on this
 /// thread (and through [`Reporter`]s cloned from it).
 pub fn with_sink<R>(sink: impl Fn(&Progress) + Send + Sync + 'static, f: impl FnOnce() -> R) -> R {
-    let reporter = Reporter { sink: Arc::new(sink), high_water: Arc::new(Mutex::new(0.0)) };
+    with_sink_and_cancel(sink, CancelToken::new(), f)
+}
+
+/// [`with_sink`], plus `cancel` as the render's stop flag: cancelling it
+/// makes the pipeline's ffmpeg runs kill their child and return
+/// [`crate::cancel::Cancelled`] (see [`crate::cancel`]).
+pub fn with_sink_and_cancel<R>(
+    sink: impl Fn(&Progress) + Send + Sync + 'static,
+    cancel: CancelToken,
+    f: impl FnOnce() -> R,
+) -> R {
+    let reporter = Reporter { sink: Arc::new(sink), high_water: Arc::new(Mutex::new(0.0)), cancel };
     let prev = CURRENT.with(|c| c.replace(Some(reporter)));
     let _restore = Restore(prev);
     f()
@@ -162,11 +204,27 @@ pub fn current() -> Option<Reporter> {
     CURRENT.with(|c| c.borrow().clone())
 }
 
+/// The cancel token of the render running on this thread, if any.
+pub fn cancel_token() -> Option<CancelToken> {
+    CURRENT.with(|c| c.borrow().as_ref().map(|r| r.cancel.clone()))
+}
+
 /// Report progress on this thread's sink (no-op without one).
 pub fn report(stage: Stage, stage_fraction: f32, detail: Option<String>) {
     if let Some(r) = current() {
         r.report(stage, stage_fraction, detail);
     }
+}
+
+/// [`report`], then stop if the render was cancelled: every progress
+/// report on the pipeline thread is also a cancel point. Use it with `?`.
+pub fn checkpoint(
+    stage: Stage,
+    stage_fraction: f32,
+    detail: Option<String>,
+) -> Result<(), crate::cancel::Cancelled> {
+    report(stage, stage_fraction, detail);
+    crate::cancel::check()
 }
 
 #[cfg(test)]
@@ -205,5 +263,62 @@ mod tests {
         assert!((seen[2].overall - 1.0).abs() < 1e-5);
         // Outside `with_sink`, reporting is a no-op.
         assert!(current().is_none());
+    }
+
+    #[test]
+    fn cancel_token_travels_with_the_reporter_and_freezes_the_bar() {
+        let seen: Arc<Mutex<Vec<Progress>>> = Arc::default();
+        let sink_seen = seen.clone();
+        let token = CancelToken::new();
+        let stop = token.clone();
+        with_sink_and_cancel(
+            move |p| sink_seen.lock().unwrap().push(p.clone()),
+            token,
+            || {
+                report(Stage::Probing, 1.0, None);
+                assert!(crate::cancel::check().is_ok());
+                let r = current().unwrap();
+                // A pool thread sees the token once it enters the reporter,
+                // and not before.
+                let worker = std::thread::spawn(move || {
+                    assert!(cancel_token().is_none());
+                    let _in = r.enter();
+                    cancel_token().is_some()
+                });
+                assert!(worker.join().unwrap());
+                stop.cancel();
+                assert_eq!(crate::cancel::check(), Err(crate::cancel::Cancelled));
+                // Reports after the stop don't move the bar.
+                report(Stage::Clips, 0.5, None);
+            },
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(cancel_token().is_none());
+    }
+
+    #[test]
+    fn a_checkpoint_reports_then_stops_a_cancelled_render() {
+        let seen: Arc<Mutex<Vec<Stage>>> = Arc::default();
+        let sink_seen = seen.clone();
+        let token = CancelToken::new();
+        let stop = token.clone();
+        let r = with_sink_and_cancel(
+            move |p| {
+                sink_seen.lock().unwrap().push(p.stage);
+                // Stop pressed while the probing report is on screen.
+                if p.stage == Stage::Probing {
+                    stop.cancel();
+                }
+            },
+            token,
+            || -> Result<(), crate::cancel::Cancelled> {
+                checkpoint(Stage::Probing, 0.0, None)?;
+                unreachable!("the render went on past a cancelled checkpoint");
+            },
+        );
+        assert_eq!(r, Err(crate::cancel::Cancelled));
+        assert_eq!(*seen.lock().unwrap(), vec![Stage::Probing]);
+        // Without a token (the CLI) a checkpoint is just a report.
+        assert_eq!(checkpoint(Stage::Clips, 0.5, None), Ok(()));
     }
 }

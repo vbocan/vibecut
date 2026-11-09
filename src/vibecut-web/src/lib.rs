@@ -139,6 +139,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jobs_list_is_newest_first_and_cancel_stops_a_queued_job() {
+        let state = AppState::default();
+        let older = state.jobs.submit_for("/projects/a.toml").await;
+        let newer = state.jobs.submit_for("/projects/b.toml").await;
+        let app = router(state.clone());
+
+        let res = app
+            .clone()
+            .oneshot(cancel_request(&newer, "application/json", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["state"], "cancelled");
+        assert_eq!(body["cancel_requested"], true);
+
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/jobs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs[0]["job_id"], newer.as_str());
+        assert_eq!(jobs[0]["state"], "cancelled");
+        assert_eq!(jobs[1]["job_id"], older.as_str());
+        assert_eq!(jobs[1]["state"], "queued");
+        assert_eq!(jobs[1]["config_path"], "/projects/a.toml");
+
+        // The per-job status reports the same state.
+        let res = app
+            .oneshot(Request::builder().uri(format!("/api/render/{newer}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body_json(res).await["state"], "cancelled");
+    }
+
+    fn cancel_request(job_id: &str, content_type: &str, body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/jobs/{job_id}/cancel"))
+            .header("content-type", content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_job_is_404() {
+        let app = router(AppState::default());
+        let res = app
+            .oneshot(cancel_request("no-such-job", "application/json", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A page on another origin can send a form post or a text/plain
+    /// fetch without a CORS preflight. Neither may stop a render: the
+    /// route takes only a JSON body, like every state-changing route.
+    #[tokio::test]
+    async fn cancel_refuses_cross_site_simple_requests() {
+        let state = AppState::default();
+        let id = state.jobs.submit_for("/projects/a.toml").await;
+        let app = router(state.clone());
+        for (ct, body) in [
+            ("application/x-www-form-urlencoded", "x=1"),
+            ("text/plain", "{}"),
+            ("multipart/form-data; boundary=b", "--b--"),
+        ] {
+            let res = app.clone().oneshot(cancel_request(&id, ct, body)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct} was accepted");
+        }
+        let bare = Request::builder()
+            .method("POST")
+            .uri(format!("/api/jobs/{id}/cancel"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(bare).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "a bodiless post was accepted");
+        let info = state.jobs.info(&id).await.unwrap();
+        assert!(!info.cancel_requested, "a refused request still stopped the job");
+        assert!(matches!(info.state, vibecut_ops::jobs::JobState::Queued));
+    }
+
+    #[tokio::test]
     async fn propose_unknown_vibe_is_400() {
         let app = router(AppState::default());
         let res = app

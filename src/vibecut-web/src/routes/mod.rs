@@ -6,6 +6,7 @@ pub mod config;
 pub mod discover;
 pub mod feedback;
 pub mod frames;
+pub mod jobs;
 pub mod music;
 pub mod output;
 pub mod propose;
@@ -42,6 +43,8 @@ pub fn api_router() -> Router<AppState> {
         .route("/render", post(render::render_sync))
         .route("/render/async", post(render::render_async))
         .route("/render/{job_id}", get(render::render_status))
+        .route("/jobs", get(jobs::list_jobs))
+        .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/frames/output", get(frames::inspect_output))
         .route("/frames/at", get(frames::inspect_at))
         .route("/output", get(output::serve_output))

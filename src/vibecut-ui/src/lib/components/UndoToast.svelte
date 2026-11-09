@@ -22,12 +22,32 @@
 		}
 	});
 
+	// Short notices (a stopped render) fade on their own after a few seconds.
+	let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+	$effect(() => {
+		const n = s.notice;
+		if (noticeTimer) clearTimeout(noticeTimer);
+		if (n) {
+			noticeTimer = setTimeout(() => {
+				if (s.notice === n) s.notice = null;
+			}, 5000);
+		}
+	});
+
 	onDestroy(() => {
 		if (timer) clearTimeout(timer);
+		if (noticeTimer) clearTimeout(noticeTimer);
 	});
 </script>
 
 <div class="toasts" aria-live="polite">
+	{#if s.notice}
+		<div class="toast notice" role="status">
+			<span class="dot info" aria-hidden="true"></span>
+			<span class="msg">{s.notice.text}</span>
+			<button class="x" type="button" aria-label="Dismiss" onclick={() => (s.notice = null)}>✕</button>
+		</div>
+	{/if}
 	{#if visible && s.undo}
 		<div class="toast" role="status">
 			<span class="dot" aria-hidden="true"></span>
@@ -73,6 +93,20 @@
 	.msg {
 		font-weight: 600;
 		white-space: nowrap;
+	}
+
+	.dot.info {
+		background: var(--text-dim);
+		box-shadow: none;
+	}
+
+	.notice .msg {
+		white-space: normal;
+		max-width: min(520px, calc(100vw - 110px));
+	}
+
+	.notice + .toast {
+		margin-top: 8px;
 	}
 
 	.undo {

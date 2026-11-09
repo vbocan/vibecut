@@ -21,7 +21,7 @@ const RAMP_SEED_MULTIPLIER: u64 = 0xc0ffee_d00d;
 /// the audio chain doesn't truncate; short enough to feel like a hard cut.
 const HARD_CUT_XFADE_SECS: f32 = 0.10;
 
-use crate::progress::{report as progress, Stage};
+use crate::progress::{checkpoint as progress, Stage};
 use crate::project_config::Config;
 use crate::selection_planner::{
     DuckWindow, ExtractOpts, Manifest, MANIFEST_SCHEMA_VERSION, Segment, build_score_curve,
@@ -132,6 +132,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             tracing::warn!(error = %e, "hwaccel detection failed; falling back to software");
             HwSupport::default()
         });
+    // A Stop during detection kills its probes, which then read as "no
+    // hardware": stop here before that answer is used.
+    crate::cancel::check()?;
     // Body uses the first output's encoder preference. Each output then
     // re-resolves its own encoder during the per-output transcode pass below.
     let pref = encoder_pref_from_cfg(&cfg.outputs[0].encoder);
@@ -148,7 +151,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     };
 
     // 1. Probe inputs.
-    progress(Stage::Probing, 0.0, None);
+    progress(Stage::Probing, 0.0, None)?;
     // Collect video files from the optional folder scan plus any explicit
     // [[input.videos]] entries. Duplicates (same canonical path) are dropped.
     let mut files: Vec<Utf8PathBuf> = Vec::new();
@@ -181,6 +184,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // sources. Hashes will be filled in by the cache layer.
     let mut probed = Vec::with_capacity(files.len());
     for f in &files {
+        // One ffprobe per chapter: hundreds on a full card, so a Stop
+        // lands between two of them.
+        crate::cancel::check()?;
         let p = crate::media_probe::probe_metadata(f).with_context(|| format!("probing {f}"))?;
         if p.media.is_none() {
             anyhow::bail!(
@@ -304,7 +310,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             crate::audio_analysis::concat_soundtrack_files(&s.files, &combined)
                 .context("concatenating soundtrack files")?
         };
-        progress(Stage::Music, 0.0, None);
+        progress(Stage::Music, 0.0, None)?;
         println!("\nanalyzing soundtrack {resolved}...");
         let started = std::time::Instant::now();
         let a = crate::audio_analysis::analyze_file(&resolved)
@@ -405,7 +411,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         curves = Vec::new();
     } else {
         let n_sources = sources.len();
-        progress(Stage::Analysing, 0.0, Some(format!("0 of {n_sources} clips")));
+        progress(Stage::Analysing, 0.0, Some(format!("0 of {n_sources} clips")))?;
         let analysis_reporter = crate::progress::current();
         let analysed = std::sync::atomic::AtomicUsize::new(0);
         println!(
@@ -430,6 +436,8 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 sources
                     .par_iter()
                     .map(|source| {
+                        // This pool thread's ffmpeg runs obey the render's Stop.
+                        let _entered = analysis_reporter.as_ref().map(|r| r.enter());
                         let tel = extract_telemetry_with(source, &extract_opts);
                         let curve = build_score_curve(&tel, &cfg.scoring, 4.0);
                         let done = analysed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -444,6 +452,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                     })
                     .collect()
             });
+        // Analysis failures are only warnings, so a Stop during this stage
+        // must be caught here rather than picking from half the footage.
+        crate::cancel::check()?;
         let (tels, crvs): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
         // Print per-source summary in source order so logs stay readable, even
@@ -483,7 +494,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         );
 
         telemetries = tels;
-        progress(Stage::Picking, 0.0, None);
+        progress(Stage::Picking, 0.0, None)?;
         curves = crvs;
     }
 
@@ -1414,7 +1425,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         }
     }
 
-    progress(Stage::Clips, 0.0, Some(format!("0 of {} clips", segments.len())));
+    progress(Stage::Clips, 0.0, Some(format!("0 of {} clips", segments.len())))?;
     println!("\nnormalizing segments → {workspace}");
     let mut normalized: Vec<Utf8PathBuf> = Vec::with_capacity(segments.len());
     let last_idx = segments.len().saturating_sub(1);
@@ -1478,7 +1489,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             normalize_hits += 1;
             normalized.push(out);
             let n = segments.len();
-            progress(Stage::Clips, (i + 1) as f32 / n as f32, Some(format!("{} of {n} clips", i + 1)));
+            progress(Stage::Clips, (i + 1) as f32 / n as f32, Some(format!("{} of {n} clips", i + 1)))?;
             continue;
         }
         let started = std::time::Instant::now();
@@ -1520,7 +1531,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         );
         normalized.push(out);
         let n = segments.len();
-        progress(Stage::Clips, (i + 1) as f32 / n as f32, Some(format!("{} of {n} clips", i + 1)));
+        progress(Stage::Clips, (i + 1) as f32 / n as f32, Some(format!("{} of {n} clips", i + 1)))?;
     }
     if normalize_hits > 0 {
         println!(
@@ -1609,7 +1620,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
 
     // (intro/outro setup moved earlier so overlay mode can attach to normalize)
 
-    progress(Stage::Joining, 0.0, None);
+    progress(Stage::Joining, 0.0, None)?;
     // 7. Concat: [intro card], the clips, [outro card] — crossfaded, or
     // joined with straight cuts in hard-cut mode (`[transition].default =
     // "cut"` / `"none"`, or a zero `duration`). Both paths keep the cards and
@@ -1662,12 +1673,16 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     plan.render(&runner, width, height, cfg.project.fps, body_crf, &hw, &body)?;
     let timeline = crate::output_timeline::OutputTimeline::build(&plan.layout, &plan.items);
 
-    progress(Stage::Mixing, 0.0, None);
+    progress(Stage::Mixing, 0.0, None)?;
     // 7. Mux soundtrack into a body+audio file. Per-output transcoding to
     // each `[[outputs]]` target happens after.
+    // Outputs are written under staging names and renamed into place only
+    // once the whole render has succeeded: a failed or stopped render never
+    // replaces the last good video with half of a new one.
+    let staged = crate::staging::StagedOutputs::new(cfg.outputs.iter().map(|o| o.path.as_path()));
     let muxed_body: Utf8PathBuf = if cfg.outputs.len() == 1 {
-        // Single output: write straight to the user's chosen path.
-        let p = cfg.outputs[0].path.clone();
+        // Single output: write straight to the user's chosen path (staged).
+        let p = staged.path(0).to_path_buf();
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -1856,7 +1871,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // 7b. Per-output transcode pass. With a single output, the muxed body IS
     // the user's output (no extra pass). With multiple, transcode each.
     let final_outputs: Vec<Utf8PathBuf> = if cfg.outputs.len() == 1 {
-        vec![muxed_body.clone()]
+        vec![cfg.outputs[0].path.clone()]
     } else {
         let mut paths = Vec::with_capacity(cfg.outputs.len());
         println!("\ntranscoding to {} output{}...", cfg.outputs.len(), plural(cfg.outputs.len()));
@@ -1865,7 +1880,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 Stage::Encoding,
                 i as f32 / cfg.outputs.len() as f32,
                 Some(format!("output {} of {}", i + 1, cfg.outputs.len())),
-            );
+            )?;
             if let Some(parent) = o.path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -1881,7 +1896,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             crate::video_renderer::transcode_output(
                 &runner,
                 &muxed_body,
-                &o.path,
+                staged.path(i),
                 ow,
                 oh,
                 o.crf,
@@ -1896,7 +1911,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     };
     let primary_output = &cfg.outputs[0].path;
 
-    progress(Stage::Checking, 0.0, None);
+    progress(Stage::Checking, 0.0, None)?;
     // 7c. Beat-sync check: where did the cuts land against the music?
     // Informational only — never fails the render.
     let beat_sync = match (&audio, &cfg.soundtrack, soundtrack_layout, &soundtrack_resolved) {
@@ -1909,7 +1924,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 fade_out_secs: snd.fade_out.as_secs_f32(),
                 duck_windows: &duck_windows,
                 soundtrack: snd_path,
-                rendered: primary_output,
+                rendered: staged.path(0),
                 fps: cfg.project.fps,
             })
         }
@@ -1951,10 +1966,14 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         timeline: Some(timeline),
         generator: format!("vibecut {}", env!("CARGO_PKG_VERSION")),
     };
+    // Last chance to stop: past this point the new video replaces the old.
+    crate::cancel::check()?;
+    staged.commit()?;
     manifest
         .write_to(&manifest_path)
         .with_context(|| format!("writing manifest {manifest_path}"))?;
-    progress(Stage::Checking, 1.0, None);
+    // Committed: the render is done now, so this report is not a cancel point.
+    crate::progress::report(Stage::Checking, 1.0, None);
 
     println!("\n✓ done");
     for p in &final_outputs {
