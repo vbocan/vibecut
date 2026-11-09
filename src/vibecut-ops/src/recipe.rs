@@ -927,20 +927,54 @@ fn frozen_baselines() -> &'static Map<String, Value> {
 
 /// A vibe's style as format 1 froze it: what a code's settings are
 /// differences from. Without music the soundtrack section is empty.
+///
+/// Config keys added to the schema after format 1 (say a new scoring
+/// signal) aren't in the frozen file. They take the vibe's current
+/// template value, so an untouched new key never shows up as a setting
+/// and an old code, which can't mention it, gets today's default. Keys
+/// the frozen file does have keep their format-1 value, so what an
+/// existing code means never changes.
 pub fn frozen_baseline(vibe: &str, with_music: bool) -> Result<Value, OpsError> {
     let mut v = frozen_baselines()
         .get(vibe)
         .cloned()
         .ok_or_else(|| OpsError::internal(format!("no format-1 baseline for vibe {vibe:?}")))?;
+    if let Some(current) = current_baseline_cached(vibe) {
+        fill_missing(&mut v, &current);
+    }
     if !with_music {
         v["soundtrack"] = Value::Null;
     }
     Ok(v)
 }
 
-/// A vibe's style as its template renders today (what format 1 froze;
-/// the tests compare the two).
-#[cfg(test)]
+/// Adds every object key of `from` that `into` lacks (recursively).
+/// Existing keys, arrays and scalars in `into` are left as they are.
+fn fill_missing(into: &mut Value, from: &Value) {
+    if let (Value::Object(i), Value::Object(f)) = (into, from) {
+        for (k, fv) in f {
+            match i.get_mut(k) {
+                Some(iv) => fill_missing(iv, fv),
+                None => {
+                    i.insert(k.clone(), fv.clone());
+                }
+            }
+        }
+    }
+}
+
+/// [`current_baseline`] per vibe, computed once.
+fn current_baseline_cached(vibe: &str) -> Option<Value> {
+    static C: OnceLock<Mutex<HashMap<String, Option<Value>>>> = OnceLock::new();
+    let cache = C.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(vibe.to_string())
+        .or_insert_with(|| vibes::get(vibe).and_then(|v| current_baseline(v).ok()))
+        .clone()
+}
+
+/// A vibe's style as its template renders today (what format 1 froze,
+/// plus any keys added since; the tests compare the two).
 fn current_baseline(vibe: &Vibe) -> Result<Value, OpsError> {
     let (_, cfg) = propose::render_checked(
         vibe,

@@ -1096,3 +1096,27 @@ fn chips_read_like_a_summary() {
     assert_eq!(json["music"]["kind"], "songs");
     assert!(json["music"]["songs"][0]["id"].is_null());
 }
+
+#[test]
+fn keys_added_after_format_1_take_the_current_template() {
+    // A key the frozen file lacks is filled in; a key it has keeps its
+    // frozen value even when the template changed.
+    let mut frozen = serde_json::json!({ "scoring": { "gps_speed": 0.4 }, "project": { "fps": 30 } });
+    let current = serde_json::json!({ "scoring": { "gps_speed": 0.9, "gyro": 0.4 }, "grading": { "stabilize": false } });
+    super::fill_missing(&mut frozen, &current);
+    assert_eq!(
+        frozen,
+        serde_json::json!({ "scoring": { "gps_speed": 0.4, "gyro": 0.4 }, "project": { "fps": 30 }, "grading": { "stabilize": false } })
+    );
+    // And an untouched vibe has no settings at all, whatever was added.
+    for key in vibes::names() {
+        let cfg = build_config(
+            &Recipe { vibe: key.into(), music: Music::Auto, settings: vec![] },
+            &dest("/footage/x", "T", "x"),
+            &["/m/a.mp3".into()],
+        )
+        .unwrap();
+        let r = recipe_from_config(&cfg, Some(key), Music::Auto).unwrap();
+        assert!(r.settings.is_empty(), "{key}: {:?}", r.settings);
+    }
+}
