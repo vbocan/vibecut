@@ -128,7 +128,9 @@ pub struct Project {
     /// Directory holding ONNX model files (`silero_vad.onnx`, future face /
     /// scene-detection nets). The pipeline auto-loads any model present;
     /// when missing it warns and gracefully falls back to non-ML behaviour.
-    /// Default `"models"` relative to the working directory.
+    /// Default `"models"` relative to the working directory. A model not
+    /// found here is looked up in `$VIBECUT_MODELS_DIR`, then `/app/models`
+    /// (see `ml_engine::ModelDirs`).
     #[serde(default = "default_models_dir")]
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub models_dir: Utf8PathBuf,
@@ -404,8 +406,9 @@ pub struct Soundtrack {
     /// duck-window score. Final score = audio_interestingness ×
     /// (1 + vad_speech_weight × peak_speech_prob). Default 1.5 → a segment
     /// with peak_speech = 1.0 gets 2.5× the duck priority. Only consulted
-    /// when `<project>/models/silero_vad.onnx` (or wherever
-    /// `[project].models_dir` points) is present.
+    /// when `silero_vad.onnx` is found in `[project].models_dir`,
+    /// `$VIBECUT_MODELS_DIR` or `/app/models` (the Docker image always has
+    /// it there); 0 turns the speech boost off.
     #[serde(default = "default_vad_speech_weight")]
     pub vad_speech_weight: f32,
 }

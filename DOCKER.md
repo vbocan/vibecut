@@ -128,6 +128,57 @@ form: `http://localhost:8080/`.
 | `/projects` | Generated TOMLs, rendered outputs, conversation logs. |
 | `/cache` | Persisted visual-analysis cache; speeds up re-renders. |
 
+`/projects/fonts` and `/projects/models` are optional drop-in folders on
+the projects mount; see below.
+
+## Fonts and models
+
+Title cards and speech-driven soundtrack ducking work out of the box: the
+image carries the fonts and the voice-activity model they need.
+
+**Fonts.** Installed from Ubuntu packages, with fontconfig:
+
+| Family | Package | Notes |
+|---|---|---|
+| Inter, Inter Display | `fonts-inter` | Thin … Black, with italics. Inter Regular is the default card face. |
+| Bebas Neue | `fonts-bebas-neue` | Condensed all-caps display face (Thin, Light, Book, Regular, Bold). |
+| DejaVu Sans / Serif / Sans Mono | `fonts-dejavu-core` | The default when Inter is missing. |
+| Liberation Sans / Serif / Mono | `fonts-liberation` | Metric-compatible with Arial, Times New Roman and Courier New, so a config written on Windows with `font = "arialbd.ttf"` keeps its layout. |
+
+A text layer's `font` can name a file (`"Inter-Black.otf"`; the extension
+is optional), a family (`"Bebas Neue"`, `"Inter Display:bold"`) or a
+path. [CONFIG.md](CONFIG.md#fonts) has the lookup rules. `docker exec
+vibecut fc-list : family style` lists what's installed. For your own
+fonts, put the `.ttf` / `.otf` files in `<projects>/fonts` and name them
+by file name: that folder is `$VIBECUT_FONTS_DIR` and is searched first.
+
+**Silero VAD.** `/app/models/silero_vad.onnx` is Silero VAD v6.2 from
+[snakers4/silero-vad](https://github.com/snakers4/silero-vad), fetched at
+build time from the v6.2.3 release commit and checked against the size
+and git blob id GitHub lists for it (the pinned values are build args in
+the Dockerfile's `models` stage, with how to bump them). Its MIT licence
+sits next to it as `/app/models/LICENSE.silero-vad`, with a provenance
+note in `NOTICE.silero-vad`. The build needs to reach
+`raw.githubusercontent.com` for this.
+
+Renders look for the model in `[project].models_dir`, then
+`$VIBECUT_MODELS_DIR`, then `/app/models`, and log which one they used at
+info level ("Silero VAD model found"). To use another copy, put
+`silero_vad.onnx` in `<projects>/models`. To keep ducking from favouring
+speech, set `[soundtrack].vad_speech_weight = 0`.
+
+| Variable | Image default | Purpose |
+|---|---|---|
+| `VIBECUT_FONTS_DIR` | `/projects/fonts` | Extra font folders (`:`-separated), searched before the system fonts. |
+| `VIBECUT_MODELS_DIR` | `/projects/models` | Extra model folders (`:`-separated), searched after `[project].models_dir` and before `/app/models`. |
+
+Missing folders are skipped. `compose.yml` sets both to these container
+paths itself rather than reading them from your shell, where the same
+names may hold host paths for native renders (a `D:\Fonts` there would
+replace the drop-in folder and match nothing in the container). To point
+them elsewhere, override `environment:` in a `compose.override.yml`, or
+pass `-e` to `docker run`.
+
 ## CPU-only fallback
 
 Drop `--gpus all` from the docker invocation. The pipeline detects the

@@ -14,6 +14,12 @@
 # you're iterating on frontend code; for that, `cd src/vibecut-ui && npm
 # run dev` against a container started via compose.yml alone is almost
 # always faster anyway (see DOCKER.md's dev loop section).
+#
+# Fonts and the Silero VAD model also stay the image's (/usr/share/fonts,
+# /app/models). To try other ones without a rebuild, drop them into
+# <projects>/fonts and <projects>/models: compose.yml points
+# VIBECUT_FONTS_DIR and VIBECUT_MODELS_DIR there, and both are searched
+# before the image's own.
 
 services:
   vibecut:
