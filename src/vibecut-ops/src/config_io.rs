@@ -186,7 +186,10 @@ fn apply(
                 if let Some(old) = table.get(seg).and_then(Item::as_value) {
                     *v.decor_mut() = old.decor().clone();
                 }
-                table.insert(seg, Item::Value(v));
+                // A whole table (an `[intro]` card) or list of tables (its
+                // `[[intro.layers]]`) is written as real tables, the way a
+                // person writes them, unless it sits inside an inline one.
+                table.insert(seg, if inline { Item::Value(v) } else { tableize(v) });
             }
         }
         return Ok(());
@@ -197,7 +200,21 @@ fn apply(
         return match item {
             Item::ArrayOfTables(a) => {
                 if tail.is_empty() {
-                    return Err(bad());
+                    // The whole entry: replace it, add one at the end, or remove it.
+                    let table = |v: Value| match tableize(v) {
+                        Item::Table(t) => Some(t),
+                        _ => None,
+                    };
+                    match value {
+                        Some(v) if i < a.len() => {
+                            let t = table(v).ok_or_else(bad)?;
+                            *a.get_mut(i).ok_or_else(bad)? = t;
+                        }
+                        Some(v) if i == a.len() => a.push(table(v).ok_or_else(bad)?),
+                        None if i < a.len() => a.remove(i),
+                        _ => return Err(bad()),
+                    }
+                    return Ok(());
                 }
                 let t = a.get_mut(i).ok_or_else(bad)?;
                 apply(t, false, tail, value, key)
@@ -238,6 +255,32 @@ fn apply(
         Item::Table(t) => apply(t, false, rest, value, key),
         Item::Value(Value::InlineTable(t)) => apply(t, true, rest, value, key),
         _ => Err(bad()),
+    }
+}
+
+/// An inline table as a `[table]`, and an array of inline tables as a
+/// `[[table]]` list, all the way down; anything else stays a value.
+fn tableize(v: toml_edit::Value) -> toml_edit::Item {
+    use toml_edit::{ArrayOfTables, Item, Table, Value};
+    fn table_of(t: toml_edit::InlineTable) -> Table {
+        let mut out = Table::new();
+        for (k, v) in t {
+            out.insert(&k, tableize(v));
+        }
+        out
+    }
+    match v {
+        Value::InlineTable(t) => Item::Table(table_of(t)),
+        Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_inline_table) => {
+            let mut list = ArrayOfTables::new();
+            for el in a {
+                if let Value::InlineTable(t) = el {
+                    list.push(table_of(t));
+                }
+            }
+            Item::ArrayOfTables(list)
+        }
+        other => Item::Value(other),
     }
 }
 
@@ -332,6 +375,40 @@ resolution = "1920x1080"
         assert!(out.contains("content = \"Coastline\""), "{out}");
         assert!(!out.contains("variety"), "{out}");
         assert!(out.find("[selection]").unwrap() < out.find("[soundtrack]").unwrap(), "order kept");
+    }
+
+    /// Titles: a whole card is added as an `[outro]` table with
+    /// `[[outro.layers]]`, a text line is added, replaced and removed by
+    /// index, and the card goes away again.
+    #[test]
+    fn cards_and_their_lines_are_added_and_removed_as_tables() {
+        let card = serde_json::json!({
+            "duration": "4s", "fade_in": "500ms", "fade_out": "1s", "mode": "card", "bg_color": "#101820",
+            "layers": [{ "kind": "text", "content": "Thanks for watching", "size": 80, "color": "#ffffff",
+                         "position": "center", "x_offset": 0, "y_offset": 0 }]
+        });
+        let out = patch_text(BASE, &[ch("outro", card)]).unwrap();
+        assert!(out.contains("[outro]\n"), "{out}");
+        assert!(out.contains("[[outro.layers]]\n"), "{out}");
+        assert!(out.contains("content = \"Thanks for watching\""), "{out}");
+        assert!(!out.contains("outro = {"), "not inline: {out}");
+
+        let line = serde_json::json!({ "kind": "text", "content": "Summer 2026", "size": 48, "color": "#ffcc00",
+                                        "position": "bottom-center", "x_offset": 0, "y_offset": -20 });
+        let out = patch_text(&out, &[ch("outro.layers.1", line)]).unwrap();
+        assert_eq!(out.matches("[[outro.layers]]").count(), 2, "{out}");
+        assert!(out.contains("content = \"Summer 2026\""), "{out}");
+        let out = patch_text(&out, &[ch("outro.layers.1.position", serde_json::json!("top-right"))]).unwrap();
+        assert!(out.contains("position = \"top-right\""), "{out}");
+        let out = patch_text(&out, &[ch("outro.layers.0", serde_json::Value::Null)]).unwrap();
+        assert_eq!(out.matches("[[outro.layers]]").count(), 1, "{out}");
+        assert!(!out.contains("Thanks for watching") && out.contains("Summer 2026"), "{out}");
+        let out = patch_text(&out, &[ch("outro", serde_json::Value::Null)]).unwrap();
+        assert!(!out.contains("outro"), "{out}");
+        // The intro written by hand above is untouched throughout.
+        assert!(out.contains("content = \"Hello\""), "{out}");
+        // Adding past the end of the list is refused.
+        assert!(patch_text(BASE, &[ch("intro.layers.5", serde_json::json!({ "kind": "text", "content": "x" }))]).is_err());
     }
 
     #[test]

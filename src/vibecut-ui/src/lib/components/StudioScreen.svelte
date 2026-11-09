@@ -270,6 +270,15 @@
 				<button class="btn ghost small" type="button" aria-haspopup="dialog" aria-expanded={helpOpen} onclick={() => (helpOpen = !helpOpen)}
 					>Shortcuts <kbd>?</kbd></button
 				>
+				<button
+					class="btn ghost small"
+					type="button"
+					aria-haspopup="dialog"
+					onclick={() => {
+						s.fineTuneGroup = 'titles';
+						onOpenPro?.();
+					}}>Titles</button
+				>
 				{#if s.outputPath}
 					{#if draftShown}
 						<button

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
+	import TitlesEditor from './TitlesEditor.svelte';
 	import { appState as s } from '$lib/state.svelte';
 	import { outputFileUrl, type JobListEntry, type PlatformPreset } from '$lib/api';
 	import { CONTROLS, GROUPS, formatDuration, getPath, keyLabel, parseDuration, sameValue, showValue, type Control, type Group } from '$lib/finetune';
@@ -27,7 +28,16 @@
 	const cfgJson = $derived(s.configStructured as unknown);
 
 	$effect(() => {
-		if (open) untrack(() => void s.openFineTune());
+		if (open)
+			untrack(() => {
+				// Opened for one group (the Studio's "Titles"): show it.
+				if (s.fineTuneGroup) {
+					group = s.fineTuneGroup;
+					s.fineTuneGroup = null;
+					s.configMode = 'guided';
+				}
+				void s.openFineTune();
+			});
 	});
 
 	function value(key: string): unknown {
@@ -199,7 +209,9 @@
 	}
 
 	async function render() {
-		if (s.rendering || s.tuneSaving) return;
+		if (s.rendering) return;
+		// Changes still being saved go into this render.
+		await s.tuneIdle();
 		s.configError = null;
 		if (s.configDirty) await s.saveTomlFromTune();
 		if (!s.configError) {
@@ -223,7 +235,7 @@
 				<button
 					class="btn primary"
 					type="button"
-					disabled={s.tuneSaving || s.savingConfig || s.rendering}
+					disabled={s.savingConfig || s.rendering}
 					title={s.rendering ? 'Wait for the current render to finish' : undefined}
 					onclick={render}
 				>
@@ -342,6 +354,9 @@
 									>
 								</div>
 							{/if}
+							{#if currentGroup.id === 'titles'}
+								<TitlesEditor />
+							{:else}
 							{#each currentGroup.controls.filter(shown) as c (c.key)}
 								{@const cur = value(c.key)}
 								{@const def = defaultOf(c.key)}
@@ -423,6 +438,7 @@
 									</div>
 								</div>
 							{/each}
+							{/if}
 						</div>
 					{:else}
 						<p class="dim small">

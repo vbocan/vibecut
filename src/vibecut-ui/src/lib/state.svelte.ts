@@ -1116,6 +1116,8 @@ class AppState {
 	/** A plan of the edit as the settings stand now (no render). */
 	tunePlan = $state<api.EditPlan | null>(null);
 	tunePlanning = $state(false);
+	/** Open Fine-tune on this group (set just before opening it). */
+	fineTuneGroup = $state<string | null>(null);
 	tuneSaving = $state(false);
 	tuneError = $state<string | null>(null);
 	private tunePlanSeq = 0;
@@ -1149,8 +1151,23 @@ class AppState {
 		}
 	}
 
-	/** Change settings in place; then refresh the views and re-plan. */
-	async tune(changes: api.ConfigChange[]) {
+	/** Saves run one after another, so quick edits can't overwrite each other. */
+	private tuneChain: Promise<unknown> = Promise.resolve();
+
+	/** Resolves once every queued settings change is saved. */
+	tuneIdle(): Promise<unknown> {
+		return this.tuneChain;
+	}
+
+	/** Change settings in place; then refresh the views and re-plan. Queued
+	 *  behind any change still being saved. */
+	tune(changes: api.ConfigChange[]): Promise<boolean> {
+		const run = this.tuneChain.then(() => this.tuneNow(changes));
+		this.tuneChain = run.catch(() => false);
+		return run;
+	}
+
+	private async tuneNow(changes: api.ConfigChange[]): Promise<boolean> {
 		if (!this.proposeResult || changes.length === 0) return false;
 		this.tuneSaving = true;
 		this.tuneError = null;
