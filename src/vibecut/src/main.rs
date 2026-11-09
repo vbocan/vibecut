@@ -429,10 +429,53 @@ fn gpmf_cmd(file: &Utf8Path, max_payloads: usize, save_raw: Option<&Utf8Path>) -
 
     let payload_count = vibecut::gopro_metadata::iter_payloads(&bytes).count();
     println!("top-level DEVC payloads: {payload_count}");
+    print_telemetry_summary(&bytes, payload_count as f32);
     println!("\n--- tree (first {max_payloads} DEVC payload{}):\n",
         if max_payloads == 1 { "" } else { "s" });
     print!("{}", vibecut::gopro_metadata::format_tree(&bytes, max_payloads));
     Ok(())
+}
+
+/// What the picker can score on from this file: the accelerometer, gyro
+/// and GPS streams (with how many GPS samples have a usable fix) and the
+/// HiLight tags. `approx_secs` (one second per payload) only spaces the
+/// samples; the numbers shown don't depend on it.
+fn print_telemetry_summary(bytes: &[u8], approx_secs: f32) {
+    use vibecut::gopro_metadata as g;
+    println!("\ntelemetry used for picking:");
+    let accel = g::extract_accel(bytes);
+    if accel.magnitude.is_empty() {
+        println!("  ACCL  none");
+    } else {
+        let peak = accel.magnitude.iter().copied().fold(0.0_f32, f32::max);
+        println!("  ACCL  {} samples, peak {:.1} g", accel.magnitude.len(), peak / 9.80665);
+    }
+    match g::extract_gyro(bytes, approx_secs) {
+        Some(gyro) => {
+            let peak = gyro
+                .rad_s
+                .iter()
+                .map(|w| (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt())
+                .fold(0.0_f32, f32::max);
+            println!("  GYRO  {} samples, peak {:.0}°/s", gyro.rad_s.len(), peak.to_degrees());
+        }
+        None => println!("  GYRO  none"),
+    }
+    match g::extract_gps(bytes, approx_secs) {
+        Some(gps) => {
+            let top = gps.samples.iter().map(|s| s.speed_2d_mps).fold(0.0_f32, f32::max);
+            println!(
+                "  {}  {} samples with a usable fix, {} dropped (no lock / poor precision){}",
+                gps.kind.key(),
+                gps.samples.len(),
+                gps.dropped,
+                if gps.samples.is_empty() { String::new() } else { format!(", top {:.0} km/h", top * 3.6) },
+            );
+        }
+        None => println!("  GPS   none"),
+    }
+    let tags = g::extract_hilights_from_gpmf(bytes);
+    println!("  HiLight tags in GPMF: {}", tags.len());
 }
 
 fn init_tracing(filter: Option<&str>) {

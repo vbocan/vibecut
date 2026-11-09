@@ -347,6 +347,13 @@ pub struct Segment {
     /// `[selection].order = "energy_arc"` to rank picks for arc placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f32>,
+    /// Why the picker chose this moment: its strongest scoring signals
+    /// with the measured values in plain words ("38 km/h", "airtime
+    /// 0.6 s", "HiLight tag"), strongest first — see `moment_signals`.
+    /// Empty for moments that weren't scored (photos, forced ranges,
+    /// beat-burst cuts, filler) and in older manifests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<crate::moment_signals::PickSignal>,
 }
 
 /// Pick the longest source, place N evenly-spaced segments
@@ -427,6 +434,7 @@ pub fn snap_to_chapter(
                 virtual_start_secs: chapter_start + in_chapter_start,
                 reason: "even-spaced".into(),
                 score: None,
+                signals: Vec::new(),
             });
         }
         acc = chapter_end;
@@ -456,6 +464,18 @@ pub struct SourceTelemetry {
     pub visual_sharpness: Vec<f32>,
     pub visual_exposure: Vec<f32>,
     pub visual_motion: Vec<f32>,
+    // ---- GoPro GPS and gyro (empty when the camera recorded none) ----
+    /// Ground speed (m/s) of every GPS sample with a usable fix, paired
+    /// with `gps_time_secs`.
+    pub gps_time_secs: Vec<f32>,
+    pub gps_speed_mps: Vec<f32>,
+    /// Angular velocity (rad/s, camera axes), paired with `gyro_time_secs`.
+    pub gyro_time_secs: Vec<f32>,
+    pub gyro_rad_s: Vec<[f32; 3]>,
+    /// Hard scene cuts and big visual changes found in the frame analysis,
+    /// as `[before, after]`: the change happened between the analysed
+    /// frames at those times.
+    pub scene_cuts: Vec<[f32; 2]>,
 }
 
 /// Options for `extract_telemetry`. `with_visual = false` skips the (expensive)
@@ -521,25 +541,28 @@ pub fn extract_telemetry_with(source: &Source, opts: &ExtractOpts) -> SourceTele
         // GPMF: accelerometer + HiLight stream.
         match crate::media_probe::extract_gpmf_bytes(&ch.path) {
             Ok(Some(bytes)) => {
+                // Each stream is timed by its own STMP / TSMP stamps
+                // where it has them, else spread evenly per payload.
                 let accel = crate::gopro_metadata::extract_accel(&bytes);
-                let n_payloads = accel.payload_lens.len().max(1) as f32;
-                let secs_per_payload = if accel.payload_lens.is_empty() {
-                    1.0
-                } else {
-                    dur / n_payloads
-                };
-                let mut sample_idx = 0usize;
-                for (p, &len) in accel.payload_lens.iter().enumerate() {
-                    let payload_start = chapter_offset + (p as f32) * secs_per_payload;
-                    for j in 0..len as usize {
-                        if sample_idx >= accel.magnitude.len() {
-                            break;
-                        }
-                        let frac = if len > 0 { j as f32 / len as f32 } else { 0.0 };
-                        let t = payload_start + frac * secs_per_payload;
-                        tel.accel_time_secs.push(t);
-                        tel.accel_mag.push(accel.magnitude[sample_idx]);
-                        sample_idx += 1;
+                for (t, &m) in accel.times_secs(dur).iter().zip(&accel.magnitude) {
+                    tel.accel_time_secs.push(chapter_offset + t);
+                    tel.accel_mag.push(m);
+                }
+                if let Some(gps) = crate::gopro_metadata::extract_gps(&bytes, dur) {
+                    if gps.dropped > 0 {
+                        tracing::debug!(file = %ch.path, kept = gps.samples.len(), dropped = gps.dropped,
+                            "GPS samples without a usable fix dropped");
+                    }
+                    for s in &gps.samples {
+                        tel.gps_time_secs.push(chapter_offset + s.t_secs);
+                        tel.gps_speed_mps.push(s.speed_2d_mps);
+                    }
+                }
+                // Rotation is scored per quarter second: 25 Hz is plenty.
+                if let Some(gyro) = crate::gopro_metadata::extract_gyro(&bytes, dur).map(|g| g.decimated(25.0)) {
+                    for (t, w) in gyro.times_secs.iter().zip(&gyro.rad_s) {
+                        tel.gyro_time_secs.push(chapter_offset + t);
+                        tel.gyro_rad_s.push(*w);
                     }
                 }
 
@@ -603,6 +626,7 @@ pub fn extract_telemetry_with(source: &Source, opts: &ExtractOpts) -> SourceTele
             match visual_result {
                 Ok(vis) => {
                     tel.visual_fps_hz = vis.sample_rate_hz;
+                    let mut kept = 0usize;
                     for i in 0..vis.frame_count {
                         let t = chapter_offset + (i as f32) / vis.sample_rate_hz;
                         if t > chapter_offset + dur + 0.5 {
@@ -614,6 +638,18 @@ pub fn extract_telemetry_with(source: &Source, opts: &ExtractOpts) -> SourceTele
                         tel.visual_sharpness.push(vis.sharpness[i]);
                         tel.visual_exposure.push(vis.exposure[i]);
                         tel.visual_motion.push(vis.motion[i]);
+                        kept += 1;
+                    }
+                    // Scene cuts, in this chapter's frames only (a chapter
+                    // join is one continuous recording, never a cut).
+                    let n = kept.min(vis.motion.len()).min(vis.sharpness.len()).min(vis.exposure.len());
+                    for sc in crate::visual_analysis::detect_scene_changes(
+                        &vis.motion[..n],
+                        &vis.sharpness[..n],
+                        &vis.exposure[..n],
+                    ) {
+                        let at = |f: usize| chapter_offset + f as f32 / vis.sample_rate_hz;
+                        tel.scene_cuts.push([at(sc.frame - 1), at(sc.frame)]);
                     }
                 }
                 Err(e) => {
@@ -634,69 +670,18 @@ pub fn extract_telemetry_with(source: &Source, opts: &ExtractOpts) -> SourceTele
 
 /// Build a combined score curve for a source using the configured weights.
 /// Returns the curve sampled at `sample_rate` Hz over the source's full duration.
+///
+/// Continuous signals (accelerometer, GPS speed, gyro, visual motion) are
+/// blended over the ones this camera recorded, so a missing stream's
+/// weight is shared by the rest; HiLight tags and jump landings are added
+/// on top; then the sharpness / exposure floors zero out unusable frames.
+/// See [`crate::moment_signals::build_source_signals`].
 pub fn build_score_curve(
     tel: &SourceTelemetry,
     weights: &crate::project_config::Scoring,
     sample_rate: f32,
 ) -> crate::selection_scoring::ScoreCurve {
-    let mut combined = crate::selection_scoring::ScoreCurve::zeros(tel.total_duration_secs, sample_rate);
-
-    // HiLight contribution.
-    if weights.hilight_tags > 0.0 && !tel.hilights_secs.is_empty() {
-        let ms: Vec<u32> = tel.hilights_secs.iter().map(|t| (t * 1000.0) as u32).collect();
-        let hl =
-            crate::selection_scoring::hilight_curve(&ms, tel.total_duration_secs, sample_rate);
-        combined.add_weighted(&hl, weights.hilight_tags);
-    }
-
-    // Accelerometer contribution.
-    if weights.accel_peaks > 0.0 && !tel.accel_mag.is_empty() {
-        let times = tel.accel_time_secs.clone();
-        let acc = crate::selection_scoring::accel_curve(
-            &tel.accel_mag,
-            move |i| times.get(i).copied().unwrap_or(0.0),
-            tel.total_duration_secs,
-            sample_rate,
-        );
-        combined.add_weighted(&acc, weights.accel_peaks);
-    }
-
-    // Visual motion contribution. Same relative-spike treatment as
-    // accelerometer but on frame-difference MSD: surfaces visual action
-    // (camera motion, scene changes, fast subjects) above the baseline.
-    if weights.motion_peaks > 0.0 && !tel.visual_motion.is_empty() {
-        let mc = crate::selection_scoring::spike_curve(
-            &tel.visual_motion,
-            &tel.visual_time_secs,
-            tel.total_duration_secs,
-            sample_rate,
-            10.0, // baseline window seconds
-            0.5,  // smooth window seconds
-        );
-        combined.add_weighted(&mc, weights.motion_peaks);
-    }
-
-    // Floors: zero out moments where the source content is too blurry
-    // or too clipped. These act *after* the additive contributions so a great
-    // accel spike on a blurry frame is correctly suppressed.
-    if !tel.visual_sharpness.is_empty() {
-        crate::selection_scoring::apply_percentile_floor(
-            &mut combined,
-            &tel.visual_sharpness,
-            tel.visual_fps_hz,
-            weights.sharpness_floor,
-        );
-    }
-    if !tel.visual_exposure.is_empty() {
-        crate::selection_scoring::apply_percentile_floor(
-            &mut combined,
-            &tel.visual_exposure,
-            tel.visual_fps_hz,
-            weights.exposure_floor,
-        );
-    }
-
-    combined
+    crate::moment_signals::build_source_signals(tel, weights, sample_rate).combined
 }
 
 /// Across **all** sources, pick clip centers respecting

@@ -3,6 +3,7 @@
 	import { sourceColor } from '$lib/colors';
 	import { clock } from '$lib/vibes';
 	import { keepFocus } from '$lib/focus';
+	import { whyChips, whySentence } from '$lib/why';
 
 	const sel = $derived(
 		s.selectedSegmentIndex !== null ? (s.segmentLayout[s.selectedSegmentIndex] ?? null) : null
@@ -12,17 +13,22 @@
 	const burst = $derived(sel?.segment.source_id.startsWith('burst:') ?? false);
 	const sourceId = $derived(sel?.segment.source_id.replace(/^burst:/, '') ?? '');
 	const maxScore = $derived(Math.max(0.0001, ...(s.manifest?.segments.map((g) => g.score ?? 0) ?? [0])));
+	/** What the picker measured for this moment (manifest `signals`):
+	 *  "38 km/h", "airtime 0.6 s", "HiLight tag"... Absent in older manifests. */
+	const chips = $derived(burst ? [] : whyChips(sel?.segment.signals));
 
-	/** The picker's reason in plain words. Its reason string names the
-	 *  scoring *weights* in play ("hilight+accel"), not what actually
-	 *  fired, so this stays honest: what kind of pick it was, and how it
-	 *  ranks, without claiming a cause the manifest doesn't record. */
+	/** The picker's reason in plain words: what kind of pick it was, then
+	 *  the strongest signal the manifest records for it (speed, a jump, a
+	 *  spin, a HiLight tag), else how it ranks — never a cause the
+	 *  manifest doesn't record. */
 	function why(reason: string, score: number | null): string {
 		const r = reason.toLowerCase();
 		if (burst || r.includes('beat-burst')) return 'Part of the rapid-fire burst at the song’s energy peak.';
 		if (r.includes('image')) return 'One of your photos, gently animated.';
 		if (r.includes('range')) return 'A moment you asked to always include.';
 		if (r.includes('even')) return 'Placed to cover the whole clip evenly.';
+		const measured = whySentence(sel?.segment.signals);
+		if (measured) return measured;
 		const rel = score !== null ? score / maxScore : 0;
 		if (rel >= 0.9) return 'One of the most eventful moments in all your footage.';
 		if (rel >= 0.6) return 'A standout moment from this clip.';
@@ -75,6 +81,15 @@
 			<button class="btn ghost close" type="button" aria-label="Close moment details" onclick={close}>✕</button>
 		</div>
 		<p class="why serif">{why(sel.segment.reason, sel.segment.score)}</p>
+		{#if chips.length > 0}
+			<ul class="signals" aria-label="What the picker measured">
+				{#each chips as chip (chip.kind + chip.label)}
+					<li class="pill signal" data-kind={chip.kind} title={chip.detail}>
+						{chip.label}<span class="sr-only">, {chip.detail}</span>
+					</li>
+				{/each}
+			</ul>
+		{/if}
 		{#if sel.segment.score !== null && !burst}
 			{@const strength = Math.round(Math.min(100, ((sel.segment.score ?? 0) / maxScore) * 100))}
 			<div class="score" title="How strongly the picker rated this moment">
@@ -146,6 +161,56 @@
 		margin: 0;
 		font-size: 21px;
 		line-height: 1.3;
+	}
+
+	.signals {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin: -2px 0 0;
+		padding: 0;
+		list-style: none;
+	}
+
+	.signal {
+		--dot: var(--text-faint);
+		color: var(--text);
+		font-family: var(--mono);
+		font-weight: 500;
+	}
+
+	.signal::before {
+		content: '';
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--dot);
+		box-shadow: 0 0 8px var(--dot);
+	}
+
+	.signal[data-kind='hilight'] {
+		--dot: var(--accent);
+	}
+
+	.signal[data-kind='gps_speed'] {
+		--dot: var(--cyan);
+	}
+
+	.signal[data-kind='gyro'] {
+		--dot: var(--violet);
+	}
+
+	.signal[data-kind='landing'] {
+		--dot: var(--magenta);
+	}
+
+	.signal[data-kind='accel'] {
+		--dot: var(--warn);
+	}
+
+	.signal[data-kind='scene_start'] {
+		--dot: var(--lime);
+		color: var(--text-dim);
 	}
 
 	.score {
