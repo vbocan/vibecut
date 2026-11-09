@@ -24,6 +24,7 @@ pub mod jobs;
 pub mod logger;
 pub mod music;
 pub mod paths;
+pub mod plan;
 pub mod propose;
 pub mod reformat;
 pub mod render;

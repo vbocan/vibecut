@@ -1001,6 +1001,11 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub timeline: Option<crate::output_timeline::OutputTimeline>,
+    /// `draft` for a draft render (a fast 540p preview of the same edit,
+    /// see `project_config::Quality`); absent for a final.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub quality: Option<crate::project_config::Quality>,
     pub generator: String,
 }
 

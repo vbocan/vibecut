@@ -69,6 +69,11 @@
 		return projectName(j.config_path);
 	}
 
+	/** A finished render that was a quick draft. */
+	function isDraft(j: JobListEntry): boolean {
+		return j.kind === 'render' && j.state === 'done' && j.quality === 'draft';
+	}
+
 	function isFinished(j: JobListEntry): boolean {
 		return j.state === 'done' || j.state === 'failed' || j.state === 'cancelled';
 	}
@@ -142,6 +147,24 @@
 		<button class="btn ghost" type="button" aria-label="Close Pro settings" onclick={() => (open = false)}>✕</button>
 	</header>
 
+	<!-- How renders are made, for every project: quick drafts first. -->
+	<label class="setting">
+		<input
+			type="checkbox"
+			role="switch"
+			checked={s.fastPreviews}
+			aria-describedby="fast-previews-help"
+			onchange={(e) => s.setFastPreviews(e.currentTarget.checked)}
+		/>
+		<span class="setting-text">
+			<strong>Fast previews</strong>
+			<span id="fast-previews-help"
+				>First cuts and tweaks render a quick 540p draft in seconds. “Finish in full quality” — or Download and
+				Share — renders the final.</span
+			>
+		</span>
+	</label>
+
 	{#if s.proposeResult}
 		<p class="path mono">{s.proposeResult.config_path}</p>
 		<div class="tabs" role="tablist" aria-label="Settings view" use:radiogroup>
@@ -191,7 +214,9 @@
 				title={s.rendering ? 'Wait for the current render to finish' : undefined}
 				onclick={saveAndRender}
 			>
-				{s.rendering ? 'Rendering…' : dirty ? 'Save & re-render' : 'Re-render'}
+				{s.rendering ? 'Rendering…' : dirty ? 'Save & re-render' : 'Re-render'}{s.fastPreviews && !s.rendering
+					? ' (draft)'
+					: ''}
 			</button>
 		</footer>
 
@@ -219,7 +244,7 @@
 					{@const what = jobTitle(j)}
 					<li data-job={j.job_id}>
 						<span class="job-state {j.state}">{stateLabel(j)}{j.cancel_requested && !isFinished(j) ? ' · stopping' : ''}</span>
-						<span class="kind {j.kind}">{KIND_LABEL[j.kind] ?? j.kind}</span>
+						<span class="kind {j.kind}" class:draft={isDraft(j)}>{isDraft(j) ? 'Draft' : (KIND_LABEL[j.kind] ?? j.kind)}</span>
 						<span class="when mono">{clockTime(j.submitted_at)}{took(j)}</span>
 						<span class="what" title={j.kind === 'reformat' ? j.output_path : j.config_path}>{jobTitle(j)}</span>
 						{#if j.state === 'queued' || j.state === 'running'}
@@ -444,8 +469,74 @@
 		color: var(--text-dim);
 	}
 
-	.renders .kind.reformat {
+	.renders .kind.reformat,
+	.renders .kind.draft {
 		color: var(--cyan);
+	}
+
+	/* ---- Fast previews switch ---- */
+	.setting {
+		display: flex;
+		align-items: flex-start;
+		gap: 12px;
+		padding: 12px 14px;
+		border-radius: var(--r-md);
+		border: 1px solid var(--line);
+		background: rgba(255, 255, 255, 0.03);
+		cursor: pointer;
+	}
+
+	.setting input {
+		appearance: none;
+		-webkit-appearance: none;
+		flex: none;
+		position: relative;
+		width: 38px;
+		height: 22px;
+		margin: 1px 0 0;
+		border-radius: 999px;
+		border: 1px solid var(--line-strong);
+		background: rgba(255, 255, 255, 0.08);
+		cursor: pointer;
+		transition: background var(--dur-2) var(--ease-out);
+	}
+
+	.setting input::after {
+		content: '';
+		position: absolute;
+		top: 2px;
+		left: 2px;
+		width: 16px;
+		height: 16px;
+		border-radius: 50%;
+		background: var(--text-dim);
+		transition: transform var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out);
+	}
+
+	.setting input:checked {
+		background: var(--grad-brand);
+		border-color: transparent;
+	}
+
+	.setting input:checked::after {
+		transform: translateX(16px);
+		background: #fff;
+	}
+
+	.setting input:focus-visible {
+		outline: 2px solid var(--cyan);
+		outline-offset: 2px;
+	}
+
+	.setting-text {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
+	.setting-text span {
+		font-size: var(--fs-sm);
+		color: var(--text-dim);
 	}
 
 	.renders .what {

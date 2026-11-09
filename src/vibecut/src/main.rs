@@ -23,6 +23,7 @@
 //! # Subcommands
 //!
 //! - `run <config>` — execute the full pipeline (the main feature).
+//! - `plan <config>` — plan the edit (picks, beat lock, output timeline) as JSON.
 //! - `validate <config>` — parse + validate a TOML, no execution.
 //! - `probe <path>` — show ffprobe metadata for a file or folder.
 //! - `gpmf <file>` — dump the GPMF metadata tree of a GoPro MP4.
@@ -93,6 +94,20 @@ enum Cmd {
         /// `seed = N` in your TOML if you like the result.
         #[arg(long)]
         random_seed: bool,
+        /// `draft`: a fast 540p preview of the same edit, written to
+        /// `<stem>.draft.mp4` (first output only). `final` (default) renders
+        /// every output. Overrides `[project].quality`.
+        #[arg(long)]
+        quality: Option<String>,
+    },
+    /// Plan a config without rendering it — the picks, their beat-locked
+    /// lengths and the exact output timeline the render will produce —
+    /// and print the plan as JSON.
+    Plan {
+        config: Utf8PathBuf,
+        /// Skip per-frame visual analysis (as `run --no-visual`).
+        #[arg(long)]
+        no_visual: bool,
     },
     /// Validate a config without running anything. Equivalent to `run --dry-run`.
     Validate { config: Utf8PathBuf },
@@ -193,8 +208,33 @@ fn main() -> Result<()> {
 
     match cli.command {
         Cmd::Probe { path, json } => probe_cmd(&path, json),
-        Cmd::Run { config, dry_run, no_visual, no_cache, explain, print_effective_config, random_seed } => {
-            vibecut::run_pipeline::run_cmd(&config, dry_run, no_visual, no_cache, explain, print_effective_config, random_seed)
+        Cmd::Run { config, dry_run, no_visual, no_cache, explain, print_effective_config, random_seed, quality } => {
+            let quality = match quality.as_deref() {
+                None => None,
+                Some(q) => Some(
+                    vibecut::project_config::Quality::parse(q)
+                        .with_context(|| format!("--quality must be draft or final, got {q:?}"))?,
+                ),
+            };
+            let opts = vibecut::run_pipeline::RunOptions {
+                dry_run,
+                no_visual,
+                no_cache,
+                explain,
+                print_effective_config,
+                random_seed,
+                quality,
+                on_plan: None,
+            };
+            vibecut::run_pipeline::run_with(&config, opts).map(|_| ())
+        }
+        Cmd::Plan { config, no_visual } => {
+            // The plan's own log goes to stdout too: the JSON comes last,
+            // after a marker line, so a script can split it off.
+            let plan = vibecut::run_pipeline::plan_cmd(&config, no_visual, false)?;
+            println!("--- plan ---");
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+            Ok(())
         }
         Cmd::Validate { config } => vibecut::run_pipeline::run_cmd(&config, true, false, false, false, false, false),
         Cmd::Gpmf { file, max_payloads, save_raw } => gpmf_cmd(&file, max_payloads, save_raw.as_deref()),

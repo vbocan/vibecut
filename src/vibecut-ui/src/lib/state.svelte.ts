@@ -10,6 +10,7 @@ import type { Segment } from './types/generated/Segment';
 import type { Config } from './types/generated/Config';
 import { captionMusicLines, labelsFollowProject, projectSongPath, trackForPath } from './music';
 import { decideChange } from './changes';
+import { matchFrames, thumbRequests } from './storyboard';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
 
@@ -58,6 +59,12 @@ export interface RenderHistoryEntry {
 	song: string | null;
 	duration_secs: number | null;
 	beats_locked: string | null;
+	/** `draft`: a fast 540p preview; `final`: full quality (older saves
+	 *  have none: they were all final). */
+	quality?: api.RenderQuality;
+	/** The config this version was rendered from, so finishing an earlier
+	 *  draft renders that draft's edit. */
+	config_toml?: string;
 }
 
 /** What survives a page reload (localStorage). */
@@ -76,12 +83,25 @@ interface Persisted {
 }
 
 const STORAGE_KEY = 'vibecut.session.v1';
+/** Pro settings → Fast previews (on unless switched off). */
+const FAST_PREVIEWS_KEY = 'vibecut.fastPreviews';
+
+function readFastPreviews(): boolean {
+	try {
+		return localStorage.getItem(FAST_PREVIEWS_KEY) !== 'off';
+	} catch {
+		return true;
+	}
+}
 
 /** Where the one-tap flow is. */
 export type MakeStep = 'idle' | 'scanning' | 'planning' | 'scoring' | 'rendering' | 'done' | 'failed';
 
 /** Which control shows a pending "Stop and apply this instead" offer. */
 export type PendingFrom = 'tweaks' | 'command' | 'song';
+
+/** What to do with a final once "Finish in full quality" made it. */
+export type DeliverWhat = 'download' | 'share';
 
 class AppState {
 	// ---------- Server ----------
@@ -823,12 +843,21 @@ class AppState {
 		this.renderResult = null;
 		this.renderError = null;
 		this.frames = [];
+		this.clearPlan();
 	}
 
-	async startRenderAsync() {
+	/** Render the project. `quality` defaults to a draft while Fast
+	 *  previews is on (first cuts and tweaks), else final; `finishing` is
+	 *  the version a final render finishes (see `finishFullQuality`). */
+	async startRenderAsync(
+		opts: { quality?: api.RenderQuality; finishing?: { index: number; then: DeliverWhat | null } } = {}
+	) {
 		// One render at a time: a second one would share the workspace and
 		// the output file with the first.
 		if (!this.proposeResult || this.rendering) return;
+		const quality: api.RenderQuality = opts.quality ?? (this.fastPreviews ? 'draft' : 'final');
+		this.renderQuality = quality;
+		this.finishing = opts.finishing ?? null;
 		// Not a change's render until `withUndo` says so (set synchronously,
 		// before the first await, so `withUndo` marks it right after).
 		this.renderUndo = null;
@@ -853,11 +882,18 @@ class AppState {
 		this.renderProgress = null;
 		this.renderStartedAt = Date.now();
 		this.makeStep = 'rendering';
+		// The settings this render is made from (kept with its version).
+		this.renderingConfigToml = this.configToml;
+		this.clearPlan();
+		const configPath = this.proposeResult.config_path;
 		this.jobIdReady = api
-			.renderAsync(this.proposeResult.config_path)
+			.renderAsync(configPath, quality)
 			.then((r) => {
 				this.jobId = r.job_id;
 				this.openProgressSocket(r.job_id);
+				// The render publishes its plan as soon as it has one; this
+				// waits for it (no second planning) and shows the storyboard.
+				void this.loadPlan(configPath);
 				return r.job_id;
 			})
 			.catch((e) => {
@@ -942,6 +978,8 @@ class AppState {
 		this.jobId = null;
 		this.renderProgress = null;
 		this.renderMode = 'idle';
+		this.finishing = null;
+		this.clearPlan();
 		this.stopBed();
 		this.autoplayReveal = false;
 		const u = this.undo;
@@ -1091,11 +1129,23 @@ class AppState {
 			this.renderResult = data;
 			this.makeStep = 'done';
 			this.stopBed();
-			this.recordRenderHistory(data);
+			const f = this.finishing;
+			this.finishing = null;
+			if (f && (data.quality ?? 'final') === 'final' && f.index >= 0 && f.index < this.renderHistory.length) {
+				// The draft on screen, finished: same version, now full quality.
+				this.finishVersion(f.index, data);
+			} else {
+				this.recordRenderHistory(data);
+			}
+			if (f?.then) {
+				this.deliver = { what: f.then, id: Date.now() };
+				this.showNotice(f.then === 'download' ? 'Full quality ready — downloading' : 'Full quality ready to share');
+			}
 			void this.loadFrames();
 			void this.loadManifest();
 			this.persist();
 		} else if (data.state === 'failed') {
+			this.finishing = null;
 			this.makeStep = 'failed';
 			this.stopBed();
 			this.autoplayReveal = false;
@@ -1390,11 +1440,32 @@ class AppState {
 			song: this.effectiveTrack?.title ?? null,
 			duration_secs: r.manifest_summary?.actual_duration_secs ?? null,
 			beats_locked:
-				beat && beat.n_cuts ? `${beat.within_tolerance ?? 0}/${beat.n_cuts} on the beat` : null
+				beat && beat.n_cuts ? `${beat.within_tolerance ?? 0}/${beat.n_cuts} on the beat` : null,
+			quality: r.quality ?? this.renderQuality,
+			config_toml: this.renderingConfigToml ?? this.configToml
 		};
 		this.renderHistory = [...this.renderHistory, entry];
 		this.compareB = this.renderHistory.length - 1;
 		this.compareA = this.renderHistory.length >= 2 ? this.renderHistory.length - 2 : null;
+	}
+
+	/** Version `i` (a draft) now has its full-quality render `r`: same
+	 *  label and edit, the final's file. */
+	private finishVersion(i: number, r: api.RenderResult) {
+		const outputPath = r.version_path ?? r.output_path;
+		if (!outputPath) return;
+		const v = this.renderHistory[i];
+		const beat = r.manifest_summary?.beat_sync;
+		const finished: RenderHistoryEntry = {
+			...v,
+			output_path: outputPath,
+			manifest_path: r.version_manifest_path ?? r.manifest_path ?? null,
+			ts: Date.now(),
+			duration_secs: r.manifest_summary?.actual_duration_secs ?? v.duration_secs,
+			beats_locked: beat && beat.n_cuts ? `${beat.within_tolerance ?? 0}/${beat.n_cuts} on the beat` : v.beats_locked,
+			quality: 'final'
+		};
+		this.renderHistory = this.renderHistory.map((x, k) => (k === i ? finished : x));
 	}
 
 	/** Show an earlier version in the player. */
@@ -1424,6 +1495,99 @@ class AppState {
 		this.selectedSegmentIndex = null;
 		this.videoDuration = null;
 		await Promise.all([this.loadManifest(), this.loadFrames()]);
+	}
+
+	// ---------- Drafts: see the edit fast, finish in full quality ----------
+	/** First cuts and tweaks render a quick 540p draft (Pro settings →
+	 *  Fast previews); "Finish in full quality" — or Download / Share on a
+	 *  draft — renders the final. Remembered per browser. */
+	fastPreviews = $state(readFastPreviews());
+
+	setFastPreviews(on: boolean) {
+		this.fastPreviews = on;
+		try {
+			localStorage.setItem(FAST_PREVIEWS_KEY, on ? 'on' : 'off');
+		} catch {
+			/* not remembered */
+		}
+	}
+
+	/** Quality of the render in flight (or the last one started). */
+	renderQuality = $state<api.RenderQuality>('final');
+	/** The config text the render in flight was started from. */
+	private renderingConfigToml: string | null = null;
+
+	/** Quality of the version on screen. */
+	shownQuality = $derived.by((): api.RenderQuality => {
+		const v = this.renderHistory.find((h) => h.output_path === this.outputPath);
+		return v?.quality ?? this.renderResult?.quality ?? 'final';
+	});
+
+	/** The draft being finished in full quality (its version index), and
+	 *  what to do with the final once it's ready. */
+	finishing = $state<{ index: number; then: DeliverWhat | null } | null>(null);
+	/** A finished final to hand over: the Studio downloads it or opens the
+	 *  share sheet, then clears this. */
+	deliver = $state<{ what: DeliverWhat; id: number } | null>(null);
+
+	/** Render the version on screen (a draft) in full quality: the same
+	 *  edit, every output, at the project's own settings. `then`: download
+	 *  it or open the share sheet once it's done. An earlier draft's
+	 *  settings are put back first, so the final is the draft on screen. */
+	async finishFullQuality(then: DeliverWhat | null = null) {
+		const p = this.proposeResult;
+		if (!p || this.rendering || this.stopping) return;
+		const index = this.renderHistory.findIndex((v) => v.output_path === this.outputPath);
+		const v = this.renderHistory[index];
+		if (v?.config_toml && v.config_toml !== this.configToml) {
+			try {
+				const r = await api.writeConfig(p.config_path, v.config_toml);
+				this.configToml = r.config_toml;
+				this.configDirty = false;
+				this.proposeResult = { ...p, config_toml: r.config_toml };
+				this.lastChanges = [];
+				await this.loadStructuredConfig();
+			} catch (e) {
+				this.configError = e instanceof api.ApiError ? e.describe() : String(e);
+				return;
+			}
+		}
+		await this.startRenderAsync({ quality: 'final', finishing: { index, then } });
+	}
+
+	// ---------- Storyboard: the edit before the encode ----------
+	/** The plan of the render in flight (POST /api/plan): its clips on the
+	 *  beat grid, shown while they are encoded. */
+	plan = $state<api.EditPlan | null>(null);
+	/** Timeline clip index → frame (data URI). */
+	planThumbs = $state<Record<number, string>>({});
+	private planSeq = 0;
+
+	private clearPlan() {
+		this.planSeq++;
+		this.plan = null;
+		this.planThumbs = {};
+	}
+
+	private async loadPlan(configPath: string) {
+		const seq = this.planSeq;
+		try {
+			const plan = await api.planEdit(configPath);
+			// A render that finished (or was replaced) meanwhile: too late.
+			if (seq !== this.planSeq || !this.rendering) return;
+			this.plan = plan;
+			await runLimited(thumbRequests(plan), 3, async (req) => {
+				try {
+					const r = await api.inspectAt(req.source, req.times);
+					if (seq !== this.planSeq) return;
+					this.planThumbs = { ...this.planThumbs, ...matchFrames(req, r.frames_inline) };
+				} catch {
+					/* a missing frame is cosmetic */
+				}
+			});
+		} catch {
+			/* no storyboard: the progress view stands on its own */
+		}
 	}
 
 	// ---------- Persistence ----------

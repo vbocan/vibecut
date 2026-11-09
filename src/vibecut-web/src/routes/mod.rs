@@ -9,6 +9,7 @@ pub mod frames;
 pub mod jobs;
 pub mod music;
 pub mod output;
+pub mod plan;
 pub mod propose;
 pub mod reformat;
 pub mod render;
@@ -41,6 +42,7 @@ pub fn api_router() -> Router<AppState> {
         )
         .route("/feedback", post(feedback::apply_feedback))
         .route("/brief", post(brief::submit_brief))
+        .route("/plan", post(plan::plan))
         .route("/render", post(render::render_sync))
         .route("/render/async", post(render::render_async))
         .route("/render/{job_id}", get(render::render_status))

@@ -134,10 +134,58 @@ pub struct Project {
     #[serde(default = "default_models_dir")]
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub models_dir: Utf8PathBuf,
+    /// `"final"` (default) or `"draft"`: a fast 540p preview of the same
+    /// edit, written next to the first output as `<stem>.draft.mp4` (see
+    /// [`Quality`]). A render request (`--quality`, the web/MCP `quality`
+    /// field) overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub quality: Option<Quality>,
 }
 
 fn default_models_dir() -> Utf8PathBuf {
     Utf8PathBuf::from("models")
+}
+
+/// How finished a render is. Both cut the same edit (the plan doesn't
+/// depend on it); a draft trades picture quality for speed: 540p, the
+/// encoder's fastest preset, a higher CRF, no stabilization, the first
+/// output only, written to its own `<stem>.draft.mp4` with its own
+/// manifest so it never replaces the final.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, rename_all = "snake_case"))]
+pub enum Quality {
+    Draft,
+    #[default]
+    Final,
+}
+
+impl Quality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Quality::Draft => "draft",
+            Quality::Final => "final",
+        }
+    }
+
+    /// `"draft"` / `"final"` (any case, surrounding blanks ignored).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "draft" => Some(Quality::Draft),
+            "final" => Some(Quality::Final),
+            _ => None,
+        }
+    }
+}
+
+impl Config {
+    /// The quality a render runs at: `requested` (a CLI flag or a request
+    /// field) wins over `[project].quality`, which defaults to final.
+    pub fn render_quality(&self, requested: Option<Quality>) -> Quality {
+        requested.or(self.project.quality).unwrap_or_default()
+    }
 }
 
 /// One target output file. The body is rendered once in the master shape
@@ -1416,5 +1464,33 @@ stabilize = false
             .unwrap_err()
             .to_string();
         assert!(e.contains("zoom"), "{e}");
+    }
+
+    #[test]
+    fn quality_is_final_unless_asked_for_a_draft() {
+        let plain = with_outputs("[[outputs]]\npath = \"a.mp4\"\nresolution = \"1920x1080\"\n").unwrap();
+        assert_eq!(plain.project.quality, None);
+        assert_eq!(plain.render_quality(None), Quality::Final);
+        assert_eq!(plain.render_quality(Some(Quality::Draft)), Quality::Draft);
+        // A config left without the key serialises exactly as before.
+        assert!(!toml::to_string(&plain).unwrap().contains("quality"));
+
+        let with_quality = |q: &str| {
+            toml::from_str::<Config>(&format!(
+                "schema_version = 1\n[project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\nquality = \"{q}\"\n\
+                 [input]\nfolder = \".\"\n[[outputs]]\npath = \"a.mp4\"\nresolution = \"1920x1080\"\n"
+            ))
+        };
+        let draft = with_quality("draft").unwrap();
+        assert_eq!(draft.render_quality(None), Quality::Draft);
+        // The request wins over the file.
+        assert_eq!(draft.render_quality(Some(Quality::Final)), Quality::Final);
+        assert!(toml::to_string(&draft).unwrap().contains("quality = \"draft\""));
+        assert!(with_quality("best").is_err());
+
+        assert_eq!(Quality::parse(" Draft "), Some(Quality::Draft));
+        assert_eq!(Quality::parse("final"), Some(Quality::Final));
+        assert_eq!(Quality::parse("preview"), None);
+        assert_eq!(Quality::Draft.as_str(), "draft");
     }
 }

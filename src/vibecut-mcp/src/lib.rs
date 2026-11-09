@@ -100,6 +100,18 @@ pub struct RenderArgs {
     /// `config_path` returned by `propose_vibe`. Absolute or relative to
     /// `/projects`.
     pub config_path: String,
+    /// `draft`: a fast 540p preview of the same edit, written beside the
+    /// final as `<stem>.draft.mp4` (seconds rather than minutes). `final`
+    /// (default) renders every output in full quality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PlanArgs {
+    /// Path to a TOML config file inside the container (absolute, or
+    /// relative to `/projects`).
+    pub config_path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -445,6 +457,22 @@ impl VibecutMcpServer {
         }
     }
 
+    /// Plan a config without rendering it: the edit the render will make,
+    /// in seconds — every clip's source window and place in the output,
+    /// the beats, the length. Lets the user see (and change) the cut before
+    /// waiting for an encode.
+    #[tool(description = "Plan the edit of a TOML config without rendering it (seconds on footage analysed before): the exact output timeline (each clip's source file, source in/out, output start/end, crossfades, speed ramps), the song's beats as they will play, the total duration, and a source time per clip for `inspect_at` thumbnails. While a render of the same config runs, returns that render's own plan.")]
+    async fn plan_edit(&self, Parameters(args): Parameters<PlanArgs>) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result = match vibecut_ops::plan::plan(&args.config_path).await {
+            Ok(body) => Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())),
+            Err(e) => ops_error_to_string_result(e),
+        };
+        self.log_string_call("plan_edit", args_json, &result, started);
+        result
+    }
+
     /// Submit a render job and return its `job_id` immediately.
     /// The render runs in the background; poll progress with
     /// `render_status(job_id)`.
@@ -461,7 +489,11 @@ impl VibecutMcpServer {
     }
 
     async fn render_async_impl(&self, args: RenderArgs) -> Result<String, ErrorData> {
-        match render::submit_async(&self.jobs, &args.config_path).await {
+        let req = match render::RenderRequest::from_quality_field(args.quality.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return ops_error_to_string_result(e),
+        };
+        match render::submit_async_with(&self.jobs, &args.config_path, req).await {
             Ok(job_id) => Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "job_id": job_id,
                 "state": "queued",
@@ -542,7 +574,11 @@ impl VibecutMcpServer {
     }
 
     async fn render_impl(&self, args: RenderArgs) -> Result<String, ErrorData> {
-        match render::render_sync(&args.config_path).await {
+        let req = match render::RenderRequest::from_quality_field(args.quality.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return ops_error_to_string_result(e),
+        };
+        match render::render_sync_with(&args.config_path, req).await {
             Ok(body) => Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())),
             Err(e) => ops_error_to_string_result(e),
         }

@@ -62,6 +62,7 @@ fade_in         = "500ms"            # video fade-in from black at start (defaul
 fade_out        = "500ms"            # video fade-out to black at end (default: 500ms; 0 = none)
 temp_dir        = "out/.cache_summer"  # optional; default: <first output's parent>/.vibecut_<name>
 models_dir      = "models"             # optional; where ONNX model files live (default: "models")
+quality         = "final"              # optional; "draft" = a fast 540p preview (default: "final")
 ```
 
 `models_dir` points at a folder that may contain `silero_vad.onnx` (and
@@ -72,6 +73,56 @@ working directory. A model missing there is looked up next in each folder
 of `$VIBECUT_MODELS_DIR` (separated like `PATH`), then in `/app/models`,
 where the Docker image ships `silero_vad.onnx`; the render log says which
 copy it loaded.
+
+### Drafts and the plan (`quality`)
+
+Every render is two phases. The **plan** probes the footage, analyses the
+music and the footage (from the cache when it was analysed before), picks
+the moments, places the beat-burst and the speed ramps, beat-locks every
+cut and lays out the exact output timeline. The **render** then encodes
+that plan: cards, clips, the concat, the soundtrack mux and ducking, the
+outputs, the beat-sync check and the manifest. The plan doesn't depend on
+the quality, so a draft and a final of the same config are the same edit,
+cut for cut.
+
+`quality = "draft"` renders that edit as a quick preview:
+
+- the **first output only**, scaled so its short side is at most 540 px
+  (960x540 for a 16:9 master, 540x960 for a vertical `reels` output, a
+  smaller project keeps its size);
+- written **beside the final** as `<stem>.draft.mp4` with its own
+  `<stem>.draft.manifest.json` (`"quality": "draft"`, the draft's
+  `resolution`), so it never replaces the final's video or manifest;
+- every encode at the encoder's fastest preset (`superfast` for x264/x265,
+  `p1` NVENC, `speed` AMF, `veryfast` QSV) and CRF 28, without
+  stabilization; card titles and logos are scaled with the frame.
+
+The default, `"final"`, renders every output as configured; a final's
+manifest carries no `quality` key. A request overrides the key: `vibecut
+run --quality draft|final`, the web `POST /api/render` and `POST
+/api/render/async` body field `"quality": "draft" | "final"` (anything
+else is a 400), and the MCP `render` / `render_async` argument `quality`.
+The result of a web or MCP render says which it was (`"quality"`) and
+names the draft's files as its `output_path` / `manifest_path`; its kept
+copy is `versions/<stem>.draft__<tag>.mp4`. On the demo project (30 s,
+20 clips, software x264) a draft takes about 10 s against about 22 s for
+the final, and a second draft with every clip cached about 9 s.
+
+**The plan on its own** — `vibecut plan <config>` (prints it as JSON after
+a `--- plan ---` line), `POST /api/plan {"config_path": "…"}`, the MCP
+`plan_edit` tool — takes seconds on analysed footage and returns:
+`duration_secs`, `target_duration_secs`, `fps`, `seed`, the `song` (path,
+`tempo_bpm`, `beat_interval_secs`) and its `soundtrack` credits, `beats`
+(seconds, as they will play under the video, loop copies included),
+`segments` and `timeline` in exactly the manifest's shape (the render
+writes the same timeline), and one `thumbnails` entry per timeline clip
+(`source_path`, `t_secs` in the source, `output_secs`) for `GET
+/api/frames/at`. The web answer adds `config_path`, `elapsed_ms` and
+`planned_by`: while a render of the same config text runs (or ran in the
+last ten minutes), the request waits for that render's own plan rather
+than planning the footage a second time (`"render"`); otherwise it plans
+it (`"plan"`). The web UI shows this plan as a storyboard — the shots on
+the beat grid, with thumbnails — while the render runs.
 
 ---
 
@@ -914,12 +965,20 @@ or building tooling on top of it:
   transitions, and the same beat-burst placement. Pass `--random-seed`
   on the CLI to override the seed with a fresh one per render (the chosen
   seed is logged so you can lock it in later).
-- **Cache fingerprinting.** Each rendered segment's filename includes a
-  blake3 hash of `(source_path, in-chapter start, duration, width,
-  height, fps, crf, lut, stabilize, speed-ramp params)`, plus the colour
-  conversion for HDR / BT.2020 clips only (SDR clips keep their old
-  hashes). Toggling any of these forces re-encode of the affected
-  segments only. Visual analysis
+- **Cache fingerprinting.** Each rendered segment is cached in the
+  workspace as `seg_<hash>.mp4`, the hash a blake3 of `(source_path,
+  in-chapter start, duration, width, height, fps, crf, lut, stabilize,
+  speed-ramp params)`, plus the colour conversion for HDR / BT.2020 clips,
+  a draft's fast preset and an image's effect seed — each only where it
+  applies. The name holds no position: after a tweak, a moment that is
+  still in the edit (with the same window, length and ramp) reuses its
+  clip wherever it now plays, and only new or changed clips are encoded.
+  On the demo project, "Shorter" (30 s → 22.5 s) re-picks the cut and
+  re-encodes 10 of its 18 clips; the other 8 come from the cache (a
+  position-keyed name would have reused none). Drafts and finals never
+  share or replace each other's clips (different size, CRF and preset),
+  and nothing is evicted. A clip with an overlay title burnt in is
+  `seg_<hash>_titled.mp4` and is encoded every time. Visual analysis
   results live in `<output_parent>/.vibecut-cache/` keyed by source
   hash + ffprobe metadata — that 22-min cold-start cost only happens once
   per source file.

@@ -236,6 +236,54 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("not found"));
     }
 
+    async fn post_json(app: Router, uri: &str, body: serde_json::Value) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn plan_of_a_missing_config_is_404() {
+        let app = router(AppState::default());
+        let res = post_json(app, "/api/plan", serde_json::json!({ "config_path": "/nonexistent/vibecut/p.toml" })).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = body_json(res).await;
+        assert!(body["error"].as_str().unwrap().contains("not found"), "{body}");
+    }
+
+    /// `quality` is `draft` or `final`: anything else is refused before a
+    /// job is made, rather than rendering something else.
+    #[tokio::test]
+    async fn render_quality_must_be_draft_or_final() {
+        let state = AppState::default();
+        let app = router(state.clone());
+        let res = post_json(
+            app.clone(),
+            "/api/render/async",
+            serde_json::json!({ "config_path": "/nonexistent/vibecut/p.toml", "quality": "best" }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(res).await;
+        assert!(body["error"].as_str().unwrap().contains("draft"), "{body}");
+        assert!(state.jobs.list().await.is_empty(), "no job for a refused request");
+        // A valid quality goes on to the usual checks (here: no such config).
+        let res = post_json(
+            app,
+            "/api/render/async",
+            serde_json::json!({ "config_path": "/nonexistent/vibecut/p.toml", "quality": "draft" }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn render_status_unknown_job_is_404() {
         let app = router(AppState::default());

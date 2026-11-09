@@ -6,6 +6,8 @@
 import type { FeedbackAction } from './types/generated/FeedbackAction';
 import type { ChangeNote } from './types/generated/ChangeNote';
 import type { Config } from './types/generated/Config';
+import type { OutputTimeline } from './types/generated/OutputTimeline';
+import type { Segment } from './types/generated/Segment';
 
 const BASE = '/api';
 
@@ -235,14 +237,58 @@ export interface RenderResult {
 	 *  `output_path`, never these. */
 	version_path?: string;
 	version_manifest_path?: string;
+	/** `draft`: a fast 540p preview (`<stem>.draft.mp4`) of the same edit;
+	 *  `final`: the full render. Absent from servers before drafts. */
+	quality?: RenderQuality;
 }
 
-export function renderSync(configPath: string): Promise<RenderResult> {
-	return sendJson('/render', { config_path: configPath });
+/** How finished a render is (see `[project].quality` in CONFIG.md). */
+export type RenderQuality = 'draft' | 'final';
+
+export function renderSync(configPath: string, quality?: RenderQuality): Promise<RenderResult> {
+	return sendJson('/render', { config_path: configPath, ...(quality ? { quality } : {}) });
 }
 
-export function renderAsync(configPath: string): Promise<{ job_id: string; state: string }> {
-	return sendJson('/render/async', { config_path: configPath });
+export function renderAsync(
+	configPath: string,
+	quality?: RenderQuality
+): Promise<{ job_id: string; state: string; quality?: RenderQuality | null }> {
+	return sendJson('/render/async', { config_path: configPath, ...(quality ? { quality } : {}) });
+}
+
+// ---------- plan (the edit before the encode) ----------
+
+/** One frame to show for a timeline clip: grab `source_path` at `t_secs`. */
+export interface PlanThumbnail {
+	clip_index: number;
+	segment_index: number;
+	source_path: string;
+	t_secs: number;
+	output_secs: number;
+}
+
+/** `POST /api/plan`: the edit a render of the config makes, before any of
+ *  it is encoded. `segments` and `timeline` have the manifest's shape. */
+export interface EditPlan {
+	config_path: string;
+	/** `render`: the plan of the render of this config that is running. */
+	planned_by: 'render' | 'plan';
+	elapsed_ms: number;
+	project_name: string;
+	fps: number;
+	seed: number | null;
+	target_duration_secs: number;
+	duration_secs: number;
+	song?: { path: string; tempo_bpm: number; beat_interval_secs: number; duration_secs: number } | null;
+	/** Beats as they will play in the video (seconds). */
+	beats: number[];
+	segments: Segment[];
+	timeline: OutputTimeline;
+	thumbnails: PlanThumbnail[];
+}
+
+export function planEdit(configPath: string): Promise<EditPlan> {
+	return sendJson('/plan', { config_path: configPath });
 }
 
 /** Latest pipeline stage report for a running render (see
@@ -284,6 +330,8 @@ export type JobKind = 'render' | 'reformat';
 interface JobListCommon {
 	/** The project config a render renders; empty for reformats. */
 	config_path: string;
+	/** A finished render's quality (`draft` / `final`). */
+	quality?: RenderQuality;
 	submitted_at: string;
 	/** A Stop is on its way (a running job turns `cancelled` within about a second). */
 	cancel_requested: boolean;
