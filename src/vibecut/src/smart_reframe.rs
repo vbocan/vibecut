@@ -950,6 +950,9 @@ fn ms_floor(t: f64) -> String {
 /// starts its own clock at 0). A sum of gated linear terms:
 /// `lt(t,T1)*(P0+S*(t-T0))+gte(t,T1)*lt(t,T2)*P1+…`; the first term has no
 /// lower gate and the last no upper one, so every frame gets exactly one.
+/// More than [`EXPR_GROUP`] terms are summed in parenthesised groups of
+/// that many: ffmpeg's expression parser refuses a flat sum of about 97
+/// terms or more ("Failed to configure input pad" on the crop).
 pub fn offset_expr(path: &CameraPath, from: f64, to: Option<f64>) -> String {
     let to = to.unwrap_or(f64::INFINITY);
     let w = path.window;
@@ -977,7 +980,7 @@ pub fn offset_expr(path: &CameraPath, from: f64, to: Option<f64>) -> String {
         return format!("{:.4}", path.offset_at(from));
     }
     let n = terms.len();
-    terms
+    let terms: Vec<String> = terms
         .iter()
         .enumerate()
         .map(|(k, &(a, b, p, s))| {
@@ -995,9 +998,16 @@ pub fn offset_expr(path: &CameraPath, from: f64, to: Option<f64>) -> String {
             }
             format!("{gate}{body}")
         })
-        .collect::<Vec<_>>()
-        .join("+")
+        .collect();
+    if terms.len() <= EXPR_GROUP {
+        return terms.join("+");
+    }
+    terms.chunks(EXPR_GROUP).map(|c| format!("({})", c.join("+"))).collect::<Vec<_>>().join("+")
 }
+
+/// Most terms [`offset_expr`] sums flat (and most groups it sums at the
+/// top): well under the ~97 ffmpeg's expression parser takes.
+const EXPR_GROUP: usize = 32;
 
 // ---------- decoding ----------
 
@@ -1458,6 +1468,11 @@ mod tests {
         }
         terms.push(&e[start..]);
         for term in terms {
+            // A group of terms (more than EXPR_GROUP of them): its sum.
+            if let Some(inner) = term.strip_prefix('(').filter(|r| r.starts_with("gte(") || r.starts_with("lt(")) {
+                sum += eval_expr(inner.strip_suffix(')').unwrap(), t);
+                continue;
+            }
             let mut rest = term;
             let mut gate = 1.0;
             loop {
@@ -1528,6 +1543,23 @@ mod tests {
         assert_eq!(path.pieces.first().map(|p| p.t0), Some(0.0));
         assert_eq!(path.pieces.last().map(|p| p.t1), Some(secs));
         assert!(path.pieces.windows(2).all(|p| (p[0].t1 - p[1].t0).abs() < 1e-9));
+        // The grouped sum still traces the path...
+        for t in [0.0, 1.3, 299.9, 600.2, 1199.0] {
+            assert!((eval_expr(&e, t) - path.offset_at(t)).abs() < 2e-3, "t={t}");
+        }
+        // ...and ffmpeg's expression parser takes it: a flat sum of ~97
+        // terms or more fails the crop ("Failed to configure input pad").
+        assert!(path.pieces.len() > 100, "make the path long enough to matter ({})", path.pieces.len());
+        if ffmpeg_available() {
+            let out = Command::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i", "nullsrc=s=256x8:r=10:d=0.2"])
+                .args(["-vf"])
+                .arg(format!("crop=64:8:'(in_w-out_w)*({e})':0"))
+                .args(["-f", "null", "-"])
+                .output()
+                .expect("ffmpeg");
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
         // A long, smoothly followed video coarsens instead of flattening.
         let t = targets(600.0, |t| Some(0.5 + 0.3 * (t / 1.7).sin()));
         let path = plan(&t, &[], 600.0, w);

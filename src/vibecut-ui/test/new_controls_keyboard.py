@@ -163,6 +163,9 @@ def main() -> int:
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         ctx = browser.new_context(viewport={"width": 1400, "height": 1000}, reduced_motion="reduce")
+        # Full-quality renders: Fast previews (on by default) makes drafts,
+        # and Share on a draft finishes it first (draft_journey.py covers that).
+        ctx.add_init_script("try { localStorage.setItem('vibecut.fastPreviews', 'off') } catch {}")
         page = ctx.new_page()
         page.on("pageerror", lambda e: FAILS.append(f"page error: {e}"))
 
@@ -270,7 +273,8 @@ def main() -> int:
         toggle.click()
 
         print("Share: the platform row")
-        page.get_by_role("button", name="Share").click()
+        # "Share" alone also matches "Share this style".
+        page.get_by_role("button", name="Share", exact=True).click()
         page.wait_for_selector("dialog.sheet[open]")
         n_reformats = len([j for j in jobs() if j["kind"] == "reformat"])
         radios = page.locator("dialog.sheet .platforms [role=radio]")
