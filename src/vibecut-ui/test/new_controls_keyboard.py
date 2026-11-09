@@ -241,7 +241,8 @@ def main() -> int:
         check(all(j.get("kind") in ("render", "reformat") for j in jobs()), "GET /api/jobs gives every job a kind")
 
         print("Music: song radios are described by their licence note")
-        page.locator(".rail .disclosure").click()
+        # The rail has two disclosures now (the song, and Share this style).
+        page.locator(".rail .disclosure", has_text="Song").click()
         page.wait_for_selector(".rail .list [role=radio]")
         described = page.evaluate(
             """[...document.querySelectorAll('.rail .list .pick[role=radio]')].map((b) => {
