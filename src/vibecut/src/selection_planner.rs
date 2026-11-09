@@ -46,8 +46,10 @@ pub struct Source {
     /// Recording id. For GoPro: the 4-digit recording number (`0042` for
     /// `GX010042.MP4` or `GOPR0042.MP4`). For standalone clips: the file
     /// stem. When two sources would share an id (two cameras both at
-    /// recording 0042, or two folders), the first chapter's file stem is
-    /// used instead, then `<folder>/<stem>`.
+    /// recording 0042, or two cards), both get a lowercase id made from the
+    /// first chapter's file stem (`gopr0042`, `gx010042`), prefixed with
+    /// the first folder that tells them apart if needed (`carda-gx010042`),
+    /// numbered as a last resort (`gx010042-2`).
     pub id: String,
     pub chapters: Vec<Chapter>,
     pub total_duration_secs: f64,
@@ -177,11 +179,22 @@ pub fn group_into_sources(files: &[ProbedFile]) -> Vec<Source> {
 /// Give every source a distinct id. Ids are what `[selection]
 /// source_weights`, `[multi_angle]` groups and the manifest refer to, so a
 /// clash (recording 0042 on two cameras or two cards) must not silently
-/// alias two takes. Unclashed ids are left alone; clashing ones become the
-/// first chapter's file stem (`GX010042`, `GOPR0042`), then
-/// `<folder>/<stem>`, then get a numeric suffix.
+/// alias two takes. Ids that don't clash are left alone. Ids that clash
+/// (compared ignoring letter case) are replaced by an [`id_slug`], built
+/// in up to three steps until they are unique:
+///
+/// 1. the first chapter's file stem: `gopr0042`, `gx010042`;
+/// 2. prefixed with the first folder that differs between the clashing
+///    sources: `carda-gx010042` / `cardb-gx010042` for two cards copied with
+///    the same `DCIM/100GOPRO` layout, `day2-gx010042` for a subfolder;
+/// 3. a numeric suffix in path order (`gx010042`, `gx010042-2`) when even
+///    the folders don't tell them apart.
+///
+/// Generated ids only use `a-z`, `0-9`, `_` and `-`, so they are typed
+/// back as they read: the UI's "more of / less of clip …" grammar
+/// (`tellit.ts`) lowercases its input and only captures those characters.
 fn make_ids_unique(sources: &mut [Source]) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn first_stem(s: &Source) -> String {
         s.chapters
@@ -190,50 +203,97 @@ fn make_ids_unique(sources: &mut [Source]) {
             .map(str::to_string)
             .unwrap_or_else(|| s.id.clone())
     }
-    fn folder_stem(s: &Source) -> String {
-        let folder = s
-            .chapters
+    fn folder_parts(s: &Source) -> Vec<&str> {
+        s.chapters
             .first()
             .and_then(|c| c.path.parent())
-            .and_then(|p| p.file_name())
-            .unwrap_or("");
-        if folder.is_empty() {
-            first_stem(s)
-        } else {
-            format!("{folder}/{}", first_stem(s))
-        }
+            .map(|p| p.components().map(|c| c.as_str()).collect())
+            .unwrap_or_default()
     }
     fn clashing(sources: &[Source]) -> Vec<bool> {
-        let mut n: HashMap<&str, usize> = HashMap::new();
+        let mut n: HashMap<String, usize> = HashMap::new();
         for s in sources {
-            *n.entry(s.id.as_str()).or_default() += 1;
+            *n.entry(s.id.to_ascii_lowercase()).or_default() += 1;
         }
-        sources.iter().map(|s| n[s.id.as_str()] > 1).collect()
+        sources.iter().map(|s| n[&s.id.to_ascii_lowercase()] > 1).collect()
     }
 
-    for rename in [first_stem as fn(&Source) -> String, folder_stem] {
-        let clash = clashing(sources);
-        if !clash.contains(&true) {
-            return;
+    // 1. File stem.
+    let clash = clashing(sources);
+    if !clash.contains(&true) {
+        return;
+    }
+    for (s, c) in sources.iter_mut().zip(clash) {
+        if c {
+            s.id = id_slug(&first_stem(s));
         }
-        for (s, c) in sources.iter_mut().zip(clash) {
-            if c {
-                s.id = rename(s);
+    }
+
+    // 2. The first folder that differs within each clashing group.
+    let clash = clashing(sources);
+    if !clash.contains(&true) {
+        return;
+    }
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for i in (0..sources.len()).filter(|&i| clash[i]) {
+        groups.entry(sources[i].id.to_ascii_lowercase()).or_default().push(i);
+    }
+    let mut renames: Vec<(usize, String)> = Vec::new();
+    for members in groups.values() {
+        let dirs: Vec<Vec<&str>> = members.iter().map(|&i| folder_parts(&sources[i])).collect();
+        let common = (0..)
+            .take_while(|&k| dirs[0].get(k).is_some_and(|c| dirs.iter().all(|d| d.get(k) == Some(c))))
+            .count();
+        for (&i, d) in members.iter().zip(&dirs) {
+            let label = d.get(common).map(|c| id_slug(c)).unwrap_or_default();
+            if !label.is_empty() {
+                renames.push((i, format!("{label}-{}", sources[i].id)));
             }
         }
     }
-    // Still clashing (same folder name and file name): number them in path order.
+    for (i, id) in renames {
+        sources[i].id = id;
+    }
+
+    // 3. Still clashing (same folders, same file name): number them in
+    // path order, skipping any id already taken.
     let clash = clashing(sources);
+    let mut used: HashSet<String> = sources
+        .iter()
+        .zip(&clash)
+        .filter(|(_, c)| !**c)
+        .map(|(s, _)| s.id.to_ascii_lowercase())
+        .collect();
     let mut order: Vec<usize> = (0..sources.len()).filter(|&i| clash[i]).collect();
     order.sort_by_key(|&i| sources[i].chapters.first().map(|c| c.path.clone()));
-    let mut seen: HashMap<String, u32> = HashMap::new();
     for i in order {
-        let n = seen.entry(sources[i].id.clone()).or_insert(0);
-        *n += 1;
-        if *n > 1 {
-            sources[i].id = format!("{}-{}", sources[i].id, n);
+        let base = sources[i].id.clone();
+        let mut id = base.clone();
+        let mut n = 1;
+        while used.contains(&id.to_ascii_lowercase()) {
+            n += 1;
+            id = format!("{base}-{n}");
+        }
+        used.insert(id.to_ascii_lowercase());
+        sources[i].id = id;
+    }
+}
+
+/// A source id made from a file or folder name: lowercase ASCII letters,
+/// digits, `_` and `-`; every other run of characters becomes one `-`
+/// (`Card A` → `card-a`). Falls back to `take` when nothing is left.
+fn id_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
         }
     }
+    let out = out.trim_matches('-');
+    if out.is_empty() { "take".into() } else { out.to_string() }
 }
 
 fn chapter_from(f: &ProbedFile, idx: u32) -> Chapter {
@@ -1104,10 +1164,10 @@ mod tests {
             ids_and_chapters(&sources),
             vec![
                 ("0099".into(), vec!["trip/GX010099.MP4".into()]),
-                ("GH010042".into(), vec!["trip/GH010042.MP4".into()]),
-                ("GOPR0042".into(), vec!["trip/GOPR0042.MP4".into(), "trip/GP010042.MP4".into()]),
-                ("day2/GX010042".into(), vec!["trip/day2/GX010042.MP4".into()]),
-                ("trip/GX010042".into(), vec!["trip/GX010042.MP4".into(), "trip/GX020042.MP4".into()]),
+                ("day2-gx010042".into(), vec!["trip/day2/GX010042.MP4".into()]),
+                ("gh010042".into(), vec!["trip/GH010042.MP4".into()]),
+                ("gopr0042".into(), vec!["trip/GOPR0042.MP4".into(), "trip/GP010042.MP4".into()]),
+                ("gx010042".into(), vec!["trip/GX010042.MP4".into(), "trip/GX020042.MP4".into()]),
             ]
         );
     }
@@ -1120,31 +1180,116 @@ mod tests {
             fake("b/other.mp4", 10.0),
         ];
         let ids: Vec<String> = group_into_sources(&files).into_iter().map(|s| s.id).collect();
-        assert_eq!(ids, vec!["a/clip", "b/clip", "other"]);
+        assert_eq!(ids, vec!["a-clip", "b-clip", "other"]);
     }
 
     #[test]
     fn two_cards_with_the_same_dcim_layout_stay_separate() {
         // Same folder name and file names on both cards: chapters still
-        // only stitch within their own folder, and the ids get numbered.
+        // only stitch within their own folder, and the ids name the card
+        // (the first folder that differs), not the shared `100GOPRO`.
         let files = vec![
-            fake("cardA/DCIM/100GOPRO/GX010042.MP4", 10.0),
-            fake("cardA/DCIM/100GOPRO/GX020042.MP4", 10.0),
-            fake("cardB/DCIM/100GOPRO/GX010042.MP4", 20.0),
+            fake("/footage/trip/cardA/DCIM/100GOPRO/GX010042.MP4", 10.0),
+            fake("/footage/trip/cardA/DCIM/100GOPRO/GX020042.MP4", 10.0),
+            fake("/footage/trip/cardB/DCIM/100GOPRO/GX010042.MP4", 20.0),
         ];
         assert_eq!(
             ids_and_chapters(&group_into_sources(&files)),
             vec![
                 (
-                    "100GOPRO/GX010042".into(),
+                    "carda-gx010042".into(),
                     vec![
-                        "cardA/DCIM/100GOPRO/GX010042.MP4".into(),
-                        "cardA/DCIM/100GOPRO/GX020042.MP4".into()
+                        "/footage/trip/cardA/DCIM/100GOPRO/GX010042.MP4".into(),
+                        "/footage/trip/cardA/DCIM/100GOPRO/GX020042.MP4".into()
                     ]
                 ),
-                ("100GOPRO/GX010042-2".into(), vec!["cardB/DCIM/100GOPRO/GX010042.MP4".into()]),
+                ("cardb-gx010042".into(), vec!["/footage/trip/cardB/DCIM/100GOPRO/GX010042.MP4".into()]),
             ]
         );
+    }
+
+    /// What the UI's no-LLM "tell it" grammar (`tellit.ts`) makes of
+    /// "less of clip <id>": the input is lowercased and the id is the run
+    /// of `[a-z0-9_-]` that follows.
+    fn tell_it_source_id(typed: &str) -> String {
+        let t = typed.to_lowercase();
+        let rest = t.strip_prefix("less of clip ").unwrap();
+        rest.chars()
+            .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-')
+            .collect()
+    }
+
+    #[test]
+    fn clashing_ids_can_be_typed_back_in_the_tell_it_grammar() {
+        let files = vec![
+            // Two cameras at one recording number, in one folder.
+            fake("/footage/trip/GOPR0042.MP4", 10.0),
+            fake("/footage/trip/GX010042.MP4", 10.0),
+            // Two cards with the same layout, folder names with spaces.
+            fake("/footage/trip/Card A/DCIM/100GOPRO/GX010077.MP4", 10.0),
+            fake("/footage/trip/Card B/DCIM/100GOPRO/GX010077.MP4", 10.0),
+            // Standalone clips whose names differ only by letter case.
+            fake("/footage/trip/Phone/IMG_0001.MOV", 10.0),
+            fake("/footage/trip/Drone/img_0001.mov", 10.0),
+        ];
+        let sources = group_into_sources(&files);
+        let ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "card-a-gx010077",
+                "card-b-gx010077",
+                "drone-img_0001",
+                "gopr0042",
+                "gx010042",
+                "phone-img_0001",
+            ]
+        );
+        for id in ids {
+            assert_eq!(tell_it_source_id(&format!("Less of clip {id}")), id);
+        }
+    }
+
+    #[test]
+    fn ids_get_numbered_only_when_folders_dont_tell_them_apart() {
+        let files = vec![
+            fake("x/clip.mp4", 10.0),
+            fake("x/CLIP.MOV", 10.0),
+            fake("y/clip-2.mp4", 10.0), // already owns the first free suffix
+            // Three cards where two share the first differing folder.
+            fake("t/a/100GOPRO/GX010042.MP4", 10.0),
+            fake("t/b/100GOPRO/GX010042.MP4", 10.0),
+            fake("t/b/101GOPRO/GX010042.MP4", 10.0),
+        ];
+        assert_eq!(
+            ids_and_chapters(&group_into_sources(&files)),
+            vec![
+                ("a-gx010042".into(), vec!["t/a/100GOPRO/GX010042.MP4".into()]),
+                ("b-gx010042".into(), vec!["t/b/100GOPRO/GX010042.MP4".into()]),
+                ("b-gx010042-2".into(), vec!["t/b/101GOPRO/GX010042.MP4".into()]),
+                ("clip".into(), vec!["x/CLIP.MOV".into()]),
+                ("clip-2".into(), vec!["y/clip-2.mp4".into()]),
+                ("clip-3".into(), vec!["x/clip.mp4".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn unclashed_ids_keep_their_names() {
+        // Existing `source_weights` keys must keep matching.
+        let files = vec![fake("trip/GX010042.MP4", 10.0), fake("trip/DJI_0001.MP4", 10.0)];
+        let ids: Vec<String> = group_into_sources(&files).into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["0042", "DJI_0001"]);
+    }
+
+    #[test]
+    fn id_slug_keeps_only_tell_it_characters() {
+        assert_eq!(id_slug("GX010042"), "gx010042");
+        assert_eq!(id_slug("Card A"), "card-a");
+        assert_eq!(id_slug("  Ski Day (2) "), "ski-day-2");
+        assert_eq!(id_slug("DJI_0001"), "dji_0001");
+        assert_eq!(id_slug("Öland"), "land");
+        assert_eq!(id_slug("日本"), "take");
     }
 
     #[test]

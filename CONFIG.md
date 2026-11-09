@@ -103,8 +103,22 @@ The source id (used by `[selection].source_weights` and
 `[multi_angle].groups`) is the 4-digit recording number. When two
 recordings would share it — an older and a newer camera both at 0042,
 or two cards in different folders — they stay separate sources and
-their ids become the first chapter's file name (`GOPR0042`,
-`GX010042`), then `<folder>/<file>` if that still clashes.
+get new ids, in up to three steps until every id is unique:
+
+1. the first chapter's file name, lowercased: `gopr0042`, `gx010042`;
+2. prefixed with the first folder that differs between them:
+   `carda-gx010042` and `cardb-gx010042` for two cards copied as
+   `cardA/DCIM/100GOPRO/…` and `cardB/DCIM/100GOPRO/…`, `day2-gx010042`
+   for a copy in a `day2/` subfolder;
+3. numbered in path order (`gx010042`, `gx010042-2`) when even the
+   folders don't tell them apart.
+
+Standalone clips with the same file name (`a/clip.mp4`, `b/clip.mp4`)
+go through the same steps (`a-clip`, `b-clip`); ids that differ only in
+letter case count as the same. Generated ids use only lowercase letters,
+digits, `_` and `-` (other characters become `-`, so `Card A` →
+`card-a`), which is what "more of / less of clip …" in the app accepts.
+Ids that don't clash keep their usual form.
 
 GoPro's low-res proxies (`.LRV`: `GL010042.LRV` in the GX / GH scheme,
 `GOPR0042.LRV` / `GP010042.LRV` in the older one) and thumbnails
