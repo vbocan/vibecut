@@ -800,6 +800,14 @@ pub fn strip_to_style(cfg: &Value) -> Value {
             }
             if let Some(Value::Array(layers)) = m.get_mut("layers") {
                 layers.retain(|l| l.get("kind").and_then(Value::as_str) == Some("text"));
+                // A font path is this machine's: share the file name.
+                for l in layers.iter_mut() {
+                    if let Some(Value::String(f)) = l.get_mut("font") {
+                        if let Some(name) = f.rsplit(['/', '\\']).next().filter(|n| n.len() < f.len()) {
+                            *f = name.to_string();
+                        }
+                    }
+                }
             }
         }
         out.insert(section.to_string(), v);
@@ -1084,7 +1092,86 @@ pub fn decoded_style(r: &Recipe) -> Result<Value, OpsError> {
             )
         })?;
     }
-    Ok(strip_to_style(&v))
+    let style = strip_to_style(&v);
+    check_style_values(&style).map_err(|e| OpsError::invalid(format!("this style code isn't valid: {e}")))?;
+    Ok(style)
+}
+
+/// Every string a style sets that ends up in a render, against what it
+/// may be: colours `#RRGGBB[AA]` or a colour name, transitions from the
+/// xfade list (or `cut` / `none`), anchors from the known set, a font as
+/// a bare file or family name, paddings and bitrates as numbers. A code
+/// is anyone's text; none of it may carry anything else into ffmpeg.
+pub fn check_style_values(style: &Value) -> Result<(), String> {
+    use vibecut::video_renderer::{is_valid_color, is_xfade_transition, POSITIONS};
+    fn str_at<'a>(v: &'a Value, key: &str, at: &str) -> Result<Option<&'a str>, String> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s)),
+            Some(_) => Err(format!("{at}.{key} must be text")),
+        }
+    }
+    let check = |v: &Value, key: &str, at: &str, ok: &dyn Fn(&str) -> bool, what: &str| -> Result<(), String> {
+        match str_at(v, key, at)? {
+            Some(s) if !ok(s) => Err(format!("{at}.{key} {s:?} is not {what}")),
+            _ => Ok(()),
+        }
+    };
+    let colour = |s: &str| is_valid_color(s);
+    let position = |s: &str| POSITIONS.contains(&s);
+    let transition = |s: &str| is_xfade_transition(s) || s == "cut" || s == "none";
+    let font = |s: &str| {
+        !s.trim().is_empty()
+            && s.len() <= 128
+            && !s.contains("..")
+            && !s.chars().any(|c| c == '/' || c == '\\' || c.is_control())
+    };
+    let padding = |s: &str| {
+        let n = s.strip_suffix("px").unwrap_or(s).trim();
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    };
+    let bitrate = |s: &str| {
+        s == "none"
+            || s == "off"
+            || (s.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b"kKmM".contains(&b))
+                && vibecut::output_format::parse_bitrate(s).is_some())
+    };
+    let resolution = |s: &str| vibecut::output_format::parse_resolution(s).is_some() && !s.contains(' ');
+
+    for card in ["intro", "outro"] {
+        let Some(c) = style.get(card).filter(|c| c.is_object()) else { continue };
+        check(c, "bg_color", card, &colour, "a colour")?;
+        for (i, layer) in c.get("layers").and_then(Value::as_array).into_iter().flatten().enumerate() {
+            let at = format!("{card}.layers.{i}");
+            check(layer, "color", &at, &colour, "a colour")?;
+            check(layer, "position", &at, &position, "a position")?;
+            check(layer, "font", &at, &font, "a font name (a bare file or family name)")?;
+            if let Some(b) = layer.get("background").filter(|b| b.is_object()) {
+                let at = format!("{at}.background");
+                check(b, "color", &at, &colour, "a colour")?;
+                check(b, "padding", &at, &padding, "a padding in pixels")?;
+            }
+        }
+    }
+    if let Some(t) = style.get("transition").filter(|t| t.is_object()) {
+        check(t, "default", "transition", &transition, "a transition")?;
+        if let Some(p) = t.get("palette") {
+            let list = p.as_array().ok_or("transition.palette must be a list")?;
+            for (i, v) in list.iter().enumerate() {
+                let s = v.as_str().ok_or_else(|| format!("transition.palette.{i} must be text"))?;
+                if !transition(s) {
+                    return Err(format!("transition.palette.{i} {s:?} is not a transition"));
+                }
+            }
+        }
+    }
+    for (i, o) in style.get("outputs").and_then(Value::as_array).into_iter().flatten().enumerate() {
+        let at = format!("outputs.{i}");
+        check(o, "audio_bitrate", &at, &bitrate, "a bitrate")?;
+        check(o, "max_bitrate", &at, &bitrate, "a bitrate")?;
+        check(o, "resolution", &at, &resolution, "a resolution")?;
+    }
+    Ok(())
 }
 
 /// The recipe for `cfg`'s style. `vibe`: the vibe it was made from, when

@@ -595,6 +595,81 @@ fn settings_from_a_newer_version_are_refused_clearly() {
     assert!(e.contains("doesn't fit") && e.contains("nope.x"), "{e}");
 }
 
+/// A hand-made code can't carry filter-graph syntax (or anything else
+/// that isn't the value) into a render: the colour that printed a local
+/// file on the title card, and every other free-form style string, is
+/// refused as invalid input (a 400) when the code is read.
+#[test]
+fn codes_carrying_ffmpeg_filter_syntax_are_refused() {
+    let set = |path: &[&str], v: Value| Setting {
+        path: path
+            .iter()
+            .map(|p| p.parse::<usize>().map(Seg::Index).unwrap_or_else(|_| Seg::Key(p.to_string())))
+            .collect(),
+        op: Op::Set(v),
+    };
+    let exploit = "white,drawtext=textfile=/etc/hostname:fontsize=40:fontcolor=red";
+    let cases = [
+        set(&["intro", "layers", "0", "color"], exploit.into()),
+        set(&["intro", "bg_color"], "black;[0:v]null".into()),
+        set(&["intro", "layers", "0", "position"], "center:x=0".into()),
+        set(&["intro", "layers", "0", "font"], "..".into()),
+        set(&["intro", "layers", "0", "font"], "x\u{7}.ttf".into()),
+        set(&["intro", "layers", "0", "background"], serde_json::json!({ "color": "#000000", "padding": "20,drawtext" })),
+        set(&["transition", "default"], "fade:offset=0,drawtext=text=x".into()),
+        set(&["transition", "palette"], serde_json::json!(["dissolve", "x;y"])),
+        set(&["outputs", "0", "audio_bitrate"], "192k -map 0".into()),
+        set(&["outputs", "0", "max_bitrate"], "3M,x".into()),
+    ];
+    for s in cases {
+        let what = path_string(&s.path);
+        let r = Recipe { vibe: "kid_reel".into(), music: Music::Auto, settings: vec![s] };
+        let r = decode(&encode(&r)).unwrap();
+        let e = decoded_style(&r).expect_err(&what);
+        assert!(matches!(e, OpsError::InvalidInput { .. }), "{what}: {e}");
+        assert!(e.to_string().contains("isn't valid"), "{what}: {e}");
+        assert!(build_config(&r, &dest("/footage/x", "T", "x"), &["/m/a.mp3".into()]).is_err(), "{what}");
+        assert!(summarize(&r).is_err(), "{what}");
+    }
+    // The values styles really use still pass.
+    for s in [
+        set(&["intro", "layers", "0", "color"], "#F0E4C8AA".into()),
+        set(&["intro", "layers", "0", "color"], "white".into()),
+        set(&["intro", "layers", "0", "font"], "Inter Bold.ttf".into()),
+        set(&["transition", "default"], "circleopen".into()),
+        set(&["outputs", "0", "max_bitrate"], "2.5M".into()),
+    ] {
+        let what = path_string(&s.path);
+        let r = Recipe { vibe: "kid_reel".into(), music: Music::Auto, settings: vec![s] };
+        build_config(&decode(&encode(&r)).unwrap(), &dest("/footage/x", "T", "x"), &["/m/a.mp3".into()])
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+}
+
+/// A font path is the sharer's machine: a shared style carries the file name.
+#[test]
+fn shared_fonts_are_bare_file_names() {
+    let mut cfg = proposal("kid_reel", "/footage/x", "T", Some("/m/a.mp3"));
+    if let Some(CardLayer::Text(t)) = cfg.intro.as_mut().and_then(|c| c.layers.first_mut()) {
+        t.font = Some("/usr/share/fonts/truetype/Inter-Bold.ttf".into());
+    } else {
+        panic!("kid_reel has an intro text layer");
+    }
+    let style = style_of(&cfg).unwrap();
+    assert_eq!(style["intro"]["layers"][0]["font"], "Inter-Bold.ttf");
+    // A hand-made code naming a path gets the file name too.
+    let r = Recipe {
+        vibe: "kid_reel".into(),
+        music: Music::Auto,
+        settings: vec![Setting {
+            path: vec![Seg::Key("intro".into()), Seg::Key("layers".into()), Seg::Index(0), Seg::Key("font".into())],
+            op: Op::Set("/etc/passwd".into()),
+        }],
+    };
+    let style = decoded_style(&decode(&encode(&r)).unwrap()).unwrap();
+    assert_eq!(style["intro"]["layers"][0]["font"], "passwd");
+}
+
 // ---------- applying to other footage ----------
 
 /// The same code on two different trips: the configs differ only in

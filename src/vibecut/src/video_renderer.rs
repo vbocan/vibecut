@@ -1180,12 +1180,12 @@ fn normalize_image_segment(
 
     // Optional LUT (colour grading).
     if let Some(lut) = args.lut3d {
-        fc.push_str(&format!(",lut3d='{}'", lut.as_str().replace('\\', "/")));
+        fc.push_str(&format!(",lut3d={}", filter_arg(&lut.as_str().replace('\\', "/"))));
     }
 
     // Text overlays (intro/outro "overlay" mode drawtext).
     for d in args.overlays {
-        if let Some(dt) = build_overlay_drawtext(d) {
+        if let Some(dt) = build_overlay_drawtext(d)? {
             fc.push(',');
             fc.push_str(&dt);
         }
@@ -1260,19 +1260,16 @@ pub fn normalize_segment(
     if let Some(trf) = args.stabilize_transforms {
         // vidstab requires forward slashes and quoted paths.
         chain.push_str(&format!(
-            ",vidstabtransform=input='{}':smoothing=10:zoom=1:interpol=bilinear",
-            trf.as_str().replace('\\', "/")
+            ",vidstabtransform=input={}:smoothing=10:zoom=1:interpol=bilinear",
+            filter_arg(&trf.as_str().replace('\\', "/"))
         ));
     }
     if let Some(lut) = args.lut3d {
-        chain.push_str(&format!(
-            ",lut3d='{}'",
-            lut.as_str().replace('\\', "/")
-        ));
+        chain.push_str(&format!(",lut3d={}", filter_arg(&lut.as_str().replace('\\', "/"))));
     }
     // Overlays: any drawtext directives baked into this segment.
     for d in args.overlays {
-        if let Some(dt) = build_overlay_drawtext(d) {
+        if let Some(dt) = build_overlay_drawtext(d)? {
             chain.push(',');
             chain.push_str(&dt);
         }
@@ -2306,7 +2303,7 @@ pub fn render_text_card(
         std::fs::create_dir_all(parent).ok();
     }
 
-    let bg = ffmpeg_color(spec.bg_color_hex);
+    let bg = ffmpeg_color(spec.bg_color_hex)?;
     let video_src = format!(
         "color=c={bg}:size={w}x{h}:rate={fps}:duration={dur}",
         bg = bg,
@@ -2356,7 +2353,7 @@ pub fn render_text_card(
             } else {
                 format!("[t{i}]")
             };
-            let dt = build_drawtext(t, spec.duration_secs);
+            let dt = build_drawtext(t, spec.duration_secs)?;
             filter.push_str(&format!("{in_label}{dt}{out_label}"));
             if i != last {
                 filter.push(';');
@@ -2511,6 +2508,9 @@ pub fn concat_with_xfade(
             inputs.len() - 1
         );
     }
+    if let Some((bad, _)) = transitions.iter().find(|(t, _)| !is_xfade_transition(t)) {
+        anyhow::bail!("{bad:?} is not an xfade transition (one of: {})", XFADE_TRANSITIONS.join(", "));
+    }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -2648,8 +2648,8 @@ pub fn concat_with_xfade(
 
 // ---------- drawtext expression construction ----------
 
-fn build_drawtext(t: &TextOverlay, card_dur: f32) -> String {
-    let (rgb, alpha) = parse_hex_color(&t.color_hex);
+fn build_drawtext(t: &TextOverlay, card_dur: f32) -> Result<String> {
+    let (rgb, alpha) = parse_hex_color(&t.color_hex)?;
     let alpha_factor = alpha.unwrap_or(1.0);
 
     // Visibility window. Defaults of (0, card_dur) yield exactly the
@@ -2667,21 +2667,18 @@ fn build_drawtext(t: &TextOverlay, card_dur: f32) -> String {
     let (x, y) = position_to_xy_with_offset(&t.position, t.x_offset, t.y_offset);
 
     let mut s = format!(
-        "drawtext=text='{txt}':fontsize={size}:fontcolor={rgb}:alpha='{alpha_expr}':x={x}:y={y}",
+        "drawtext=text={txt}:fontsize={size}:fontcolor={rgb}:alpha='{alpha_expr}':x={x}:y={y}",
         txt = escape_drawtext(&t.content),
         size = t.size,
         alpha_expr = full_alpha,
     );
 
     if let Some(font) = &t.font_path {
-        s.push_str(&format!(
-            ":fontfile='{}'",
-            escape_drawtext(font.as_str())
-        ));
+        s.push_str(&format!(":fontfile={}", filter_arg(font.as_str())));
     }
 
     if let Some(bg) = &t.bg_color_hex {
-        let (bg_rgb, bg_alpha) = parse_hex_color(bg);
+        let (bg_rgb, bg_alpha) = parse_hex_color(bg)?;
         let bg_pad = t.bg_padding_px.unwrap_or(20);
         let bg_color_arg = match bg_alpha {
             Some(a) => format!("{bg_rgb}@{a:.4}"),
@@ -2697,7 +2694,7 @@ fn build_drawtext(t: &TextOverlay, card_dur: f32) -> String {
         ":enable='between(t,{:.4},{:.4})'",
         appear, disappear
     ));
-    s
+    Ok(s)
 }
 
 fn position_to_xy_with_offset(pos: &str, x_off: i32, y_off: i32) -> (String, String) {
@@ -2707,17 +2704,86 @@ fn position_to_xy_with_offset(pos: &str, x_off: i32, y_off: i32) -> (String, Str
     (x, y)
 }
 
-fn parse_hex_color(s: &str) -> (String, Option<f32>) {
-    let s = s.trim_start_matches('#');
-    if s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        (format!("0x{}", s), None)
-    } else if s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let alpha = u8::from_str_radix(&s[6..8], 16).unwrap_or(255) as f32 / 255.0;
-        (format!("0x{}", &s[..6]), Some(alpha))
+/// Parse a config colour into ffmpeg's form: `#RRGGBB` / `#RRGGBBAA`
+/// (also `0x…` or bare hex) → `0xRRGGBB` plus the alpha, or one of
+/// ffmpeg's colour names (optionally `@alpha`) as written. Anything else
+/// is refused: a colour lands unquoted in a filter graph, so a string like
+/// `white,drawtext=…` must never pass through.
+fn parse_hex_color(s: &str) -> Result<(String, Option<f32>)> {
+    let t = s.trim();
+    let hex = t.strip_prefix('#').or_else(|| t.strip_prefix("0x")).or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok((format!("0x{hex}"), None))
+    } else if hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let alpha = u8::from_str_radix(&hex[6..8], 16).unwrap_or(255) as f32 / 255.0;
+        Ok((format!("0x{}", &hex[..6]), Some(alpha)))
+    } else if is_color_name(t) {
+        Ok((t.to_string(), None))
     } else {
-        // Pass through named colors as-is (white, black, red, ...).
-        (s.to_string(), None)
+        anyhow::bail!("{s:?} is not a colour (use #RRGGBB, #RRGGBBAA or a colour name such as \"white\")")
     }
+}
+
+/// Whether `s` is a colour the renderer accepts (see [`parse_hex_color`]).
+pub fn is_valid_color(s: &str) -> bool {
+    parse_hex_color(s).is_ok()
+}
+
+/// ffmpeg's colour names (lower case; matched case-insensitively).
+pub const COLOR_NAMES: &[&str] = &[
+    "aliceblue", "antiquewhite", "aqua", "aquamarine", "azure", "beige", "bisque", "black",
+    "blanchedalmond", "blue", "blueviolet", "brown", "burlywood", "cadetblue", "chartreuse",
+    "chocolate", "coral", "cornflowerblue", "cornsilk", "crimson", "cyan", "darkblue", "darkcyan",
+    "darkgoldenrod", "darkgray", "darkgreen", "darkkhaki", "darkmagenta", "darkolivegreen",
+    "darkorange", "darkorchid", "darkred", "darksalmon", "darkseagreen", "darkslateblue",
+    "darkslategray", "darkturquoise", "darkviolet", "deeppink", "deepskyblue", "dimgray",
+    "dodgerblue", "firebrick", "floralwhite", "forestgreen", "fuchsia", "gainsboro", "ghostwhite",
+    "gold", "goldenrod", "gray", "green", "greenyellow", "honeydew", "hotpink", "indianred",
+    "indigo", "ivory", "khaki", "lavender", "lavenderblush", "lawngreen", "lemonchiffon",
+    "lightblue", "lightcoral", "lightcyan", "lightgoldenrodyellow", "lightgreen", "lightgrey",
+    "lightpink", "lightsalmon", "lightseagreen", "lightskyblue", "lightslategray", "lightsteelblue",
+    "lightyellow", "lime", "limegreen", "linen", "magenta", "maroon", "mediumaquamarine",
+    "mediumblue", "mediumorchid", "mediumpurple", "mediumseagreen", "mediumslateblue",
+    "mediumspringgreen", "mediumturquoise", "mediumvioletred", "midnightblue", "mintcream",
+    "mistyrose", "moccasin", "navajowhite", "navy", "oldlace", "olive", "olivedrab", "orange",
+    "orangered", "orchid", "palegoldenrod", "palegreen", "paleturquoise", "palevioletred",
+    "papayawhip", "peachpuff", "peru", "pink", "plum", "powderblue", "purple", "red", "rosybrown",
+    "royalblue", "saddlebrown", "salmon", "sandybrown", "seagreen", "seashell", "sienna", "silver",
+    "skyblue", "slateblue", "slategray", "snow", "springgreen", "steelblue", "tan", "teal",
+    "thistle", "tomato", "turquoise", "violet", "wheat", "white", "whitesmoke", "yellow",
+    "yellowgreen",
+];
+
+/// A colour name, optionally with an `@alpha` (`white@0.5`).
+fn is_color_name(s: &str) -> bool {
+    let (name, alpha) = match s.split_once('@') {
+        Some((n, a)) => (n, Some(a)),
+        None => (s, None),
+    };
+    let alpha_ok = alpha.is_none_or(|a| !a.is_empty() && a.parse::<f32>().is_ok_and(|v| (0.0..=1.0).contains(&v)));
+    alpha_ok && COLOR_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// The anchor names text and image layers take.
+pub const POSITIONS: &[&str] =
+    &["center", "top-left", "top-right", "top-center", "bottom-left", "bottom-right", "bottom-center"];
+
+/// ffmpeg's `xfade` transition names (all but `custom`, which needs an
+/// expression).
+pub const XFADE_TRANSITIONS: &[&str] = &[
+    "fade", "wipeleft", "wiperight", "wipeup", "wipedown", "slideleft", "slideright", "slideup",
+    "slidedown", "circlecrop", "rectcrop", "distance", "fadeblack", "fadewhite", "radial", "smoothleft",
+    "smoothright", "smoothup", "smoothdown", "circleopen", "circleclose", "vertopen", "vertclose",
+    "horzopen", "horzclose", "dissolve", "pixelize", "diagtl", "diagtr", "diagbl", "diagbr", "hlslice",
+    "hrslice", "vuslice", "vdslice", "hblur", "fadegrays", "wipetl", "wipetr", "wipebl", "wipebr",
+    "squeezeh", "squeezev", "zoomin", "fadefast", "fadeslow", "hlwind", "hrwind", "vuwind", "vdwind",
+    "coverleft", "coverright", "coverup", "coverdown", "revealleft", "revealright", "revealup",
+    "revealdown",
+];
+
+/// Whether `name` is an ffmpeg xfade transition.
+pub fn is_xfade_transition(name: &str) -> bool {
+    XFADE_TRANSITIONS.contains(&name)
 }
 
 fn position_to_xy(pos: &str) -> (&'static str, &'static str) {
@@ -2747,12 +2813,12 @@ fn fade_alpha_expr_window(start: f32, duration: f32, fade_in: f32, fade_out: f32
 /// Build a drawtext filter for an overlay placed at `start`..`start+duration`
 /// within the segment's local time. Returns `Some(s)` only when the overlay
 /// has positive duration.
-fn build_overlay_drawtext(d: &OverlayDirective<'_>) -> Option<String> {
+fn build_overlay_drawtext(d: &OverlayDirective<'_>) -> Result<Option<String>> {
     if d.duration_secs <= 0.0 {
-        return None;
+        return Ok(None);
     }
     let t = d.overlay;
-    let (rgb, alpha) = parse_hex_color(&t.color_hex);
+    let (rgb, alpha) = parse_hex_color(&t.color_hex)?;
     let alpha_factor = alpha.unwrap_or(1.0);
     let fade_expr = fade_alpha_expr_window(
         d.start_secs,
@@ -2765,16 +2831,16 @@ fn build_overlay_drawtext(d: &OverlayDirective<'_>) -> Option<String> {
     // lifted range captions rely on them.
     let (x, y) = position_to_xy_with_offset(&t.position, t.x_offset, t.y_offset);
     let mut s = format!(
-        "drawtext=text='{txt}':fontsize={size}:fontcolor={rgb}:alpha='{alpha_expr}':x={x}:y={y}",
+        "drawtext=text={txt}:fontsize={size}:fontcolor={rgb}:alpha='{alpha_expr}':x={x}:y={y}",
         txt = escape_drawtext(&t.content),
         size = t.size,
         alpha_expr = full_alpha,
     );
     if let Some(font) = &t.font_path {
-        s.push_str(&format!(":fontfile='{}'", escape_drawtext(font.as_str())));
+        s.push_str(&format!(":fontfile={}", filter_arg(font.as_str())));
     }
     if let Some(bg) = &t.bg_color_hex {
-        let (bg_rgb, bg_alpha) = parse_hex_color(bg);
+        let (bg_rgb, bg_alpha) = parse_hex_color(bg)?;
         let bg_pad = t.bg_padding_px.unwrap_or(20);
         let bg_color_arg = match bg_alpha {
             Some(a) => format!("{bg_rgb}@{a:.4}"),
@@ -2788,7 +2854,7 @@ fn build_overlay_drawtext(d: &OverlayDirective<'_>) -> Option<String> {
         d.start_secs,
         d.start_secs + d.duration_secs,
     ));
-    Some(s)
+    Ok(Some(s))
 }
 
 #[cfg(test)]
@@ -2821,26 +2887,46 @@ fn fade_alpha_expr(fade_in: f32, fade_out: f32, dur: f32) -> String {
     format!("({ramp_in}-{ramp_out})")
 }
 
-fn escape_drawtext(s: &str) -> String {
-    // ffmpeg drawtext: escape backslashes, single quotes, colons.
+/// Backslash-escape `specials` and whitespace: one level of ffmpeg's
+/// `av_get_token` parsing (whitespace so leading / trailing spaces survive).
+fn backslash_escape(s: &str, specials: &[char]) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\\\\\"),
-            '\'' => out.push_str("\\\\'"),
-            ':' => out.push_str("\\:"),
-            _ => out.push(c),
+        if specials.contains(&c) || matches!(c, ' ' | '\t' | '\n' | '\r') {
+            out.push('\\');
         }
+        out.push(c);
     }
     out
 }
 
-fn ffmpeg_color(hex: &str) -> String {
-    let (rgb, alpha) = parse_hex_color(hex);
-    match alpha {
+/// A string as one filter option value inside a filter graph: escaped for
+/// the option parser (`\ ' :`) and then for the graph parser
+/// (`\ ' [ ] , ;`), so whatever it holds reaches the filter as that one
+/// value — it can't end the option or the filter and start another.
+pub fn filter_arg(s: &str) -> String {
+    backslash_escape(&backslash_escape(s, &['\\', '\'', ':']), &['\\', '\'', '[', ']', ',', ';'])
+}
+
+/// drawtext's `text=` value: the text with drawtext's own expansion
+/// characters (`\`, `%`) escaped, as a [`filter_arg`].
+fn escape_drawtext(s: &str) -> String {
+    let mut lit = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if matches!(c, '\\' | '%') {
+            lit.push('\\');
+        }
+        lit.push(c);
+    }
+    filter_arg(&lit)
+}
+
+fn ffmpeg_color(hex: &str) -> Result<String> {
+    let (rgb, alpha) = parse_hex_color(hex)?;
+    Ok(match alpha {
         Some(a) => format!("{rgb}@{a:.4}"),
         None => rgb,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2849,11 +2935,11 @@ mod phase5_tests {
 
     #[test]
     fn parses_hex_with_and_without_alpha() {
-        let (rgb, a) = parse_hex_color("#FFFFFF");
+        let (rgb, a) = parse_hex_color("#FFFFFF").unwrap();
         assert_eq!(rgb, "0xFFFFFF");
         assert!(a.is_none());
 
-        let (rgb, a) = parse_hex_color("#000000AA");
+        let (rgb, a) = parse_hex_color("#000000AA").unwrap();
         assert_eq!(rgb, "0x000000");
         let av = a.unwrap();
         assert!((av - 0xAA as f32 / 255.0).abs() < 1e-3);
@@ -2895,8 +2981,8 @@ mod phase5_tests {
     #[test]
     fn drawtext_includes_text_and_position() {
         let t = make_text_overlay("Hello World", 64);
-        let dt = build_drawtext(&t, 2.5);
-        assert!(dt.contains("text='Hello World'"));
+        let dt = build_drawtext(&t, 2.5).unwrap();
+        assert!(dt.contains(r"text=Hello\\\ World:"), "{dt}");
         assert!(dt.contains("fontsize=64"));
         assert!(dt.contains("0xFF8800"));
         assert!(dt.contains("(w-text_w)/2"));
@@ -2909,7 +2995,7 @@ mod phase5_tests {
         let mut t = make_text_overlay("Stage 2", 60);
         t.appear_at_secs = 1.5;
         t.disappear_at_secs = 3.5;
-        let dt = build_drawtext(&t, 5.0);
+        let dt = build_drawtext(&t, 5.0).unwrap();
         assert!(dt.contains("enable='between(t,1.5000,3.5000)'"), "got: {dt}");
     }
 
@@ -2920,7 +3006,9 @@ mod phase5_tests {
         let mut t = make_text_overlay("March", 48);
         t.position = "bottom-center".into();
         let at = |t: &TextOverlay| {
-            build_overlay_drawtext(&OverlayDirective { overlay: t, start_secs: 0.4, duration_secs: 2.0 }).unwrap()
+            build_overlay_drawtext(&OverlayDirective { overlay: t, start_secs: 0.4, duration_secs: 2.0 })
+                .unwrap()
+                .unwrap()
         };
         let plain = at(&t);
         assert!(plain.contains(":x=(w-text_w)/2:y=h-text_h-40"), "{plain}");
@@ -2929,6 +3017,119 @@ mod phase5_tests {
         let lifted = at(&t);
         assert!(lifted.contains(":x=((w-text_w)/2)+(12):y=(h-text_h-40)+(-64)"), "{lifted}");
         assert!(lifted.contains("enable='between(t,0.4000,2.4000)'"), "{lifted}");
+    }
+
+    /// ffmpeg's `av_get_token`: read one token up to an unescaped,
+    /// unquoted `term` char, undoing `\x` escapes and `'…'` quoting and
+    /// trimming unescaped whitespace. Returns the token and the rest.
+    fn av_get_token<'a>(s: &'a str, term: &[char]) -> (String, &'a str) {
+        let s = s.trim_start_matches([' ', '\n', '\t', '\r']);
+        let mut out = String::new();
+        let mut end = 0;
+        let mut it = s.char_indices().peekable();
+        let mut rest = "";
+        while let Some((i, c)) = it.next() {
+            if term.contains(&c) {
+                rest = &s[i..];
+                break;
+            }
+            if c == '\\' {
+                if let Some((_, n)) = it.next() {
+                    out.push(n);
+                    end = out.len();
+                }
+            } else if c == '\'' {
+                for (_, q) in it.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    out.push(q);
+                }
+                end = out.len();
+            } else {
+                out.push(c);
+            }
+        }
+        let trimmed = out.trim_end_matches([' ', '\n', '\t', '\r']);
+        let keep = trimmed.len().max(end);
+        out.truncate(keep);
+        (out, rest)
+    }
+
+    /// The graph parser then the option parser, as ffmpeg reads a filter
+    /// option value: what `text=<v>` hands the filter, and what follows it.
+    fn parse_value(v: &str) -> (String, String) {
+        let (graph_level, after) = av_get_token(v, &['[', ']', ',', ';']);
+        let (opt_level, after_opt) = av_get_token(&graph_level, &[':']);
+        (opt_level, format!("{after_opt}{after}"))
+    }
+
+    #[test]
+    fn filter_arg_reaches_the_filter_as_one_value() {
+        for s in [
+            "plain",
+            "It's 100% a: test, [x]; back\\slash",
+            "  leading and trailing  ",
+            "x',drawtext=textfile=/etc/hostname:fontcolor=red,'",
+            "a\\',b;[c]",
+            "line one\nline two",
+        ] {
+            let (value, rest) = parse_value(&filter_arg(s));
+            assert_eq!(value, s, "{s:?} → {:?}", filter_arg(s));
+            assert!(rest.is_empty(), "{s:?} left {rest:?} for the parser");
+        }
+    }
+
+    #[test]
+    fn drawtext_text_escapes_expansion_and_cannot_break_out() {
+        let mut t = make_text_overlay("x',drawtext=textfile=/etc/hostname,'100%", 48);
+        let dt = build_drawtext(&t, 2.0).unwrap();
+        let v = dt.strip_prefix("drawtext=text=").unwrap();
+        let (value, rest) = parse_value(v);
+        // drawtext then sees `\%` (a literal %) and nothing else.
+        assert_eq!(value, "x',drawtext=textfile=/etc/hostname,'100\\%");
+        assert!(rest.starts_with(":fontsize=48"), "{rest}");
+        assert!(!rest.contains("textfile"), "{rest}");
+
+        t.font_path = Some("/fonts/it's: a,font.ttf".into());
+        let dt = build_drawtext(&t, 2.0).unwrap();
+        let at = dt.find(":fontfile=").unwrap() + ":fontfile=".len();
+        let (font, _) = parse_value(&dt[at..]);
+        assert_eq!(font, "/fonts/it's: a,font.ttf");
+    }
+
+    #[test]
+    fn colours_outside_the_allowlist_are_refused() {
+        for bad in [
+            "white,drawtext=textfile=/etc/hostname:fontcolor=red",
+            "white:box=1",
+            "#FFF",
+            "#GGGGGG",
+            "notacolour",
+            "white@",
+            "white@2",
+            "",
+        ] {
+            assert!(parse_hex_color(bad).is_err(), "{bad:?} was accepted");
+            assert!(!is_valid_color(bad));
+        }
+        for good in ["#FFFFFF", "#ffffff80", "0x112233", "White", "darkorange", "black@0.5"] {
+            assert!(is_valid_color(good), "{good:?} was refused");
+        }
+        let mut t = make_text_overlay("Hi", 48);
+        t.color_hex = "white,drawtext=textfile=/etc/hostname".into();
+        assert!(build_drawtext(&t, 2.0).is_err());
+        let mut t = make_text_overlay("Hi", 48);
+        t.bg_color_hex = Some("black;[0:v]null".into());
+        assert!(build_drawtext(&t, 2.0).is_err());
+        assert!(ffmpeg_color("black,drawtext=text=x").is_err());
+    }
+
+    #[test]
+    fn unknown_xfade_transitions_are_refused() {
+        assert!(is_xfade_transition("dissolve"));
+        assert!(!is_xfade_transition("custom"));
+        assert!(!is_xfade_transition("fade,drawtext=textfile=/etc/hostname"));
     }
 }
 
@@ -3399,6 +3600,18 @@ mod tests {
         assert!(args.iter().any(|a| a == "-cq"));
         assert!(args.iter().any(|a| a == "20"));
         assert!(!args.iter().any(|a| a == "-crf"));
+    }
+
+    #[test]
+    fn xfade_refuses_an_unknown_transition_name() {
+        let runner = MockRunner::new();
+        let out = camino::Utf8PathBuf::from("/tmp/sv_xfade_bad/body.mp4");
+        let hw = HwConfig::resolve(HwSupport::default(), EncoderPref::Libx264);
+        let inputs: Vec<(camino::Utf8PathBuf, f32)> = vec![("a.mp4".into(), 1.0), ("b.mp4".into(), 1.0)];
+        let trans = vec![("fade:offset=0,drawtext=text=x".to_string(), 0.3)];
+        let err = concat_with_xfade(&runner, &inputs, &trans, 64, 36, 30, 20, 0.0, 0.0, &hw, &out).unwrap_err();
+        assert!(err.to_string().contains("not an xfade transition"), "{err}");
+        assert!(runner.calls.borrow().is_empty(), "ffmpeg ran");
     }
 
     #[test]

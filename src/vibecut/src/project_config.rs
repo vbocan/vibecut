@@ -1246,6 +1246,8 @@ impl Config {
             ));
         }
 
+        self.validate_filter_strings()?;
+
         if matches!(self.selection.order, Order::StrictChronological) {
             for (i, img) in self.input.images.iter().enumerate() {
                 if img.timestamp.as_deref().map(str::trim).unwrap_or("").is_empty() {
@@ -1258,6 +1260,55 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    /// The strings that end up inside ffmpeg filter graphs as names rather
+    /// than escaped values — colours and transition names — must be ones
+    /// the renderer knows (it refuses anything else too; this says so
+    /// before a render starts, naming the key).
+    fn validate_filter_strings(&self) -> Result<(), ConfigError> {
+        use crate::video_renderer::{is_valid_color, is_xfade_transition};
+        let color = |key: String, v: &str| -> Result<(), ConfigError> {
+            if is_valid_color(v) {
+                Ok(())
+            } else {
+                Err(ConfigError::Validation(format!(
+                    "{key} {v:?} is not a colour (use #RRGGBB, #RRGGBBAA or a colour name such as \"white\")"
+                )))
+            }
+        };
+        for (name, card) in [("intro", &self.intro), ("outro", &self.outro)] {
+            let Some(card) = card else { continue };
+            color(format!("{name}.bg_color"), &card.bg_color)?;
+            for (i, layer) in card.layers.iter().enumerate() {
+                if let CardLayer::Text(t) = layer {
+                    color(format!("{name}.layers[{i}].color"), &t.color)?;
+                    if let Some(b) = &t.background {
+                        color(format!("{name}.layers[{i}].background.color"), &b.color)?;
+                    }
+                }
+            }
+        }
+        for (i, t) in self.texts.iter().enumerate() {
+            color(format!("text[{i}].color"), &t.color)?;
+            if let Some(b) = &t.background {
+                color(format!("text[{i}].background.color"), &b.color)?;
+            }
+        }
+        let transition = |key: &str, v: &str| -> Result<(), ConfigError> {
+            if is_xfade_transition(v) || v == "cut" || v == "none" {
+                Ok(())
+            } else {
+                Err(ConfigError::Validation(format!(
+                    "{key} {v:?} is not a transition (\"cut\", \"none\" or an ffmpeg xfade name such as \"fade\" or \"dissolve\")"
+                )))
+            }
+        };
+        transition("transition.default", &self.transition.default)?;
+        for (i, p) in self.transition.palette.iter().enumerate() {
+            transition(&format!("transition.palette[{i}]"), p)?;
+        }
         Ok(())
     }
 
@@ -1664,6 +1715,42 @@ stabilize = false
         assert!(toml::to_string(&cfg).is_err(), "TOML learned to hold u64s; this check can go");
         let e = cfg.validate().expect_err("a seed of 2^63").to_string();
         assert!(e.contains("project.seed") && e.contains(&MAX_SEED.to_string()), "{e}");
+    }
+
+    /// A colour or transition name lands in an ffmpeg filter graph, so one
+    /// carrying filter syntax (it printed a local file on the title card)
+    /// fails validation, naming the key.
+    #[test]
+    fn validate_refuses_filter_syntax_in_colours_and_transitions() {
+        let exploit = "white,drawtext=textfile=/etc/hostname:fontcolor=red";
+        let with = |extra: &str| -> Result<(), ConfigError> {
+            let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+            let card: TextCard = toml::from_str(extra).unwrap();
+            cfg.intro = Some(card);
+            cfg.validate()
+        };
+        let ok = "duration = \"2s\"\nbg_color = \"#000000\"\n[[layers]]\nkind = \"text\"\ncontent = \"Hi\"\ncolor = \"White\"\n";
+        with(ok).expect("a named colour is fine");
+        let e = with(&ok.replace("\"White\"", &format!("{exploit:?}"))).unwrap_err().to_string();
+        assert!(e.contains("intro.layers[0].color"), "{e}");
+        let e = with(&ok.replace("\"#000000\"", "\"black;[0:v]null\"")).unwrap_err().to_string();
+        assert!(e.contains("intro.bg_color"), "{e}");
+        let bg = format!("{ok}background = {{ color = {exploit:?} }}\n");
+        let e = with(&bg).unwrap_err().to_string();
+        assert!(e.contains("intro.layers[0].background.color"), "{e}");
+
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        cfg.transition.default = "fade:offset=0,drawtext=text=x".into();
+        let e = cfg.validate().unwrap_err().to_string();
+        assert!(e.contains("transition.default"), "{e}");
+        cfg.transition.default = "cut".into();
+        cfg.transition.palette = vec!["dissolve".into(), "nope".into()];
+        let e = cfg.validate().unwrap_err().to_string();
+        assert!(e.contains("transition.palette[1]"), "{e}");
+        cfg.transition.palette.pop();
+        cfg.validate().unwrap();
+        cfg.outputs[0].audio_bitrate = Some("192k -map 0".into());
+        assert!(cfg.validate().unwrap_err().to_string().contains("audio_bitrate"));
     }
 
     #[test]

@@ -308,6 +308,16 @@ pub fn resolve_output(o: &RenderOutput) -> Result<ResolvedOutput, String> {
         })?,
         None => spec.and_then(|s| s.max_bitrate),
     };
+    if let Some(b) = o.audio_bitrate.as_deref() {
+        if !is_bitrate_string(b) {
+            return Err(format!("audio_bitrate must look like \"192k\", got {b:?}"));
+        }
+    }
+    if let Some(p) = o.encoder_preset.as_deref() {
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(format!("encoder_preset must be a preset name such as \"p5\" or \"veryfast\", got {p:?}"));
+        }
+    }
     Ok(ResolvedOutput {
         path: o.path.clone(),
         preset,
@@ -332,6 +342,13 @@ pub fn parse_resolution(s: &str) -> Option<(u32, u32)> {
     let w: u32 = w.trim().parse().ok()?;
     let h: u32 = h.trim().parse().ok()?;
     (w > 0 && h > 0).then_some((w, h))
+}
+
+/// A bitrate as ffmpeg takes it: digits with an optional `k` / `M` suffix
+/// (`"192k"`, `"3M"`, `"128000"`).
+pub fn is_bitrate_string(s: &str) -> bool {
+    let digits = s.strip_suffix(['k', 'K', 'm', 'M']).unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `"3M"`, `"2500k"`, `"1.5M"`, `"128000"` → bits/s.
