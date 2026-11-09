@@ -648,9 +648,11 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
 
     // Apply [[selection.exclude]] entries by zeroing the
     // matching ranges in each source's score curve. Each entry matches
-    // chapter files by case-insensitive basename suffix, so a feedback
-    // action that wrote `file = "GH010320.MP4"` lines up with a source
-    // chapter whose absolute path is `E:/.../GH010320.MP4`. After this
+    // chapter files by `project_config::file_matches`: a bare
+    // `file = "GH010320.MP4"` lines up with a source chapter whose
+    // absolute path is `E:/.../GH010320.MP4`, and a path ending such as
+    // `camA/100GOPRO/GX010001.MP4` (what "Drop this moment" writes) only
+    // with that folder's file, not another camera's namesake. After this
     // step, `select_multi_source` naturally avoids excluded windows
     // because their score is 0.
     if !cfg.selection.exclude.is_empty() {
@@ -662,18 +664,10 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 tracing::warn!(file = %excl.file, "selection.exclude entry has end <= start; skipping");
                 continue;
             }
-            let filter_lc = excl.file.to_ascii_lowercase();
             for (src, curve) in sources.iter().zip(curves.iter_mut()) {
                 let mut chapter_offset = 0.0_f32;
                 for ch in &src.chapters {
-                    let basename = ch
-                        .path
-                        .file_name()
-                        .map(|n| n.to_ascii_lowercase())
-                        .unwrap_or_default();
-                    let matches =
-                        basename == filter_lc || basename.ends_with(&filter_lc);
-                    if matches {
+                    if crate::project_config::file_matches(&excl.file, &ch.path) {
                         curve.zero_range(chapter_offset + lo, chapter_offset + hi);
                         applied += 1;
                     }
@@ -786,26 +780,33 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     }
 
     // Inject `[[input.ranges]]` as mandatory picks. Each range identifies a
-    // file by its filename suffix; we resolve it to a source + chapter and
-    // create a Segment that bypasses scoring. Used for clips the picker would
-    // otherwise skip (e.g. phone videos with no GoPro telemetry).
+    // file by its filename suffix or a path ending
+    // (`project_config::file_matches`); we resolve it to a source + chapter
+    // and create a Segment that bypasses scoring. Used for clips the picker
+    // would otherwise skip (e.g. phone videos with no GoPro telemetry).
     let mut forced_added = 0usize;
     for r in &cfg.input.ranges {
         let needle = r.file.as_str();
-        let Some(matching) = sources.iter().find_map(|s| {
-            s.chapters.iter().find_map(|ch| {
-                let name = ch.path.file_name().unwrap_or("");
-                if name.eq_ignore_ascii_case(needle) || name.ends_with(needle) {
-                    Some((s, ch))
-                } else {
-                    None
-                }
-            })
-        }) else {
+        let matching: Vec<_> = sources
+            .iter()
+            .flat_map(|s| s.chapters.iter().map(move |ch| (s, ch)))
+            .filter(|(_, ch)| crate::project_config::file_matches(needle, &ch.path))
+            .collect();
+        let Some(&(src, ch)) = matching.first() else {
             tracing::warn!(file = needle, "input.ranges: no source matched; range skipped");
             continue;
         };
-        let (src, ch) = matching;
+        if matching.len() > 1 {
+            // Two cameras' GX010001.MP4: say which one, rather than
+            // silently taking whichever was found first.
+            tracing::warn!(
+                file = needle,
+                matches = matching.len(),
+                using = %ch.path,
+                "input.ranges: file matches more than one chapter; using the first — \
+                 write its path relative to [input].folder (e.g. camA/100GOPRO/GX010001.MP4) to choose"
+            );
+        }
         let start = r.start.as_secs_f64();
         let end = r.end.as_secs_f64();
         let dur = (end - start).max(0.0);
@@ -2319,17 +2320,13 @@ fn arrange_energy_arc(segs: &mut Vec<Segment>) {
     *segs = placed.into_iter().map(|s| s.expect("every position filled")).collect();
 }
 
-/// Produce a fresh `u64` seed from the system clock, mixed via SplitMix64
-/// so consecutive calls (which differ in nanos) yield well-distributed
-/// seeds rather than near-neighbour values. No `rand` crate dependency.
+/// Produce a fresh seed from the system clock, mixed via SplitMix64 so
+/// consecutive calls (which differ in nanos) yield well-distributed seeds
+/// rather than near-neighbour values. No `rand` crate dependency. Kept
+/// within 53 bits (`rng::MAX_FRESH_SEED`): `--print-effective-config` and
+/// a pasted-back `seed = N` need it to fit a TOML integer.
 fn generate_random_seed() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0xdeadbeef);
-    // Advance the nanos counter by the golden-ratio constant before mixing so
-    // consecutive nanosecond-apart calls produce well-distributed outputs.
-    crate::rng::splitmix64(nanos.wrapping_add(crate::rng::GOLDEN_RATIO_64))
+    crate::rng::clock_seed()
 }
 
 fn manifest_path_for(output: &Utf8Path) -> Utf8PathBuf {

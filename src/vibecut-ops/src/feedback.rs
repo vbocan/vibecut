@@ -25,7 +25,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use vibecut::project_config::{
@@ -523,13 +523,8 @@ fn apply_drop_segment(
             Some(hit) => hit?,
             None => drop_target_by_summed_durations(&manifest, at_seconds)?,
         };
-    let chapter_path = chapter_path.as_str();
     let segment_dur = source_secs;
-    let basename = std::path::Path::new(chapter_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(chapter_path)
-        .to_string();
+    let file = exclude_file_for(cfg, &chapter_path);
     // Pad the exclude window slightly so the picker can't snap right
     // back to the same neighbourhood — enough to skip past min_clip
     // worth of overlap. 0.5 s on each side is plenty.
@@ -538,7 +533,7 @@ fn apply_drop_segment(
     let hi = in_chapter_start + segment_dur + pad;
 
     cfg.selection.exclude.push(SelectionExclude {
-        file: basename.clone(),
+        file: file.clone(),
         start: Duration::from_secs_f32(lo),
         end: Duration::from_secs_f32(hi),
     });
@@ -546,13 +541,36 @@ fn apply_drop_segment(
     Ok(vec![
         ChangeNote {
             field: "selection.exclude".into(),
-            before: format!("(no exclude entries for {basename})"),
+            before: format!("(no exclude entries for {file})"),
             after: format!(
                 "added: file={:?} start={:.2}s end={:.2}s (segment #{} at output_t={:.2}s)",
-                basename, lo, hi, seg_index, at_seconds
+                file, lo, hi, seg_index, at_seconds
             ),
         },
     ])
+}
+
+/// What a drop's `[[selection.exclude]]` names the chapter by, so it
+/// matches that file and no other (`vibecut::project_config::file_matches`):
+///
+/// - a `[[input.videos]]` entry: its path as written there;
+/// - a file under `[input].folder`: its path relative to the folder
+///   (`camA/100GOPRO/GX010001.MP4`). Two cameras' cards both hold a
+///   `GX010001.MP4`; the bare name would drop the same seconds from both.
+///   Straight in the folder that is just the file name, as before;
+/// - anything else: the file name.
+fn exclude_file_for(cfg: &Config, chapter_path: &str) -> String {
+    let path = Utf8Path::new(chapter_path);
+    if let Some(v) = cfg.input.videos.iter().find(|v| v.path.as_path() == path) {
+        return v.path.as_str().replace('\\', "/");
+    }
+    if let Some(rel) = cfg.input.folder.as_deref().and_then(|f| path.strip_prefix(f).ok()) {
+        let parts: Vec<&str> = rel.components().map(|c| c.as_str()).collect();
+        if !parts.is_empty() {
+            return parts.join("/");
+        }
+    }
+    path.file_name().unwrap_or(chapter_path).to_string()
 }
 
 /// The source window that played at an output time.
@@ -719,21 +737,12 @@ fn fmt_duration(d: Duration) -> String {
     format!("{}h", hours)
 }
 
-/// SplitMix64 mix of the system clock — same shape as the seed
-/// generator used inside the vibecut binary. We keep our own copy
-/// rather than expose theirs because the contract is stable (it just
-/// has to be deterministic + reasonably uniform).
+/// The same clock seed `vibecut run --random-seed` uses: SplitMix64 of
+/// the system clock, kept within 53 bits. A full-range `u64` can't be
+/// written back — TOML integers are signed 64-bit — so a Shuffle used to
+/// fail to save about half the time.
 fn generate_random_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0xa1b2c3d4_e5f60718);
-    let mut x = nanos;
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^= x >> 31;
-    x
+    vibecut::rng::clock_seed()
 }
 
 // ---------- file-level orchestration ----------
@@ -1227,6 +1236,41 @@ stabilize = false
         assert_ne!(cfg1.project.seed, cfg2.project.seed);
     }
 
+    /// Shuffle used to fail with "could not serialise mutated config:
+    /// out-of-range value for u64 type" whenever the fresh seed was 2^63
+    /// or more (TOML integers are i64) — about every other press. Every
+    /// reroll must now save, and read back as the same seed.
+    #[test]
+    fn every_reroll_seed_can_be_saved_and_read_back() {
+        let mut cfg = base_config();
+        for i in 0..300 {
+            apply(&mut cfg, &FeedbackAction::Reroll).unwrap();
+            let seed = cfg.project.seed.unwrap();
+            assert!(seed <= vibecut::rng::MAX_FRESH_SEED, "reroll {i}: seed {seed} won't fit");
+            let text = toml::to_string_pretty(&cfg)
+                .unwrap_or_else(|e| panic!("reroll {i}: seed {seed} doesn't serialise: {e}"));
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!(back.project.seed, Some(seed));
+        }
+    }
+
+    /// The same through the file op the web route and MCP tool call.
+    #[tokio::test]
+    async fn rerolls_through_the_file_op_always_save() {
+        let dir = std::env::temp_dir().join(format!("sv_reroll_file_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.toml");
+        std::fs::write(&path, toml::to_string_pretty(&base_config()).unwrap()).unwrap();
+        let p = path.to_string_lossy().into_owned();
+        for i in 0..50 {
+            let r = apply_feedback_to_file(&p, &FeedbackAction::Reroll).await;
+            let r = r.unwrap_or_else(|e| panic!("reroll {i} failed: {e}"));
+            let saved = Config::load(camino::Utf8Path::from_path(&path).unwrap()).unwrap();
+            assert_eq!(saved.project.seed.map(|s| s.to_string()), Some(r.changes[0].after.clone()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// After any mutation, the resulting Config should still pass
     /// `validate()` — i.e. we never produce a Config that vibecut
     /// would reject. (DropSegment is excluded here because it requires
@@ -1390,11 +1434,14 @@ stabilize = false
     }
 
     fn drop_at(manifest: &serde_json::Value, name: &str, t: f32) -> Result<Config> {
+        drop_at_with(base_config(), manifest, name, t)
+    }
+
+    fn drop_at_with(mut cfg: Config, manifest: &serde_json::Value, name: &str, t: f32) -> Result<Config> {
         let dir = std::env::temp_dir().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let manifest_path = dir.join("manifest.json");
         std::fs::write(&manifest_path, serde_json::to_string(manifest).unwrap()).unwrap();
-        let mut cfg = base_config();
         let r = apply(
             &mut cfg,
             &FeedbackAction::DropSegment {
@@ -1405,6 +1452,51 @@ stabilize = false
         let _ = std::fs::remove_file(&manifest_path);
         let _ = std::fs::remove_dir(&dir);
         r.map(|_| cfg)
+    }
+
+    /// Two GoPros on one trip: both cards hold `100GOPRO/GX010001.MP4`,
+    /// kept apart by folder (`cama-gx010001`, `camb-gx010001`). Dropping
+    /// a moment of camera A must name camera A's file only — the bare
+    /// name dropped the same seconds from camera B's footage too.
+    #[test]
+    fn drop_segment_names_one_camera_of_two_same_named_files() {
+        let clip = |path: &str| {
+            serde_json::json!({
+                "segment_index": 0, "source_id": "cama-gx010001", "source_path": path,
+                "source_in_secs": 14.886, "source_out_secs": 16.686, "speed": 1.0,
+                "start_frame": 0, "end_frame": 54,
+                "output_start_secs": 14.0, "output_end_secs": 15.8,
+                "cut_in_secs": 14.0, "cut_out_secs": 15.8,
+                "transition_in_secs": 0.0, "transition_out_secs": 0.0 })
+        };
+        let manifest = |path: &str| {
+            serde_json::json!({
+                "segments": [],
+                "timeline": { "fps": 30, "frames": 474, "duration_secs": 15.8, "clips": [clip(path)] },
+            })
+        };
+        let a = "/footage/trip/camA/100GOPRO/GX010001.MP4";
+        let b = Utf8Path::new("/footage/trip/camB/100GOPRO/GX010001.MP4");
+        let mut cfg = base_config();
+        cfg.input.folder = Some("/footage/trip".into());
+        let cfg = drop_at_with(cfg, &manifest(a), "sv_drop_two_cameras", 15.0).unwrap();
+        let added = cfg.selection.exclude.last().unwrap();
+        assert_eq!(added.file, "camA/100GOPRO/GX010001.MP4");
+        assert!(vibecut::project_config::file_matches(&added.file, Utf8Path::new(a)));
+        assert!(!vibecut::project_config::file_matches(&added.file, b), "camera B's file is dropped too");
+        let saved: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(saved.selection.exclude.last().unwrap().file, added.file);
+
+        // A file straight in the folder keeps the plain name; one listed
+        // in [[input.videos]] keeps the path written there.
+        let mut cfg = base_config();
+        cfg.input.folder = Some("/footage/trip".into());
+        let cfg = drop_at_with(cfg, &manifest("/footage/trip/GX010001.MP4"), "sv_drop_flat", 15.0).unwrap();
+        assert_eq!(cfg.selection.exclude.last().unwrap().file, "GX010001.MP4");
+        let mut cfg = base_config();
+        cfg.input.videos = vec![vibecut::project_config::ExplicitVideo { path: "/phone/DCIM/VID_1.mp4".into() }];
+        let cfg = drop_at_with(cfg, &manifest("/phone/DCIM/VID_1.mp4"), "sv_drop_listed", 15.0).unwrap();
+        assert_eq!(cfg.selection.exclude.last().unwrap().file, "/phone/DCIM/VID_1.mp4");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
+	import { onDestroy, tick } from 'svelte';
 	import { appState as s } from '$lib/state.svelte';
 	import { musicFileUrl, type Track } from '$lib/api';
 	import { clock } from '$lib/vibes';
@@ -91,6 +91,22 @@
 		setBeat(null);
 	}
 
+	// "Look again" on the empty library: the list may replace the button
+	// it was pressed on, so the focus moves to the song that is picked and
+	// the outcome is read from this component's own status line.
+	let lookNote = $state('');
+	async function lookAgain() {
+		if (s.loadingMusic) return;
+		lookNote = 'Looking for songs…';
+		await s.loadMusic();
+		const n = s.tracks.length;
+		lookNote = `${n === 0 ? 'No songs' : n === 1 ? '1 song' : `${n} songs`} in your library.`;
+		if (n > 0) {
+			await tick();
+			list?.querySelector<HTMLElement>('[role="radio"][aria-checked="true"]')?.focus();
+		}
+	}
+
 	onDestroy(() => {
 		audio?.pause();
 		audio = undefined;
@@ -106,7 +122,9 @@
 		</div>
 	{/if}
 
-	{#if s.loadingMusic && s.tracks.length === 0}
+	<!-- Placeholders for the first read only: a later "Look again" keeps
+	     what is on screen (and the focus on it) while it looks. -->
+	{#if s.loadingMusic && !s.musicLoaded && s.tracks.length === 0}
 		<div class="list">
 			{#each [0, 1, 2] as i (i)}<div class="row skeleton"></div>{/each}
 		</div>
@@ -117,9 +135,11 @@
 				>Put MP3, WAV or M4A files in the <code>projects/music</code> folder — Vibecut works out their
 				tempo, beats and energy automatically. Without a song, videos keep their own sound.</span
 			>
-			<button class="btn" type="button" onclick={() => s.loadMusic()}>Look again</button>
+			<!-- aria-disabled keeps the focus on the button while it looks. -->
+			<button class="btn" type="button" aria-disabled={s.loadingMusic} onclick={lookAgain}
+				>{s.loadingMusic ? 'Looking…' : 'Look again'}</button
+			>
 		</div>
-		<MusicImport />
 	{:else}
 		<div class="moods" role="radiogroup" aria-label="Filter by mood" use:radiogroup>
 			{#each MOODS as m (m.key)}
@@ -227,8 +247,11 @@
 				</li>
 			{/each}
 		</ul>
-		<MusicImport />
 	{/if}
+	<p class="sr-only" role="status">{lookNote}</p>
+	<!-- One import view for every state of the list, so the panel the user
+	     opened (and the focus in it) stays put while the library reloads. -->
+	<MusicImport />
 </section>
 
 <style>

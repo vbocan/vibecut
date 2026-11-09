@@ -2,73 +2,102 @@
 	import { onDestroy } from 'svelte';
 	import { appState as s } from '$lib/state.svelte';
 
+	// Both toasts count down while nobody is on them, and wait while one
+	// has the pointer or the keyboard focus (WCAG 2.2.1); the countdown
+	// starts over when both leave. A toast that goes away under the
+	// keyboard focus (Undo, Dismiss) hands it back to where it came from
+	// instead of dropping it on the page.
+	function countdown(ms: number, current: () => unknown, expire: (item: unknown) => void) {
+		const held = { focus: false, pointer: false };
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		let returnTo: HTMLElement | null = null;
+		function arm() {
+			const item = current();
+			if (timer) clearTimeout(timer);
+			timer = null;
+			if (!item || held.focus || held.pointer) return;
+			timer = setTimeout(() => {
+				if (current() === item) expire(item);
+			}, ms);
+		}
+		function hold(kind: keyof typeof held, on: boolean) {
+			held[kind] = on;
+			arm();
+		}
+		return {
+			arm,
+			/** A new item: nobody is on it yet. */
+			restart() {
+				held.focus = held.pointer = false;
+				arm();
+			},
+			focusin(e: FocusEvent & { currentTarget: HTMLElement }) {
+				const from = e.relatedTarget as HTMLElement | null;
+				if (!e.currentTarget.contains(from)) returnTo = from;
+				hold('focus', true);
+			},
+			focusout(e: FocusEvent & { currentTarget: HTMLElement }) {
+				if (!e.currentTarget.contains(e.relatedTarget as Node | null)) hold('focus', false);
+			},
+			enter: () => hold('pointer', true),
+			leave: () => hold('pointer', false),
+			/** The toast is about to go: give the focus back first. */
+			close(toast: HTMLElement | null) {
+				if (toast?.contains(document.activeElement) && returnTo?.isConnected) returnTo.focus();
+				held.focus = held.pointer = false;
+				returnTo = null;
+			},
+			stop() {
+				if (timer) clearTimeout(timer);
+			}
+		};
+	}
+
 	// Shown once the re-render for the last change has finished; one Undo
 	// restores the settings and the previous version instantly.
 	let shownFor = $state<object | null>(null);
-	let timer: ReturnType<typeof setTimeout> | null = null;
-
-	const visible = $derived(
-		!!s.undo && s.renderMode === 'done' && shownFor === s.undo
+	const visible = $derived(!!s.undo && s.renderMode === 'done' && shownFor === s.undo);
+	const undoClock = countdown(
+		12000,
+		() => s.undo,
+		(u) => {
+			if (s.undo === u) s.undo = null;
+		}
 	);
-
 	$effect(() => {
 		const u = s.undo;
 		if (u && s.renderMode === 'done' && shownFor !== u) {
 			shownFor = u;
-			held.focus = held.pointer = false;
-			arm();
+			undoClock.restart();
 		}
 	});
 
-	// Short notices (a stopped render) fade on their own after a few seconds.
-	let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+	// Short notices (a stopped render) fade on their own after a few
+	// seconds — unless someone is reading them.
+	let noticeEl: HTMLDivElement | undefined = $state();
+	const noticeClock = countdown(
+		5000,
+		() => s.notice,
+		(n) => {
+			if (s.notice !== n) return;
+			noticeClock.close(noticeEl ?? null);
+			s.notice = null;
+		}
+	);
+	let noticeFor: object | null = null;
 	$effect(() => {
 		const n = s.notice;
-		if (noticeTimer) clearTimeout(noticeTimer);
-		if (n) {
-			noticeTimer = setTimeout(() => {
-				if (s.notice === n) s.notice = null;
-			}, 5000);
-		}
+		if (n === noticeFor) return;
+		// A notice replacing one that is being read keeps it held.
+		if (n && noticeFor) noticeClock.arm();
+		else if (n) noticeClock.restart();
+		else noticeClock.stop();
+		noticeFor = n;
 	});
 
-	// The countdown waits while the toast has the pointer or keyboard
-	// focus (WCAG 2.2.1), and starts over when both leave.
-	const held = { focus: false, pointer: false };
-	function arm() {
-		const u = s.undo;
-		if (timer) clearTimeout(timer);
-		timer = null;
-		if (!u || held.focus || held.pointer) return;
-		timer = setTimeout(() => {
-			if (s.undo === u) s.undo = null;
-		}, 12000);
-	}
-	function hold(kind: keyof typeof held, on: boolean) {
-		held[kind] = on;
-		arm();
-	}
-
-	// Undo / Dismiss remove the toast under the keyboard focus: hand it
-	// back to where it came from instead of dropping it on the page.
-	let returnTo: HTMLElement | null = null;
-	function onFocusIn(e: FocusEvent & { currentTarget: HTMLElement }) {
-		const from = e.relatedTarget as HTMLElement | null;
-		if (!e.currentTarget.contains(from)) returnTo = from;
-		hold('focus', true);
-	}
-	function onFocusOut(e: FocusEvent & { currentTarget: HTMLElement }) {
-		if (!e.currentTarget.contains(e.relatedTarget as Node | null)) hold('focus', false);
-	}
-	function leave(toast: HTMLElement | null) {
-		if (toast?.contains(document.activeElement) && returnTo?.isConnected) returnTo.focus();
-		held.focus = held.pointer = false;
-		returnTo = null;
-	}
-
 	onDestroy(() => {
-		if (timer) clearTimeout(timer);
-		if (noticeTimer) clearTimeout(noticeTimer);
+		undoClock.stop();
+		noticeClock.stop();
 	});
 </script>
 
@@ -78,10 +107,27 @@
 <p class="sr-only" role="status">{visible && s.undo ? `${s.undo.label}. You can undo this.` : ''}</p>
 <div class="toasts">
 	{#if s.notice}
-		<div class="toast notice" role="group" aria-label="Notice">
+		<div
+			class="toast notice"
+			role="group"
+			aria-label="Notice"
+			bind:this={noticeEl}
+			onfocusin={noticeClock.focusin}
+			onfocusout={noticeClock.focusout}
+			onmouseenter={noticeClock.enter}
+			onmouseleave={noticeClock.leave}
+		>
 			<span class="dot info" aria-hidden="true"></span>
 			<span class="msg">{s.notice.text}</span>
-			<button class="x" type="button" aria-label="Dismiss notice" onclick={() => (s.notice = null)}>✕</button>
+			<button
+				class="x"
+				type="button"
+				aria-label="Dismiss notice"
+				onclick={(e) => {
+					noticeClock.close(e.currentTarget.parentElement);
+					s.notice = null;
+				}}>✕</button
+			>
 		</div>
 	{/if}
 	{#if visible && s.undo}
@@ -89,10 +135,10 @@
 			class="toast"
 			role="group"
 			aria-label="Last change"
-			onfocusin={onFocusIn}
-			onfocusout={onFocusOut}
-			onmouseenter={() => hold('pointer', true)}
-			onmouseleave={() => hold('pointer', false)}
+			onfocusin={undoClock.focusin}
+			onfocusout={undoClock.focusout}
+			onmouseenter={undoClock.enter}
+			onmouseleave={undoClock.leave}
 		>
 			<span class="dot" aria-hidden="true"></span>
 			<span class="msg">{s.undo.label}</span>
@@ -100,7 +146,7 @@
 				class="undo"
 				type="button"
 				onclick={(e) => {
-					leave(e.currentTarget.parentElement);
+					undoClock.close(e.currentTarget.parentElement);
 					void s.undoLast();
 				}}>Undo</button
 			>
@@ -109,7 +155,7 @@
 				type="button"
 				aria-label="Dismiss"
 				onclick={(e) => {
-					leave(e.currentTarget.parentElement);
+					undoClock.close(e.currentTarget.parentElement);
 					s.undo = null;
 				}}>✕</button
 			>

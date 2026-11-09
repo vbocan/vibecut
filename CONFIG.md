@@ -87,7 +87,7 @@ include = ["**/*.MP4", "**/*.mp4"]         # glob patterns (default shown)
 # Optional: hard-coded "must include this exact range" overrides the picker
 # for one or more sources. Time strings accept any humantime form.
 [[input.ranges]]
-file  = "GX010023.MP4"                     # match by filename suffix
+file  = "GX010023.MP4"                     # filename (suffix) or path ending; see [selection]
 start = "1m12s"
 end   = "1m30s"
 ```
@@ -141,11 +141,16 @@ settings, so adding a 1080p alongside a 4K render only adds a fast resize
 pass. An output whose aspect differs from the body's (a 9:16 Reel next to
 a 16:9 master) is reframed in that same pass; see `fit` below.
 
-Each `path` is written as `<name>.partial.<ext>` next to it while the render
-runs and only renamed into place once the whole render has succeeded, so a
-failed or stopped render (the web UI's **Stop**, `POST /api/jobs/{id}/cancel`,
-the MCP `cancel_render` tool) leaves the previous video and its manifest
-exactly as they were.
+Each `path` is written as `<name>.partial-<pid>-<n>.<ext>` next to it while
+the render runs and only renamed into place once the whole render has
+succeeded, so a failed or stopped render (the web UI's **Stop**,
+`POST /api/jobs/{id}/cancel`, the MCP `cancel_render` tool) leaves the
+previous video and its manifest exactly as they were. The staging name is
+the writer's own, so a render and a `reformat` that write the same file at
+once (see below) don't touch each other's partial file; a partial file left
+by a process that died is removed by the next writer. Every committed file
+is dated by the moment it lands, which is what makes a reformat's "is the
+version newer than the render?" check hold.
 
 ```toml
 [[outputs]]
@@ -239,8 +244,13 @@ Given a version instead (`out/edit.square.mp4`), it works from the render
 next to it (`out/edit.mp4`), so a vertical version of the square one is
 still one reframe of the master; if the render is gone, the result keeps
 the version's whole name (`out/edit.square.reels.mp4`). Like the render's
-outputs, the version is written as `out/edit.reels.partial.mp4` and renamed
-into place only when the pass has finished. In the web UI each version is
+outputs, the version is written under a staging name
+(`out/edit.reels.partial-<pid>-<n>.mp4`) and renamed into place only when
+the pass has finished — and only if the render it read is still the one
+there: a render that landed meanwhile (say one with `out/edit.reels.mp4`
+as an extra output) means the pass runs again over the new cut. A version
+counts as up to date (and is reused) while it is at least as new as its
+render. In the web UI each version is
 a job of kind `reformat` in the same queue as renders (`GET /api/jobs`,
 the Renders list), stopped the same way (`POST /api/jobs/{id}/cancel`,
 which keeps the last good version); asking again for a version that is
@@ -559,7 +569,7 @@ source_id = "0320"                       # GoPro source id (trailing digits of t
 weight    = 0.5                          # × the source's score curve; 1.0 = unchanged, clamped to [0, 10]
 
 [[selection.exclude]]
-file  = "GX010320.MP4"                   # chapter file name (or suffix)
+file  = "GX010320.MP4"                   # chapter file name (or suffix), or a path ending
 start = "12s"                            # chapter-local range the picker must avoid
 end   = "17s"
 ```
@@ -569,6 +579,17 @@ can). "Less of this clip" halves the
 weight (down to 0.125, never 0 — the source still appears, just less) and
 "more of" doubles it (up to 8), so one undoes the other. "Drop this
 moment" adds an `exclude` for the footage that played there.
+
+The `file` of an exclude or an `[[input.ranges]]` entry is compared
+ignoring letter case. A bare name (`GX010320.MP4`, or a suffix such as
+`0320.MP4`) matches that file in any folder; a path
+(`camA/100GOPRO/GX010001.MP4`, `/` or `\`) matches only the files whose
+path ends with those whole folders and name. Two cameras' cards both hold a
+`100GOPRO/GX010001.MP4`, so "Drop this moment" writes the file's path
+relative to `[input].folder` (just the name for a file straight in the
+folder, the path as written for an `[[input.videos]]` entry): it drops the
+seconds from that camera's footage only. A range whose bare name matches
+more than one file uses the first and logs a warning.
 
 Source ids in `source_weights`, `[[multi_angle.groups]]` (`master`,
 `members`, `offsets` keys) and the "more of / less of clip …" feedback
@@ -913,7 +934,9 @@ or building tooling on top of it:
   produces the same picks, the same segment order, the same ramped
   transitions, and the same beat-burst placement. Pass `--random-seed`
   on the CLI to override the seed with a fresh one per render (the chosen
-  seed is logged so you can lock it in later).
+  seed is logged so you can lock it in later). Fresh seeds — this flag and
+  the Shuffle feedback — stay below 2^53, so they fit a TOML integer and a
+  JavaScript number; a hand-written `seed` can be any value up to 2^63 − 1.
 - **Cache fingerprinting.** Each rendered segment's filename includes a
   blake3 hash of `(source_path, in-chapter start, duration, width,
   height, fps, crf, lut, stabilize, speed-ramp params)`, plus the colour

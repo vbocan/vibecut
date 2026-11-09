@@ -53,9 +53,53 @@ pub fn jitter_f32(seed: u64, idx: usize) -> f32 {
     coin_f32(seed, idx) * 2.0 - 1.0
 }
 
+/// The largest seed a fresh one ([`clock_seed`]) can be: 2^53 − 1.
+///
+/// A seed has to survive being written back as `seed = N` — TOML integers
+/// are signed 64-bit, so a full-range `u64` fails to serialise about half
+/// the time — and the browser, which reads the config as JSON into an
+/// `f64` that holds integers exactly only up to here
+/// (`Number.MAX_SAFE_INTEGER`).
+pub const MAX_FRESH_SEED: u64 = (1 << 53) - 1;
+
+/// A fresh seed from a clock reading in nanoseconds: SplitMix64 over the
+/// golden-ratio-advanced counter (so readings a nanosecond apart give
+/// unrelated seeds), kept to its top 53 bits — see [`MAX_FRESH_SEED`].
+#[inline]
+pub fn seed_from_nanos(nanos: u64) -> u64 {
+    splitmix64(nanos.wrapping_add(GOLDEN_RATIO_64)) >> 11
+}
+
+/// A fresh seed from the system clock (`--random-seed`, the Shuffle
+/// feedback). Always `<= MAX_FRESH_SEED`, so it can be written to a
+/// config file and pasted back as `seed = N`.
+pub fn clock_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xdeadbeef);
+    seed_from_nanos(nanos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_seeds_fit_a_toml_integer_and_a_js_number() {
+        // The full-range SplitMix64 output these replaced is >= 2^63 about
+        // half the time; a thousand readings would have hit one.
+        let mut high = 0u64;
+        for i in 0..1000u64 {
+            let s = seed_from_nanos(1_700_000_000_000_000_000 + i * 997);
+            assert!(s <= MAX_FRESH_SEED, "seed {s} is past 2^53 - 1");
+            high = high.max(s);
+        }
+        // Still spread over the range, not stuck low.
+        assert!(high > MAX_FRESH_SEED / 2, "seeds don't use the range ({high})");
+        assert!(clock_seed() <= MAX_FRESH_SEED);
+        assert!(MAX_FRESH_SEED <= i64::MAX as u64);
+    }
 
     #[test]
     fn coin_f32_is_in_range() {

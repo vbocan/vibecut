@@ -87,7 +87,12 @@ pub fn prepare(output_path: &str, preset: &str, fit: Option<&str>) -> Result<Ref
     Ok(ReformatTarget { source, target, preset, fit })
 }
 
-/// The target exists and is at least as new as the source.
+/// The target exists and is at least as new as the source. Both are dated
+/// by when they were committed (`vibecut::staging` stamps the commit
+/// time), so a version made from the previous render is older than the
+/// render that replaced it even if its pass finished before that render's
+/// encode did; and `reformat_video` never commits a pass whose source was
+/// replaced under it.
 fn is_fresh(source: &Path, target: &Path) -> bool {
     let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     match (mtime(source), mtime(target)) {
@@ -436,7 +441,7 @@ mod tests {
         let st = wait_finished(&jobs, &a.job_id).await;
         assert!(matches!(st, JobState::Cancelled { started_at: Some(_), .. }), "{st:?}");
         assert_eq!(std::fs::read(&target).unwrap(), b"the last good version");
-        assert!(!vibecut::staging::staging_path(Utf8Path::from_path(&target).unwrap()).exists());
+        assert!(vibecut::staging::staged_files(Utf8Path::from_path(&target).unwrap()).is_empty());
         // A finished reformat job carries the version it made.
         let c = submit_async(&jobs, &src, "whatsapp", None).await.unwrap();
         assert!(!c.reused);
