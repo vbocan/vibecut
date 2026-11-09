@@ -236,6 +236,16 @@ mod cancel_tests {
         }
     }
 
+    /// Detection runs at the start of every render (several ffmpeg runs
+    /// and encoder smoke tests): a Stop must not wait for it to finish.
+    #[test]
+    fn hardware_detection_obeys_a_stop() {
+        let token = CancelToken::new();
+        token.cancel();
+        let r = crate::progress::with_sink_and_cancel(|_| {}, token, || HwSupport::detect("ffmpeg"));
+        assert!(is_cancelled(&r.expect_err("detection ran its ffmpeg probes after a Stop")));
+    }
+
     #[test]
     fn stabilize_detect_never_leaves_a_partial_trf() {
         let d = tmp("trf");
@@ -336,9 +346,11 @@ impl HwSupport {
 }
 
 fn capture(binary: &str, args: &[&str]) -> Result<String> {
+    // Runs at the start of every render: a Stop must not wait for it.
+    use crate::cancel::CancellableCommand as _;
     let out = std::process::Command::new(binary)
         .args(args)
-        .output()
+        .cancellable_output()
         .with_context(|| format!("spawning {binary}"))?;
     if !out.status.success() {
         anyhow::bail!(
@@ -359,6 +371,10 @@ fn capture(binary: &str, args: &[&str]) -> Result<String> {
 ///
 /// Returns `true` if the encoder is genuinely usable, `false` otherwise.
 fn probe_encoder(binary: &str, encoder: &str) -> bool {
+    // Cancellable (a stuck driver can hold it for seconds). A killed probe
+    // reads as "unusable", but the pipeline's check right after detection
+    // stops the render before that answer is used.
+    use crate::cancel::CancellableCommand as _;
     let result = std::process::Command::new(binary)
         .args([
             "-v", "error",
@@ -369,7 +385,7 @@ fn probe_encoder(binary: &str, encoder: &str) -> bool {
             "-f", "null",
             "-",
         ])
-        .output();
+        .cancellable_output();
     match result {
         Ok(o) => {
             if !o.status.success() {

@@ -59,7 +59,12 @@
 
 	function choose(path: string | null) {
 		if (inStudio) {
-			if (s.rendering) return;
+			if (s.rendering) {
+				// Mid-render: offer to stop it and switch songs instead.
+				const title = s.tracks.find((t) => t.path === path)?.title ?? 'Vibecut’s pick';
+				s.requestChange(`Song: ${title}`, () => choose(path));
+				return;
+			}
 			const target = path ?? s.autoTrackFor(s.effectiveVibe)?.path ?? null;
 			if (target && target !== s.effectiveTrack?.path) {
 				void s.changeSong(target).then(() => {

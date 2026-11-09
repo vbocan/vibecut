@@ -8,9 +8,11 @@
 //! - every ffmpeg / ffprobe run through [`CancellableCommand`] or
 //!   [`wait_child`] kills its child process (polling `try_wait` with a
 //!   short back-off) and returns [`Cancelled`];
-//! - explicit [`check`] points in the pipeline stop it where an ffmpeg
-//!   failure would otherwise be swallowed, and before the outputs are
-//!   committed (see [`crate::staging`]);
+//! - every progress report on the pipeline thread is a cancel point
+//!   ([`crate::progress::checkpoint`]), and explicit [`check`] points stop
+//!   it where no report is made (after hardware detection, per probed
+//!   file), where an ffmpeg failure would otherwise be swallowed, and
+//!   before the outputs are committed (see [`crate::staging`]);
 //! - progress reports stop reaching the sink, so the bar freezes.
 //!
 //! A cancelled render returns an error whose chain contains
@@ -288,13 +290,18 @@ mod tests {
             Command::new("ffmpeg")
                 .args([
                     "-v", "error", "-nostdin",
+                    // `-re`: read at real time, so this runs for the full
+                    // 600 s unless it's killed — however fast the CPU.
+                    "-re",
                     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
                     "-t", "600",
                     "-f", "s16le", "-",
                 ])
                 .cancellable_output()
         });
-        assert!(is_cancelled(&r.unwrap_err()));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let err = r.expect_err("the child finished on its own instead of being killed");
+        assert!(is_cancelled(&err));
+        // Far below the child's natural 600 s: it was killed, not awaited.
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
     }
 }

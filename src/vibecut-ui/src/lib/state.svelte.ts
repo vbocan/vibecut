@@ -204,14 +204,26 @@ class AppState {
 		// Start the song now, inside the tap (autoplay rules), so the wait
 		// has the music in it; the finished reel takes over when it's ready.
 		if (opts.bed !== false) this.startBed(this.effectiveTrack);
+		// A Stop before the render starts (or a newer run) bumps `makeRun`:
+		// this run then quits at its next step instead of rendering.
+		const run = ++this.makeRun;
+		const live = () => run === this.makeRun;
+		// A stopped run may still be waiting on the server: let its request
+		// land first, so it can't overwrite this run's proposal.
+		await this.makeInFlight;
+		if (!live()) return;
+		let landed!: () => void;
+		this.makeInFlight = new Promise<void>((r) => (landed = () => r()));
 		try {
 			if (!this.discoverResult || this.discoveredFolder !== this.folder) {
 				this.makeStep = 'scanning';
 				await this.discover();
+				if (!live()) return;
 				if (this.discoverError) throw new Error(this.discoverError);
 			}
 			this.makeStep = 'planning';
 			await this.propose();
+			if (!live()) return;
 			if (this.proposeError) throw new Error(this.proposeError);
 			const track = this.effectiveTrack;
 			if (track && this.proposeResult) {
@@ -220,14 +232,34 @@ class AppState {
 					kind: 'different_music',
 					path: track.path
 				});
+				if (!live()) return;
 				await this.refreshConfig();
+				if (!live()) return;
 			}
 			this.startRenderAsync();
 		} catch (e) {
+			if (!live()) return;
 			this.makeStep = 'failed';
 			this.stopBed();
 			this.makeError = e instanceof api.ApiError ? e.describe() : e instanceof Error ? e.message : String(e);
+		} finally {
+			landed();
 		}
+	}
+
+	/** Bumped to abandon the `makeVideo` run in flight (see `stopRender`). */
+	private makeRun = 0;
+	/** Settles once the latest `makeVideo` run's server calls are done. */
+	private makeInFlight: Promise<void> | null = null;
+
+	/** Reading clips / planning / matching the music: before the first
+	 *  render of a project, when there is no server job to stop yet. */
+	get preparing(): boolean {
+		return (
+			!this.rendering &&
+			this.renderHistory.length === 0 &&
+			(this.makeStep === 'scanning' || this.makeStep === 'planning' || this.makeStep === 'scoring')
+		);
 	}
 
 	// ---------- Build bed: the song under the wait ----------
@@ -337,8 +369,9 @@ class AppState {
 
 	/** Snapshot the project, run `change`, re-render, and offer Undo.
 	 *  Undo is instant: the earlier version's file still exists, so it
-	 *  only restores the settings and shows that version again. */
-	async withUndo(label: string, change: () => Promise<void>, opts: { render?: boolean } = {}) {
+	 *  only restores the settings and shows that version again.
+	 *  `change` may resolve `false`: nothing was changed, so no render. */
+	async withUndo(label: string, change: () => Promise<void | boolean>, opts: { render?: boolean } = {}) {
 		// Never change the project mid-render: the change would be written
 		// but the render guard would refuse to render it.
 		if (opts.render !== false && this.rendering) return;
@@ -355,8 +388,8 @@ class AppState {
 					versionIndex
 				}
 			: null;
-		await change();
-		if (this.configError || this.makeError) return;
+		const changed = await change();
+		if (changed === false || this.configError || this.makeError) return;
 		if (opts.render !== false) void this.startRenderAsync();
 		this.undo = snapshot && snapshot.versionIndex >= 0 ? snapshot : null;
 		// The render just started is this change's: a Stop undoes it.
@@ -710,7 +743,19 @@ class AppState {
 	 * `quiet`: no toast — for "Stop and apply this instead".
 	 */
 	async stopRender(opts: { quiet?: boolean } = {}): Promise<boolean> {
-		if (!this.rendering || this.stopping) return false;
+		if (this.stopping) return false;
+		if (!this.rendering) {
+			// Still reading the clips or planning: no server job yet, so
+			// drop the remaining steps and go back to Create.
+			if (!this.preparing) return false;
+			this.makeRun++;
+			this.makeStep = 'idle';
+			this.stopBed();
+			this.autoplayReveal = false;
+			this.pendingChange = null;
+			if (!opts.quiet) this.showNotice('Render stopped');
+			return true;
+		}
 		this.stopping = true;
 		try {
 			const jobId = this.jobId ?? (await this.jobIdReady);
@@ -767,9 +812,44 @@ class AppState {
 		}
 		this.persist();
 		if (!quiet) {
+			// A plain Stop: the user chose not to apply a pending request.
+			this.pendingChange = null;
 			const label = back === null ? null : this.renderHistory[back]?.label;
 			this.showNotice(label ? `Render stopped — back to ${label}` : 'Render stopped');
 		}
+	}
+
+	// ---------- Stop and apply this instead ----------
+	/** A change asked for while a render runs, waiting on "Stop and apply
+	 *  this instead". `from`: the control showing the offer — the command
+	 *  bar shows its own; the tweak panel shows the rest (tweak buttons,
+	 *  keyboard shortcuts, song picks). */
+	pendingChange = $state.raw<{ label: string; from: 'tweaks' | 'command'; run: () => unknown } | null>(null);
+
+	/** Run a change now, or — mid-render — offer to stop the render and
+	 *  run it instead. */
+	requestChange(label: string, run: () => unknown, from: 'tweaks' | 'command' = 'tweaks') {
+		if (this.stopping) return;
+		if (this.rendering) {
+			this.pendingChange = { label, from, run };
+			return;
+		}
+		this.pendingChange = null;
+		void run();
+	}
+
+	/** The offer's button: stop the render if it's still going (its own
+	 *  change is undone), then run the pending change. */
+	async applyPendingChange() {
+		const p = this.pendingChange;
+		if (!p) return;
+		if (this.rendering) {
+			await this.stopRender({ quiet: true });
+			if (this.rendering) return; // couldn't stop; the toast says why
+		}
+		if (this.pendingChange !== p) return; // replaced meanwhile
+		this.pendingChange = null;
+		await p.run();
 	}
 
 	// ---------- Renders list ----------
@@ -1074,6 +1154,17 @@ class AppState {
 		} finally {
 			this.briefBusy = false;
 		}
+	}
+
+	/** A Studio request the AI turns into a tweak, as one undoable change:
+	 *  it re-renders through `withUndo`, so a Stop (or Undo) puts it back
+	 *  like any other tweak instead of leaving it in the next render. */
+	async submitBriefChange(label: string) {
+		await this.withUndo(label, async () => {
+			if (!this.briefText.trim() || this.briefBusy) return false;
+			await this.submitBrief();
+			return !this.briefError;
+		});
 	}
 
 	// ---------- History / A-B compare ----------

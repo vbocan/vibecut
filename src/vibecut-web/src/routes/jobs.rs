@@ -21,9 +21,15 @@ pub async fn list_jobs(State(state): State<AppState>) -> Json<serde_json::Value>
 /// job that was still queued, `running` with `cancel_requested: true`
 /// for one that is being stopped (it turns `cancelled` within about a
 /// second), or its final state if it had already finished.
+///
+/// The body is a JSON object (`{}`), like every other state-changing
+/// route: requiring `Content-Type: application/json` keeps the route out
+/// of reach of cross-site form posts and other CORS "simple" requests,
+/// which a browser sends without a preflight (job ids are guessable).
 pub async fn cancel_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
+    Json(_body): Json<serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match vibecut_ops::render::cancel(&state.jobs, &job_id).await {
         Some(v) => Ok(Json(v)),

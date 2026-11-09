@@ -67,30 +67,31 @@
 		return true;
 	}
 
-	/** A request that came in mid-render, waiting on "Stop and apply this instead". */
-	let offer = $state<string | null>(null);
+	/** A request typed mid-render, waiting on "Stop and apply this instead". */
+	const offer = $derived(s.pendingChange?.from === 'command' ? s.pendingChange : null);
 
-	async function stopAndApply() {
-		const text = offer;
-		if (!text) return;
-		await s.stopRender({ quiet: true });
-		if (s.rendering) return; // couldn't stop; the toast says why
-		offer = null;
-		s.briefText = text;
-		await submit();
+	/** "make it moodier" → “make it moodier”, short enough for the Undo toast. */
+	function quoted(text: string): string {
+		return `“${text.length > 40 ? `${text.slice(0, 39)}…` : text}”`;
 	}
 
 	async function submit() {
 		const text = s.briefText.trim();
 		if (!text || s.briefBusy) return;
 		note = null;
-		offer = null;
 		s.briefError = null;
 		if (studio && s.rendering) {
-			note = 'Still rendering the last change.';
-			offer = text;
+			s.requestChange(
+				quoted(text),
+				() => {
+					s.briefText = text;
+					return submit();
+				},
+				'command'
+			);
 			return;
 		}
+		if (offer) s.pendingChange = null;
 		const handled = studio ? await runStudio(text) : runCreate(text);
 		if (handled) {
 			s.briefText = '';
@@ -100,11 +101,14 @@
 			note = `I didn't catch that. Try: ${examples.join(' · ')}.`;
 			return;
 		}
-		const wasStudio = studio;
+		if (studio) {
+			// One undoable change, like a tweak: a Stop puts it back.
+			await s.submitBriefChange(quoted(text));
+			return;
+		}
 		await s.submitBrief();
 		if (s.briefError) return;
-		if (wasStudio) void s.startRenderAsync();
-		else if (s.effectiveVibe && s.folder) void s.makeVideo();
+		if (s.effectiveVibe && s.folder) void s.makeVideo();
 	}
 </script>
 
@@ -132,15 +136,15 @@
 <div class="feedback" aria-live="polite">
 	{#if s.briefError}
 		<p class="error" role="alert">{s.briefError}</p>
-	{:else if note}
+	{:else if offer}
 		<p class="why">
-			{offer && !s.rendering ? 'The last change is ready.' : note}
-			{#if offer}
-				<button class="btn small offer" type="button" disabled={s.stopping} onclick={stopAndApply}>
-					{s.stopping ? 'Stopping…' : s.rendering ? 'Stop and apply this instead' : 'Apply it now'}
-				</button>
-			{/if}
+			{s.rendering ? 'Still rendering the last change.' : 'The last change is ready.'}
+			<button class="btn small offer" type="button" disabled={s.stopping} onclick={() => s.applyPendingChange()}>
+				{s.stopping ? 'Stopping…' : s.rendering ? 'Stop and apply this instead' : 'Apply it now'}
+			</button>
 		</p>
+	{:else if note}
+		<p class="why">{note}</p>
 	{:else if s.briefRationale}
 		<p class="why"><span class="serif">“{s.briefRationale}”</span></p>
 	{/if}

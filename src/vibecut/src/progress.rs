@@ -8,7 +8,8 @@
 //! Work fanned out to other threads (the visual-analysis pool) reports
 //! through a [`Reporter`] cloned from [`current`] before the fan-out.
 //! The reporter also carries the render's cancel token
-//! ([`with_sink_and_cancel`], see [`crate::cancel`]).
+//! ([`with_sink_and_cancel`], see [`crate::cancel`]); the pipeline thread
+//! reports through [`checkpoint`], so every report is also a cancel point.
 //!
 //! `overall` is a 0..1 estimate built from fixed per-stage weights (a
 //! typical render's time split). It never goes backwards, even when a
@@ -215,6 +216,17 @@ pub fn report(stage: Stage, stage_fraction: f32, detail: Option<String>) {
     }
 }
 
+/// [`report`], then stop if the render was cancelled: every progress
+/// report on the pipeline thread is also a cancel point. Use it with `?`.
+pub fn checkpoint(
+    stage: Stage,
+    stage_fraction: f32,
+    detail: Option<String>,
+) -> Result<(), crate::cancel::Cancelled> {
+    report(stage, stage_fraction, detail);
+    crate::cancel::check()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +294,31 @@ mod tests {
         );
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert!(cancel_token().is_none());
+    }
+
+    #[test]
+    fn a_checkpoint_reports_then_stops_a_cancelled_render() {
+        let seen: Arc<Mutex<Vec<Stage>>> = Arc::default();
+        let sink_seen = seen.clone();
+        let token = CancelToken::new();
+        let stop = token.clone();
+        let r = with_sink_and_cancel(
+            move |p| {
+                sink_seen.lock().unwrap().push(p.stage);
+                // Stop pressed while the probing report is on screen.
+                if p.stage == Stage::Probing {
+                    stop.cancel();
+                }
+            },
+            token,
+            || -> Result<(), crate::cancel::Cancelled> {
+                checkpoint(Stage::Probing, 0.0, None)?;
+                unreachable!("the render went on past a cancelled checkpoint");
+            },
+        );
+        assert_eq!(r, Err(crate::cancel::Cancelled));
+        assert_eq!(*seen.lock().unwrap(), vec![Stage::Probing]);
+        // Without a token (the CLI) a checkpoint is just a report.
+        assert_eq!(checkpoint(Stage::Clips, 0.5, None), Ok(()));
     }
 }

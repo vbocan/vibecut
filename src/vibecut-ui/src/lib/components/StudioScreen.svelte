@@ -103,7 +103,10 @@
 		if (!keysOn) return;
 		const inTimeline = !!t?.closest('.timeline');
 		const onVideo = t?.tagName === 'VIDEO';
-		const busy = s.feedbackBusy || s.renderMode === 'queued' || s.renderMode === 'running';
+		// Mid-render a tweak isn't ignored: it offers "Stop and apply this
+		// instead" (shown in the tweak panel).
+		const busy = s.feedbackBusy || s.stopping;
+		const ask = (label: string, run: () => unknown) => s.requestChange(label, run);
 		const k = e.key;
 		let handled = true;
 		if ((k === ' ' && !onVideo) || k === 'k') {
@@ -113,18 +116,22 @@
 		else if ((k === 'ArrowLeft' || k === 'ArrowRight') && !inTimeline && !onVideo) moveMoment(k === 'ArrowLeft' ? -1 : 1);
 		else if (k === 'd') onOpenPro?.();
 		else if (busy) handled = false;
-		else if (k === '[') void s.tweakAndRender({ kind: 'scale_duration', factor: 0.75 }, 'Shorter');
-		else if (k === ']') void s.tweakAndRender({ kind: 'scale_duration', factor: 1.25 }, 'Longer');
-		else if (k === 'e') void s.tweakAndRender({ kind: 'punchier' }, 'More energy');
-		else if (k === 'c') void s.tweakAndRender({ kind: 'calmer' }, 'Calmer');
-		else if (k === 's') void s.tweakAndRender({ kind: 'reroll' }, 'Shuffle');
-		else if (k === 'm') void s.anotherMix();
+		else if (k === '[') ask('Shorter', () => s.tweakAndRender({ kind: 'scale_duration', factor: 0.75 }, 'Shorter'));
+		else if (k === ']') ask('Longer', () => s.tweakAndRender({ kind: 'scale_duration', factor: 1.25 }, 'Longer'));
+		else if (k === 'e') ask('More energy', () => s.tweakAndRender({ kind: 'punchier' }, 'More energy'));
+		else if (k === 'c') ask('Calmer', () => s.tweakAndRender({ kind: 'calmer' }, 'Calmer'));
+		else if (k === 's') ask('Shuffle', () => s.tweakAndRender({ kind: 'reroll' }, 'Shuffle'));
+		else if (k === 'm') ask('Another mix', () => s.anotherMix());
 		else if (k === 'n') {
-			const p = nextSongPath();
-			if (p) void s.changeSong(p);
+			if (s.tracks.length > 1)
+				ask('New song', () => {
+					const p = nextSongPath();
+					if (p) return s.changeSong(p);
+				});
 		} else if ((k === 'Delete' || k === 'Backspace') && s.selectedSegmentIndex !== null) {
 			const g = s.segmentLayout[s.selectedSegmentIndex];
-			if (g) void s.withUndo(`Dropped moment ${g.index + 1}`, () => s.dropSegment(g));
+			const label = g ? `Dropped moment ${g.index + 1}` : '';
+			if (g) ask(label, () => s.withUndo(label, () => s.dropSegment(g)));
 		} else handled = false;
 		if (handled) e.preventDefault();
 	}

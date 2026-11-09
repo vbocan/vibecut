@@ -14,22 +14,14 @@
 	];
 
 	// Tweaks stay live during a render: picking one offers to stop it.
+	// The offer is shared: keyboard shortcuts and song picks made
+	// mid-render show up here too.
 	const busy = $derived(s.feedbackBusy || s.stopping);
-	let offer = $state<(typeof TWEAKS)[number] | 'mix' | null>(null);
+	const offer = $derived(s.pendingChange?.from === 'tweaks' ? s.pendingChange : null);
 
 	function tryRun(t: (typeof TWEAKS)[number] | 'mix') {
-		if (s.rendering) offer = t;
-		else if (t === 'mix') void s.anotherMix();
-		else run(t);
-	}
-
-	async function stopAndApply() {
-		const t = offer;
-		if (!t) return;
-		await s.stopRender({ quiet: true });
-		if (s.rendering) return; // couldn't stop; the toast says why
-		offer = null;
-		tryRun(t);
+		if (t === 'mix') s.requestChange('Another mix', () => s.anotherMix());
+		else s.requestChange(t.label, () => run(t));
 	}
 
 	function nextSong(): string | null {
@@ -98,12 +90,12 @@
 	{#if offer}
 		<div class="offer" role="status">
 			<span>{s.rendering ? 'Still rendering the last change.' : 'The last change is ready.'}</span>
-			<button class="btn primary small" type="button" disabled={s.stopping} onclick={stopAndApply}>
+			<button class="btn primary small" type="button" disabled={s.stopping} onclick={() => s.applyPendingChange()}>
 				{s.stopping
 					? 'Stopping…'
-					: `${s.rendering ? 'Stop and apply' : 'Apply'} “${offer === 'mix' ? 'Another mix' : offer.label}”${s.rendering ? ' instead' : ''}`}
+					: `${s.rendering ? 'Stop and apply' : 'Apply'} “${offer.label}”${s.rendering ? ' instead' : ''}`}
 			</button>
-			<button class="btn ghost small" type="button" disabled={s.stopping} onclick={() => (offer = null)}
+			<button class="btn ghost small" type="button" disabled={s.stopping} onclick={() => (s.pendingChange = null)}
 				>{s.rendering ? 'Keep rendering' : 'Never mind'}</button
 			>
 		</div>

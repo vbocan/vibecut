@@ -64,9 +64,9 @@
 
 	const errorText = $derived(s.makeError ?? s.renderError ?? 'Something went wrong.');
 
-	// One tap stops a wrong render. Before the render itself starts
-	// (reading clips, planning) there is nothing on the server to stop yet.
-	const canStop = $derived(s.rendering && !s.stopping);
+	// One tap stops a wrong render — also while the clips are still being
+	// read and planned (no server job yet: it goes back to Create).
+	const canStop = $derived((s.rendering || s.preparing) && !s.stopping);
 </script>
 
 <!-- Screen readers hear the stage changes and the outcome, not the
@@ -155,11 +155,7 @@
 				type="button"
 				disabled={!canStop}
 				aria-busy={s.stopping}
-				title={s.rendering
-					? s.renderHistory.length > 0
-						? 'Stop this render and go back to the last version'
-						: 'Stop this render'
-					: 'You can stop it once the render starts'}
+				title={s.renderHistory.length > 0 ? 'Stop this render and go back to the last version' : 'Stop this render'}
 				onclick={() => s.stopRender()}
 			>
 				<span class="stop-icon" aria-hidden="true"></span>

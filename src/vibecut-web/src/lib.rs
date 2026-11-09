@@ -147,13 +147,7 @@ mod tests {
 
         let res = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/jobs/{newer}/cancel"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(cancel_request(&newer, "application/json", "{}"))
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -183,20 +177,51 @@ mod tests {
         assert_eq!(body_json(res).await["state"], "cancelled");
     }
 
+    fn cancel_request(job_id: &str, content_type: &str, body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/jobs/{job_id}/cancel"))
+            .header("content-type", content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn cancel_unknown_job_is_404() {
         let app = router(AppState::default());
         let res = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/jobs/no-such-job/cancel")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(cancel_request("no-such-job", "application/json", "{}"))
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A page on another origin can send a form post or a text/plain
+    /// fetch without a CORS preflight. Neither may stop a render: the
+    /// route takes only a JSON body, like every state-changing route.
+    #[tokio::test]
+    async fn cancel_refuses_cross_site_simple_requests() {
+        let state = AppState::default();
+        let id = state.jobs.submit_for("/projects/a.toml").await;
+        let app = router(state.clone());
+        for (ct, body) in [
+            ("application/x-www-form-urlencoded", "x=1"),
+            ("text/plain", "{}"),
+            ("multipart/form-data; boundary=b", "--b--"),
+        ] {
+            let res = app.clone().oneshot(cancel_request(&id, ct, body)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct} was accepted");
+        }
+        let bare = Request::builder()
+            .method("POST")
+            .uri(format!("/api/jobs/{id}/cancel"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(bare).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "a bodiless post was accepted");
+        let info = state.jobs.info(&id).await.unwrap();
+        assert!(!info.cancel_requested, "a refused request still stopped the job");
+        assert!(matches!(info.state, vibecut_ops::jobs::JobState::Queued));
     }
 
     #[tokio::test]
