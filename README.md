@@ -68,7 +68,7 @@ No LLM client to configure — open a browser instead.
 
    (Set `VIBECUT_FOOTAGE` and `VIBECUT_PROJECTS` env vars first to point at your host paths. Set `ANTHROPIC_API_KEY` too if you want the free-text "Ask AI" box to work — everything else works without it.)
 
-2. Open **http://localhost:8090/**. Sources → Vibe → Config → Render → Preview → History, all in one page — see [Architecture](#architecture) below for what each step does.
+2. Open **http://localhost:8090/**. Pick a trip, tap **Make my video**: the vibe, length and song are picked for you, a storyboard of the edit appears in seconds and a 540p draft plays shortly after. Tweak it in the Studio (shorter, calmer, more energy, new song, drop a moment, undo), then **Finish in full quality**, download, or make a Reels / Shorts / TikTok / WhatsApp version from the Share sheet. The guided editor and raw TOML are one click away under **Pro**.
 
 ### Drop a folder, get a video — through Claude Desktop
 
@@ -125,7 +125,19 @@ See [CONFIG.md](CONFIG.md) for the full TOML schema to hand-author `my-project.t
 - **Audio-aware composition.** Beat-locked cuts on a fitted beat grid (exact tempo and phase, hits timed to ~1 ms, half/double-tempo correction): every cut — crossfades, intro card, beat-burst and loop seams included — lands within half a frame of a beat. Smart-loop with natural-intro preservation and whole-beat loop crossfades, VAD-guided ducking around speech, optional rapid-cut beat-burst at the soundtrack's energy peak.
 - **Beat-sync report.** Every render with a soundtrack checks where the cuts actually landed against the beats — real crossfade widths, loop seams, and the encoded audio offset (measured by cross-correlation) included — and writes the per-cut errors to the manifest. See [CONFIG.md](CONFIG.md#beat-sync-report).
 - **GoPro-Quik-style transitions.** Per-pair speed-ramp ("whip-up") effect with brightness warm-up and 67 ms fade-to-white at the seam — visually a kinetic flash.
-- **MCP server with 9 tools** (`discover_sources`, `list_vibes`, `propose_vibe`, `render`, `render_async`, `render_status`, `apply_feedback`, `inspect_output`, `inspect_at`). Streamable HTTP transport on port 8080.
+- **Music-led pacing.** Bars, phrases and sections are found on the beat grid: clips run short in loud parts and hold in quiet ones, the best moment lands on the downbeat of the drop, and the edit ends on a phrase with the music finishing on a bar (or the song's own final hit). See [CONFIG.md](CONFIG.md).
+- **Exact output timeline.** Every manifest records where each clip and card plays, frame-exact; ducking, beat-burst, "drop this moment", the Studio timeline and exports all read it.
+- **See the edit before the encode.** The pipeline plans, then renders: `POST /api/plan` / `vibecut plan` returns the beat-locked storyboard in seconds, 540p drafts render in ~10 s, and only clips that changed are re-encoded after a tweak.
+- **Platform versions.** `[[outputs]]` presets for YouTube, Reels / TikTok / Shorts, square, 4:5 portrait and WhatsApp, fitted by blur-fill, crop, pad or a **smart crop that follows the action**; a finished render is reformatted in one fast pass.
+- **Telemetry 2.0.** GoPro GPS speed (GPS5 / GPS9), gyro spins, airtime and landings, and scene cuts join HiLight tags and accelerometer peaks — each optional per camera — and every pick says why it was chosen ("38 km/h", "airtime 0.6 s").
+- **Stop, queue, jobs.** Renders are cancellable mid-encode (ffmpeg children killed, nothing half-written replaces a good file), jobs are listed, and a change asked for mid-render offers "Stop and apply".
+- **Music you can keep.** The server picks a library song by vibe, tempo and length; tracks carry licence and credit metadata (sidecar JSON), credits and the file's SHA-256 go into the manifest and the share caption. See [MUSIC.md](MUSIC.md).
+- **Style codes.** A short `VC1-…` code carries a video's style — vibe, length, pacing, cards, song, formats — and reproduces it on anyone's footage.
+- **Auto-reel from a card.** Optional footage-folder watcher: a new trip or SD card becomes a reel by itself, with an in-app toast, browser notification and an optional webhook.
+- **"Your year" recap.** The best moment of each month (or trip) from saved versions, in filming order, with month captions and a song, beat-locked.
+- **Finish elsewhere.** Export the edit as FCPXML (Final Cut Pro, DaVinci Resolve) or OpenTimelineIO.
+- **Footage that just works.** GoPro chapters stitched for every naming scheme (GOPR/GP, GX/GH), LRV/THM proxies ignored, HDR (HLG / PQ) tone-mapped to SDR; fonts and the Silero voice model ship in the Docker image.
+- **MCP server with 18 tools** (`discover_sources`, `list_vibes`, `propose_vibe`, `plan_edit`, `render`, `render_async`, `render_status`, `cancel_render`, `apply_feedback`, `inspect_output`, `inspect_at`, `reformat`, `export_timeline`, `share_style`, `describe_style`, `apply_style`, `list_styles`, `make_recap`). Streamable HTTP transport on port 8080.
 - **Six curated vibes.** `kid_reel`, `family_chronicle`, `drone_cinematic`, `action_highlight`, `documentary`, `memory_keeper` — each a hand-tuned TOML template the LLM picks from.
 - **Eight feedback variants.** Natural-language reactions ("shorter", "less aggressive", "different music", "drop the bit at 0:42", "more of source X") map to type-checked deterministic config mutations.
 - **Multimodal inspection.** `inspect_output` returns 12 evenly-spaced frames inline as JPEG content; `inspect_at` returns frames at user-referenced timestamps. The LLM can see and reason about the actual pixels.
@@ -222,7 +234,7 @@ Five crates plus one frontend, all under [src/](src/) in this repo, all shipped 
 - **Video / audio**: ffmpeg 6.x (NVENC, libx264, libx265, vidstab)
 - **ML inference**: ONNX Runtime 2.x with CUDA EP (Silero VAD)
 - **Container base**: `nvidia/cuda:12.6.0-runtime-ubuntu24.04`
-- **Tests**: 185 (115 pipeline + 53 operations layer + 0 MCP layer + 17 web layer)
+- **Tests**: 669 Rust (393 pipeline + 232 operations layer + 0 MCP layer + 44 web layer) + 53 UI unit tests + 5 Playwright journeys
 
 ## Testing
 
@@ -234,7 +246,7 @@ cargo test --release -p vibecut-mcp
 cargo test --release -p vibecut-web
 ```
 
-The web UI has no automated tests yet — `npm run check` (TypeScript + Svelte type-checking via `svelte-check`) inside [src/vibecut-ui/](src/vibecut-ui/) is the closest thing today.
+Inside [src/vibecut-ui/](src/vibecut-ui/): `npm run check` (TypeScript + Svelte type-checking), `npm test` (unit tests of the UI's pure logic, `node --test`, Node 22.18+), and Playwright journeys in `test/*.py` (`python test/draft_journey.py --url http://localhost:8090`; also `smart_reframe_share`, `style_codes_journey`, `new_controls_keyboard`, `a11y_keyboard`) that drive a running server with the demo footage.
 
 End-to-end smokes (require Docker):
 
@@ -269,6 +281,7 @@ If you use Vibecut in your research, please cite:
 |---|---|
 | [CONFIG.md](CONFIG.md) | Complete TOML schema reference for hand-authored projects. |
 | [WIZARD.md](WIZARD.md) | Web UI's guided config editor, step by step. No TOML required. |
+| [MUSIC.md](MUSIC.md) | The music library: folders, licence sidecars, credits, the starter-pack layout. |
 | [DOCKER.md](DOCKER.md) | Docker build / run / wire-up guide. Includes the CLI workflow. |
 | [scripts/](scripts/) | PowerShell helpers for CLI, Docker, and web-layer dev workflows. |
 
@@ -276,13 +289,16 @@ If you use Vibecut in your research, please cite:
 
 - **No user study.** This is a systems contribution; user vocabulary corpus is future work.
 - **Vibe library is curated, not learned** — six hand-built entries.
-- **Preview's click-to-seek timeline is an approximation** — the manifest doesn't yet record exact per-segment output timing (intro duration, per-seam transition width), so seeking can land a beat off around heavily-transitioned cuts. (The beat-sync report's per-cut times are exact; Preview doesn't use them yet.)
+- **Faces aren't scored.** The `faces` weight needs a face-detection model that isn't bundled; telemetry thresholds (gyro, airtime) are tuned on synthetic data, not real rides yet.
+- **No captions yet** — speech recognition under the ducked moments needs a local ASR model that isn't bundled.
+- **Timeline exports are untested in real editors** — FCPXML and OTIO are checked structurally (frame-exact times, media containment), not opened in Final Cut / Resolve / Premiere.
 - **NVENC determinism is bit-identical within one driver version** — we make no claim across NVIDIA driver upgrades. CPU fallback (libx264) is fully deterministic.
 
 ## Roadmap
 
 - Implement the `ExtendSegment` feedback action (pin an exact range) once the picker supports selecting one.
-- Persist exact output-timeline layout in the manifest for frame-accurate Preview seeking.
+- Captions for voice moments (local speech recognition), face-aware scoring and reframing.
+- A bundled starter pack of vetted CC0 / CC BY tracks, then commissioned "Vibecut Originals" (see [MUSIC.md](MUSIC.md)).
 - Verify additional MCP clients beyond Claude Desktop — LM Studio and `mcp-inspector` are next.
 
 ## License
