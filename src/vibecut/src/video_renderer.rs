@@ -29,10 +29,11 @@
 //!    For `mode = "overlay"`, the text is instead baked into stage (3)'s
 //!    first / last segment via `OverlayDirective`.
 //!
-//! 5. **Concat** ([`concat_segments`] hard-cuts, or [`concat_with_xfade`]
+//! 5. **Concat** ([`concat_with_cuts`] hard cuts, or [`concat_with_xfade`]
 //!    with transitions) — combines intro + segments + outro into one body
-//!    file. The xfade variant runs video-xfade + audio-acrossfade in one
-//!    ffmpeg pass and applies optional video fade-in / fade-out.
+//!    file. Both run in one ffmpeg pass and apply the optional video
+//!    fade-in / fade-out; the xfade variant adds video-xfade +
+//!    audio-acrossfade at every seam.
 //!
 //! 6. **Mux soundtrack** — two flavors:
 //!    - [`mux_soundtrack`] — straight replacement of body audio with
@@ -1201,6 +1202,114 @@ pub fn concat_segments(
     ])
 }
 
+/// Concat clips back to back with straight cuts (hard-cut mode), re-encoded
+/// in one pass so the project fade-in / fade-out apply over the cards and
+/// footage — the stream-copy [`concat_segments`] can't fade.
+///
+/// `inputs[k]` is `(path, frames)`: the frames the output timeline gives
+/// input `k` (a `ChainLayout` with zero-length seams). Each input adds
+/// exactly that many frames, and exactly the audio samples under them
+/// (padded with silence or trimmed), so every input starts on the frame the
+/// timeline puts it on and the body's audio is exactly as long as its
+/// picture. Picture and sound are concatenated separately: a clip whose AAC
+/// track runs a few ms past its last frame can't push the next clip's
+/// picture late.
+pub fn concat_with_cuts(
+    runner: &dyn FfmpegRunner,
+    inputs: &[(Utf8PathBuf, u32)],
+    width: u32,
+    height: u32,
+    fps: u32,
+    crf: u32,
+    video_fade_in_secs: f32,
+    // 0 = no fade. Otherwise a fade-to-black over the last `fade_out_secs`.
+    video_fade_out_secs: f32,
+    hw: &HwConfig,
+    output: &Utf8Path,
+) -> Result<()> {
+    if inputs.is_empty() {
+        anyhow::bail!("concat_with_cuts: no inputs provided");
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let frames: Vec<u32> = inputs.iter().map(|(_, f)| *f).collect();
+    let filter = cut_concat_filter(&frames, fps, video_fade_in_secs, video_fade_out_secs);
+    let mut args: Vec<String> = vec![arg("-y"), arg("-hide_banner"), arg("-loglevel"), arg("error")];
+    for (p, _) in inputs {
+        args.push(arg("-i"));
+        args.push(p.to_string());
+    }
+    args.extend([
+        arg("-filter_complex"), filter,
+        arg("-map"), arg("[vout]"),
+        arg("-map"), arg("[aout]"),
+        arg("-pix_fmt"), arg("yuv420p"),
+    ]);
+    args.extend(hw.encode_args(crf));
+    args.extend([
+        arg("-r"), fps.to_string(),
+        arg("-s"), format!("{width}x{height}"),
+        arg("-c:a"), arg("aac"),
+        arg("-ar"), AUDIO_SAMPLE_RATE.to_string(),
+        arg("-ac"), arg("2"),
+        arg("-movflags"), arg("+faststart"),
+        output.to_string(),
+    ]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    runner.run(&refs)
+}
+
+/// The `-filter_complex` graph of [`concat_with_cuts`] for inputs
+/// `frames[k]` frames long; its outputs are `[vout]` and `[aout]`.
+fn cut_concat_filter(frames: &[u32], fps: u32, fade_in_secs: f32, fade_out_secs: f32) -> String {
+    let fps = fps.max(1) as u64;
+    let sr = AUDIO_SAMPLE_RATE as u64;
+    // Audio sample at a frame boundary, rounded per boundary (not per clip)
+    // so the rounding never adds up.
+    let sample_at = |frame: u64| (frame * sr + fps / 2) / fps;
+    let mut f = String::new();
+    let mut start = 0u64;
+    for (k, &len) in frames.iter().enumerate() {
+        let len = len.max(1) as u64;
+        let samples = sample_at(start + len) - sample_at(start);
+        start += len;
+        f.push_str(&format!(
+            "[{k}:v]setsar=1,trim=end_frame={len},setpts=N/({fps}*TB)[v{k}];\
+             [{k}:a]aformat=sample_rates={sr}:channel_layouts=stereo,\
+             apad=whole_len={samples},atrim=end_sample={samples},asetpts=N/SR/TB[a{k}];"
+        ));
+    }
+    let n = frames.len();
+    for k in 0..n {
+        f.push_str(&format!("[v{k}]"));
+    }
+    f.push_str(&format!("concat=n={n}:v=1:a=0[vcat];"));
+    for k in 0..n {
+        f.push_str(&format!("[a{k}]"));
+    }
+    f.push_str(&format!("concat=n={n}:v=0:a=1[aout];"));
+    // The project fades, over the whole body (cards included), as on the
+    // crossfade path.
+    let total = start as f64 / fps as f64;
+    let mut fades: Vec<String> = Vec::new();
+    if fade_in_secs > 0.0 {
+        fades.push(format!("fade=t=in:st=0:d={:.6}", fade_in_secs));
+    }
+    if fade_out_secs > 0.0 && total > fade_out_secs as f64 {
+        fades.push(format!(
+            "fade=t=out:st={:.6}:d={:.6}",
+            total - fade_out_secs as f64,
+            fade_out_secs
+        ));
+    }
+    if fades.is_empty() {
+        fades.push("null".into());
+    }
+    f.push_str(&format!("[vcat]{}[vout]", fades.join(",")));
+    f
+}
+
 // ---------- Stage 3: mux soundtrack ----------
 
 /// Replace the body video's audio with the soundtrack. `-shortest` cuts at whichever
@@ -1559,9 +1668,11 @@ pub fn mux_with_ducking(
     // across 40+ seams that's enough to leave the player holding the last
     // frame for several seconds at the very end. Pass `body_duration_secs`
     // explicitly via `-t` so audio is truncated to the same wall-clock
-    // length the video actually has.
+    // length the video actually has. Microseconds, not milliseconds: 865
+    // frames at 30 fps written as "28.833" cut the audio a third of a
+    // millisecond early, and `-shortest` then dropped the last video frame.
     let body_dur = if body_duration_secs > 0.0 {
-        format!("{body_duration_secs:.3}")
+        format!("{body_duration_secs:.6}")
     } else {
         // No declared duration: fall back to -shortest only.
         String::new()
@@ -2655,5 +2766,95 @@ mod tests {
         let fc = calls[0].iter().find(|a| a.contains("xfade=")).unwrap();
         assert!(fc.contains("offset=0.900000[v1]"), "{fc}");
         assert!(fc.contains("offset=1.466667[v2]"), "{fc}");
+    }
+
+    #[test]
+    fn hard_cut_concat_keeps_the_cards_and_the_project_fades() {
+        // Hard-cut mode used to stream-copy the clips alone: no intro or
+        // outro card, no fade from or to black. Intro card (90 frames), a
+        // clip (61), an outro card (45), straight cuts, 0.2 s in / 1.5 s out.
+        let runner = MockRunner::new();
+        let out = camino::Utf8PathBuf::from("/tmp/sv_cut_concat/body.mp4");
+        let hw = HwConfig::resolve(HwSupport::default(), EncoderPref::Libx264);
+        let inputs: Vec<(camino::Utf8PathBuf, u32)> =
+            vec![("intro.mp4".into(), 90), ("seg_001.mp4".into(), 61), ("outro.mp4".into(), 45)];
+        concat_with_cuts(&runner, &inputs, 64, 36, 30, 20, 0.2, 1.5, &hw, &out).unwrap();
+        let calls = runner.calls.borrow();
+        let args = &calls[0];
+        let inputs_passed: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-i")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(inputs_passed, vec!["intro.mp4", "seg_001.mp4", "outro.mp4"]);
+        let fc = args.iter().find(|a| a.contains("concat=")).unwrap();
+        // Straight cuts: no crossfade anywhere.
+        assert!(!fc.contains("xfade") && !fc.contains("acrossfade"), "{fc}");
+        // 196 frames = 6.5333 s; the fade-out ends on the last frame.
+        assert!(fc.contains("[vcat]fade=t=in:st=0:d=0.200000,fade=t=out:st=5.033333:d=1.500000[vout]"), "{fc}");
+        assert!(args.windows(2).any(|w| w[0] == "-map" && w[1] == "[vout]"));
+        assert!(args.windows(2).any(|w| w[0] == "-map" && w[1] == "[aout]"));
+    }
+
+    #[test]
+    fn hard_cut_concat_holds_every_input_to_its_timeline_frames() {
+        // Each input is trimmed to the frames the timeline gives it, and its
+        // audio padded/trimmed to exactly the samples under those frames, so
+        // a long AAC tail can't push the next clip late.
+        let fc = cut_concat_filter(&[90, 61, 45], 30, 0.0, 0.0);
+        for (k, (frames, samples)) in [(90, 144_000), (61, 97_600), (45, 72_000)].iter().enumerate() {
+            assert!(fc.contains(&format!("[{k}:v]setsar=1,trim=end_frame={frames},")), "{fc}");
+            assert!(
+                fc.contains(&format!("apad=whole_len={samples},atrim=end_sample={samples},asetpts=N/SR/TB[a{k}]")),
+                "{fc}"
+            );
+        }
+        // Picture and sound concatenated separately; no fades asked for.
+        assert!(fc.contains("[v0][v1][v2]concat=n=3:v=1:a=0[vcat]"), "{fc}");
+        assert!(fc.contains("[a0][a1][a2]concat=n=3:v=0:a=1[aout]"), "{fc}");
+        assert!(fc.ends_with("[vcat]null[vout]"), "{fc}");
+    }
+
+    #[test]
+    fn hard_cut_audio_rounding_does_not_accumulate() {
+        // At 7 fps a frame is 6857.14 samples: per-clip rounding would drift,
+        // per-boundary rounding keeps the total at round(frames × 48000 / 7).
+        // Five 2-frame clips: 5 × round(13714.29) = 68570, one sample short.
+        let fc = cut_concat_filter(&[2, 2, 2, 2, 2], 7, 0.0, 0.0);
+        let total: u64 = fc
+            .split("atrim=end_sample=")
+            .skip(1)
+            .map(|s| s.split(',').next().unwrap().parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(total, 68_571);
+    }
+
+    #[test]
+    fn mux_caps_at_the_full_body_length() {
+        // A 865-frame body (28.8333 s) capped at "-t 28.833" lost its last
+        // frame in the mux; the cap must not fall short of the body.
+        let runner = MockRunner::new();
+        let out = camino::Utf8PathBuf::from("/tmp/sv_mux_cap/out.mp4");
+        let body_secs = 865.0_f32 / 30.0;
+        mux_with_ducking(
+            &runner,
+            camino::Utf8Path::new("body.mp4"),
+            camino::Utf8Path::new("song.mp3"),
+            &[(5.0, 9.0, 0.3)],
+            -18.0,
+            body_secs,
+            1.5,
+            SoundtrackLoopPlan::default(),
+            &out,
+        )
+        .unwrap();
+        let calls = runner.calls.borrow();
+        let t: f64 = calls[0]
+            .windows(2)
+            .find(|w| w[0] == "-t")
+            .map(|w| w[1].parse().unwrap())
+            .expect("-t cap");
+        // Within a microsecond of the true end (well under one audio sample).
+        assert!((t - 865.0 / 30.0).abs() < 2e-6, "-t {t}");
     }
 }

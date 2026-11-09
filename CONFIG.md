@@ -231,8 +231,9 @@ beat sync: 26 cuts vs the 128.00 BPM grid — on the beat
 ```
 
 It accounts for everything between the plan and the file: each seam's real
-crossfade width (cuts are measured at the crossfade midpoint), the intro
-card, the beat-burst's internal cuts, the smart loop's crossfades, and the
+crossfade width (cuts are measured at the crossfade midpoint, or at the
+first frame after a straight cut), the intro card, the beat-burst's
+internal cuts, the smart loop's crossfades, and the
 audio track's offset in the encoded file, measured by cross-correlating the
 rendered audio against the soundtrack. ±3 frames is the tolerance; the
 "random placement" figure (a quarter beat) is what unaligned cuts would
@@ -246,7 +247,8 @@ per-cut table, and the full report is written to the manifest as
 ## `[intro]` and `[outro]` (optional)
 
 Title and end cards. Both share the same shape — `[outro]` just appears
-after the body.
+after the body. A card crossfades into the footage with the `[transition]`
+default, or cuts straight to it in [hard-cut mode](#transition-optional).
 
 ```toml
 [intro]
@@ -416,7 +418,7 @@ normalize cache for *segments whose pick changed* re-encodes — typically
 
 ```toml
 [transition]
-default                = "fade"          # any ffmpeg xfade name; "cut" / "none" disables xfade
+default                = "fade"          # any ffmpeg xfade name; "cut" / "none" = straight cuts (see below)
 duration               = "400ms"         # default: 400ms
 palette                = ["fade", "dissolve", "circleopen"]   # currently informational
 # --- Speed-ramp ("whip-up"): the last X ms of the outgoing clip plays at
@@ -426,6 +428,27 @@ speed_ramp_duration    = "350ms"         # length of the SOURCE speed-up portion
 speed_ramp_factor      = 2.5             # how fast — 1.0 = off, 2.5 = typical reel, 3.0+ = aggressive
 speed_ramp_flash       = true            # GoPro-Quik fade-to-white at the seam (default: true)
 ```
+
+**Hard-cut mode.** `default = "cut"` (or `"none"`, or `duration = "0s"`)
+joins the clips with straight cuts instead of crossfades; nothing else is
+dropped:
+
+- `[intro]` / `[outro]` cards in `mode = "card"` are still their own clips,
+  with their own layer fades, joined to the footage by a straight cut.
+- `[project].fade_in` / `fade_out` still fade the whole video from and to
+  black, cards included.
+- Speed-ramps still play their sped-up tail (and flash); the cut after it
+  is a plain cut.
+- With `[soundtrack].beat_align`, every cut — intro card to footage, clip to
+  clip, footage to the outro card — lands on a beat. A straight cut has no
+  crossfade to sit in the middle of, so the beat lock puts the next clip's
+  first frame on the beat, and the intro card still moves by at most half a
+  beat to get there.
+
+The body is re-encoded in one pass (as on the crossfade path), with every
+clip held to exactly the frames the manifest `timeline` gives it; the
+timeline records the card spans with `transition_secs = 0`, and the
+beat-sync report scores all of those cuts.
 
 `speed_ramp_*` triggers a Reels/TikTok-style "whip-up" on a deterministic
 random subset of transitions, sized by `speed_ramp_probability`. Which

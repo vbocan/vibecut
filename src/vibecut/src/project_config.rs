@@ -622,6 +622,9 @@ pub enum Order {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export))]
 pub struct Transition {
+    /// ffmpeg xfade name used at every seam. `"cut"` / `"none"` (or a zero
+    /// `duration`) join the clips with straight cuts; the intro/outro cards
+    /// and the project fade-in / fade-out are kept either way.
     #[serde(default = "default_transition")]
     pub default: String,
     #[serde(with = "humantime_serde", default = "default_transition_duration")]
