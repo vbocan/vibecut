@@ -777,7 +777,11 @@ and primaries, and the run log lists the clips that get converted:
 
 The conversion happens before `lut`, so a creative LUT grades HDR clips
 the same way as the rest. Each chapter's probed colour info is recorded
-in the manifest (`sources[].chapters[].color`).
+in the manifest (`sources[].chapters[].color`). The same conversion is
+applied to the frames the visual analysis scores (so an HDR clip's
+exposure and sharpness are judged on the picture the render shows; the
+GPU `scale_cuda` path stands aside for those clips) and to the frames the
+web UI and the MCP `inspect_*` tools grab, footage thumbnails included.
 
 ---
 

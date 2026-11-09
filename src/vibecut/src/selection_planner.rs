@@ -477,6 +477,12 @@ pub struct ExtractOpts {
     /// Optional persistent cache. When `Some`, visual analysis results are
     /// keyed by (file_size, mtime, params) and skipped on hit.
     pub cache: Option<crate::disk_cache::Cache>,
+    /// The colour filters ffmpeg has (`zscale` / `tonemap` / `colorspace`):
+    /// each chapter's frames are read through the conversion normalize
+    /// will apply (`plan_color_conversion` on the chapter's colour), so HDR
+    /// footage is scored on its tone-mapped picture. The default (none)
+    /// leaves every chapter as decoded.
+    pub color_support: crate::video_renderer::HwSupport,
 }
 
 impl Default for ExtractOpts {
@@ -489,6 +495,7 @@ impl Default for ExtractOpts {
             visual_hwaccel_cuda: false,
             visual_use_scale_cuda: false,
             cache: None,
+            color_support: crate::video_renderer::HwSupport::default(),
         }
     }
 }
@@ -566,6 +573,11 @@ pub fn extract_telemetry_with(source: &Source, opts: &ExtractOpts) -> SourceTele
         // Visual analysis: one ffmpeg decode per chapter, streaming.
         // Results cache by (size, mtime, params) when configured.
         if opts.with_visual {
+            let color = ch
+                .color
+                .as_ref()
+                .map(|c| crate::video_renderer::plan_color_conversion(c, &opts.color_support))
+                .unwrap_or_default();
             let visual_result = if let Some(cache) = &opts.cache {
                 crate::visual_analysis::analyze_visual_cached(
                     &ch.path,
@@ -574,6 +586,7 @@ pub fn extract_telemetry_with(source: &Source, opts: &ExtractOpts) -> SourceTele
                     opts.visual_h,
                     opts.visual_hwaccel_cuda,
                     opts.visual_use_scale_cuda,
+                    &color,
                     cache,
                 )
             } else {
@@ -584,6 +597,7 @@ pub fn extract_telemetry_with(source: &Source, opts: &ExtractOpts) -> SourceTele
                     opts.visual_h,
                     opts.visual_hwaccel_cuda,
                     opts.visual_use_scale_cuda,
+                    &color,
                 )
             };
             match visual_result {

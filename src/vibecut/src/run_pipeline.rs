@@ -423,6 +423,8 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         visual_hwaccel_cuda,
         visual_use_scale_cuda,
         cache: if cache_enabled { Some(cache.clone()) } else { None },
+        // HDR chapters are scored through the same tone-map normalize uses.
+        color_support: hw.support.clone(),
         ..ExtractOpts::default()
     };
     // Concurrency cap for the per-source ffmpeg fan-out below. NVDEC supports

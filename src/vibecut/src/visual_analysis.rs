@@ -18,6 +18,8 @@ use serde::Serialize;
 use std::io::Read;
 use std::process::{Command, Stdio};
 
+use crate::video_renderer::ColorConversion;
+
 /// Per-frame visual metrics. Frame `i` corresponds to time `i / sample_rate_hz`
 /// since the start of the analyzed video.
 #[derive(Debug, Clone, serde::Deserialize, Serialize, Default)]
@@ -52,7 +54,7 @@ pub const DEFAULT_H: u32 = 270;
 
 /// Cacheable parameter set — included in the cache key so re-analyses with
 /// different settings don't collide.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct VisualCacheKey {
     fps: f32,
     w: u32,
@@ -65,12 +67,18 @@ struct VisualCacheKey {
     use_scale_cuda: bool,
     /// Bumped when the algorithm changes in a way that invalidates old caches.
     algo_version: u32,
+    /// The colour conversion the frames were read through (HDR footage is
+    /// tone-mapped like normalize does it); absent for SDR, so SDR keys are
+    /// what they always were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
 }
 
 const ALGO_VERSION: u32 = 1;
 
 /// Wrap `analyze_visual` with on-disk caching. On cache hit the function
 /// returns instantly; on miss it runs the full decode and stores the result.
+#[allow(clippy::too_many_arguments)]
 pub fn analyze_visual_cached(
     path: &Utf8Path,
     fps: f32,
@@ -78,6 +86,7 @@ pub fn analyze_visual_cached(
     h: u32,
     hwaccel_cuda: bool,
     use_scale_cuda: bool,
+    color: &ColorConversion,
     cache: &crate::disk_cache::Cache,
 ) -> anyhow::Result<VisualAnalysis> {
     let params = VisualCacheKey {
@@ -87,6 +96,7 @@ pub fn analyze_visual_cached(
         hwaccel_cuda,
         use_scale_cuda,
         algo_version: ALGO_VERSION,
+        color: color.cache_tag(),
     };
     let key = crate::disk_cache::Cache::key_for_file(path, &params)?;
     if let Some(cached) = cache.load::<VisualAnalysis>(&key, crate::disk_cache::VISUAL) {
@@ -94,7 +104,7 @@ pub fn analyze_visual_cached(
         return Ok(cached);
     }
     let started = std::time::Instant::now();
-    let result = analyze_visual(path, fps, w, h, hwaccel_cuda, use_scale_cuda)?;
+    let result = analyze_visual(path, fps, w, h, hwaccel_cuda, use_scale_cuda, color)?;
     tracing::info!(
         file = %path.file_name().unwrap_or("?"),
         frames = result.frame_count,
@@ -121,6 +131,12 @@ pub fn analyze_visual_cached(
 /// fallback to a `cuda` filter input), we automatically retry the same file
 /// with the CPU `scale` chain. This per-file fallback keeps mixed projects
 /// working without requiring users to know which clips NVDEC accepts.
+///
+/// `color` is the clip's colour plan (`plan_color_conversion`, as normalize
+/// uses it): HDR footage is tone-mapped to BT.709 before it is measured, so
+/// exposure and sharpness are judged on the picture the render shows, not
+/// on washed-out HLG / PQ code values. A conversion runs on the CPU chain
+/// (it has no `scale_cuda` counterpart); NVDEC decode still applies.
 pub fn analyze_visual(
     path: &Utf8Path,
     fps: f32,
@@ -128,9 +144,11 @@ pub fn analyze_visual(
     h: u32,
     hwaccel_cuda: bool,
     use_scale_cuda: bool,
+    color: &ColorConversion,
 ) -> Result<VisualAnalysis> {
+    let use_scale_cuda = use_scale_cuda && color.filter().is_none();
     // First attempt: whatever the caller asked for.
-    let primary = run_visual_chain(path, fps, w, h, hwaccel_cuda, use_scale_cuda);
+    let primary = run_visual_chain(path, fps, w, h, hwaccel_cuda, use_scale_cuda, color);
 
     // Specifically when the GPU chain failed with a CUDA-init / format-bridge
     // error, retry with the CPU scale chain. We don't blanket-fall-back on
@@ -148,11 +166,24 @@ pub fn analyze_visual(
                     file = %path.file_name().unwrap_or("?"),
                     "GPU scale_cuda chain rejected this source; retrying with CPU scale chain"
                 );
-                return run_visual_chain(path, fps, w, h, hwaccel_cuda, false);
+                return run_visual_chain(path, fps, w, h, hwaccel_cuda, false, color);
             }
         }
     }
     primary
+}
+
+/// The CPU chain's filter: downscale, then (HDR only) the same colour
+/// conversion normalize applies, then the frame rate. The conversion runs
+/// after the scale so its float tone-map works on the small frame. Note the
+/// explicit `format=yuv420p`: it normalises the JPEG-range `yuvj420p` GoPro
+/// sometimes emits, so the `pix_fmt gray` output doesn't trip the
+/// auto-converter on edge cases. SDR keeps its exact old chain.
+fn cpu_chain_filter(w: u32, h: u32, fps: &str, color: &ColorConversion) -> String {
+    match color.filter() {
+        Some(conv) => format!("scale={w}:{h}:flags=fast_bilinear,{conv},fps={fps}"),
+        None => format!("scale={w}:{h}:flags=fast_bilinear,format=yuv420p,fps={fps}"),
+    }
 }
 
 /// One ffmpeg invocation + per-frame analysis loop. Factored out so
@@ -164,6 +195,7 @@ fn run_visual_chain(
     h: u32,
     hwaccel_cuda: bool,
     use_scale_cuda: bool,
+    color: &ColorConversion,
 ) -> Result<VisualAnalysis> {
     let path_str = path.as_str().to_string();
     let fps_s = format!("{fps}");
@@ -180,17 +212,15 @@ fn run_visual_chain(
             format!("scale_cuda={w}:{h},hwdownload,format=nv12,extractplanes=y,fps={fps_s}"),
         ]);
     } else {
-        // CPU-side scale + fps. Hwaccel decode is optional; when present the
-        // decoded frames are auto-downloaded before scale. Note the explicit
-        // `format=yuv420p` after scale: it normalises the JPEG-range
-        // `yuvj420p` GoPro sometimes emits, so the `pix_fmt gray` output
-        // doesn't trip the auto-converter on edge cases.
+        // CPU-side scale (+ colour conversion) + fps. Hwaccel decode is
+        // optional; when present the decoded frames are auto-downloaded
+        // before scale. See `cpu_chain_filter`.
         if hwaccel_cuda {
             args.extend(["-hwaccel".into(), "cuda".into()]);
         }
         args.extend([
             "-i".into(), path_str.clone(),
-            "-vf".into(), format!("scale={w}:{h}:flags=fast_bilinear,format=yuv420p,fps={fps_s}"),
+            "-vf".into(), cpu_chain_filter(w, h, &fps_s, color),
         ]);
     }
     args.extend([
@@ -377,6 +407,74 @@ mod tests {
     fn motion_zero_for_identical_frames() {
         let f = flat(32, 32, 100);
         assert!(frame_diff_msd(&f, &f) < 1e-9);
+    }
+
+    #[test]
+    fn hdr_frames_are_tone_mapped_before_they_are_measured() {
+        use crate::video_renderer::ColorIn;
+        let sdr = cpu_chain_filter(480, 270, "2", &ColorConversion::None);
+        assert_eq!(sdr, "scale=480:270:flags=fast_bilinear,format=yuv420p,fps=2");
+        assert_eq!(cpu_chain_filter(480, 270, "2", &ColorConversion::PixelFormat), sdr);
+        let hlg = ColorConversion::ToneMap(ColorIn {
+            transfer: "arib-std-b67",
+            primaries: "bt2020",
+            matrix: "bt2020nc",
+            range: "tv",
+        });
+        let f = cpu_chain_filter(480, 270, "2", &hlg);
+        assert!(f.starts_with("scale=480:270:flags=fast_bilinear,zscale=tin=arib-std-b67"), "{f}");
+        assert!(f.contains("tonemap=tonemap=mobius") && f.ends_with(",format=yuv420p,fps=2"), "{f}");
+        // The cache key changes only for converted clips.
+        let key = |c: &ColorConversion| {
+            serde_json::to_string(&VisualCacheKey {
+                fps: 2.0,
+                w: 480,
+                h: 270,
+                hwaccel_cuda: false,
+                use_scale_cuda: false,
+                algo_version: ALGO_VERSION,
+                color: c.cache_tag(),
+            })
+            .unwrap()
+        };
+        assert!(!key(&ColorConversion::None).contains("color"));
+        assert_eq!(key(&ColorConversion::None), key(&ColorConversion::PixelFormat));
+        assert_ne!(key(&ColorConversion::None), key(&hlg));
+    }
+
+    /// The tone-mapped chain runs on a real HLG clip (ffmpeg accepts the
+    /// graph into `gray` rawvideo) and changes what is measured.
+    #[test]
+    fn an_hlg_clip_is_analysed_through_its_tone_map() {
+        let ok = |args: &[&str]| Command::new("ffmpeg").args(args).status().is_ok_and(|s| s.success());
+        let support = crate::video_renderer::color_filter_support();
+        if !ok(&["-version"]) || !(support.zscale && support.tonemap) {
+            eprintln!("ffmpeg with zscale + tonemap not available; skipping");
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("vibecut_visual_hdr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let clip = camino::Utf8PathBuf::from_path_buf(d.join("hlg.mp4")).unwrap();
+        let hlg_vf = "format=yuv444p,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,                      zscale=t=linear:npl=203,format=gbrpf32le,                      zscale=p=bt2020:t=arib-std-b67:m=bt2020nc:r=tv:npl=203,format=yuv420p10le";
+        if !ok(&[
+            "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2", "-vf", hlg_vf,
+            "-c:v", "libx265", "-preset", "ultrafast",
+            "-x265-params", "log-level=error:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc",
+            "-color_primaries", "bt2020", "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc",
+            "-color_range", "tv", clip.as_str(),
+        ]) {
+            eprintln!("this ffmpeg can't make an HLG test clip (libx265); skipping");
+            return;
+        }
+        let plan = crate::video_renderer::frame_color_conversion(&clip);
+        assert!(matches!(plan, ColorConversion::ToneMap(_)), "{plan:?}");
+        let mapped = analyze_visual(&clip, 2.0, 160, 90, false, false, &plan).unwrap();
+        let raw = analyze_visual(&clip, 2.0, 160, 90, false, false, &ColorConversion::None).unwrap();
+        assert!(mapped.frame_count >= 3, "{} frames", mapped.frame_count);
+        assert_eq!(mapped.frame_count, raw.frame_count);
+        assert_ne!(mapped.exposure, raw.exposure, "the tone map didn't change the measured picture");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

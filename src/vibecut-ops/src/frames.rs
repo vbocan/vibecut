@@ -8,6 +8,11 @@
 //! plus metadata, not `rmcp::model::Content`. The MCP layer wraps the
 //! result into inline image content for multimodal clients; a REST
 //! layer would instead return the bytes as a data URI or a static file.
+//!
+//! The same calls serve the UI's footage thumbnails (frames of source
+//! chapters). HDR (HLG / PQ) footage is grabbed through the colour
+//! conversion normalize applies to it (`vibecut::video_renderer::
+//! frame_color_conversion`), so its thumbnails aren't washed out.
 
 use std::path::Path;
 
@@ -73,11 +78,38 @@ pub fn clean_timestamps(timestamps: &[f32], duration_secs: f32) -> (Vec<f32>, us
 
 // ---------- raw frame extraction ----------
 
+/// The `-vf` of a frame grab: scale to `width` (height auto, even), then
+/// the clip's colour conversion, if it has one (after the scale, so a
+/// float tone-map works on the small frame).
+fn frame_filter(width: u32, color_filter: Option<&str>) -> String {
+    match color_filter {
+        Some(c) => format!("scale={width}:-2,{c}"),
+        None => format!("scale={width}:-2"),
+    }
+}
+
+/// The colour conversion frames of `path` need (`None` for SDR): one
+/// ffprobe, on a blocking thread.
+async fn color_filter_for(path: &Path) -> Option<String> {
+    let path = camino::Utf8PathBuf::from_path_buf(path.to_path_buf()).ok()?;
+    tokio::task::spawn_blocking(move || vibecut::video_renderer::frame_color_conversion(&path).filter())
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Extract a single frame at `t_secs` from `mp4_path` as a JPEG.
 ///
 /// `width` is the OUTPUT width; height is auto-computed and rounded to
 /// even pixels (mjpeg requires that). Aspect ratio is preserved.
-pub async fn extract_frame_jpeg(mp4_path: &Path, t_secs: f32, width: u32) -> Result<Vec<u8>> {
+/// `color_filter` is the clip's colour conversion
+/// (`ColorConversion::filter`), applied after the scale; `None` for SDR.
+pub async fn extract_frame_jpeg(
+    mp4_path: &Path,
+    t_secs: f32,
+    width: u32,
+    color_filter: Option<&str>,
+) -> Result<Vec<u8>> {
     let path_str = mp4_path.to_str().context("mp4 path is not valid UTF-8")?;
     // -ss before -i = INPUT seek (fast). -frames:v 1 caps at one frame.
     let out = Command::new("ffmpeg")
@@ -92,7 +124,7 @@ pub async fn extract_frame_jpeg(mp4_path: &Path, t_secs: f32, width: u32) -> Res
             "-frames:v",
             "1",
             "-vf",
-            &format!("scale={width}:-2"),
+            &frame_filter(width, color_filter),
             "-q:v",
             JPEG_QSCALE,
             "-f",
@@ -128,11 +160,14 @@ async fn extract_frames_parallel(
 ) -> Vec<(f32, Result<Vec<u8>>)> {
     use futures_util::future::join_all;
 
+    // One colour plan for the file, shared by every frame.
+    let color = color_filter_for(mp4_path).await;
     let path = mp4_path.to_path_buf();
     let futs = timestamps.iter().map(|&t| {
         let path = path.clone();
+        let color = color.clone();
         async move {
-            let r = extract_frame_jpeg(&path, t, width).await;
+            let r = extract_frame_jpeg(&path, t, width, color.as_deref()).await;
             (t, r)
         }
     });
@@ -288,6 +323,79 @@ fn package(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_filter_adds_the_colour_conversion_after_the_scale() {
+        assert_eq!(frame_filter(480, None), "scale=480:-2");
+        assert_eq!(frame_filter(480, Some("zscale=t=linear,tonemap=tonemap=mobius")), "scale=480:-2,zscale=t=linear,tonemap=tonemap=mobius");
+    }
+
+    fn ffmpeg_ok(args: &[&str]) -> bool {
+        std::process::Command::new("ffmpeg").args(args).status().is_ok_and(|s| s.success())
+    }
+
+    /// Mean saturation of a JPEG (ffmpeg signalstats `SATAVG`).
+    fn saturation(jpeg: &[u8], dir: &Path, name: &str) -> f64 {
+        let file = dir.join(name);
+        std::fs::write(&file, jpeg).unwrap();
+        let out = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-f", "lavfi"])
+            .arg(format!("movie={},signalstats", file.to_str().unwrap()))
+            .args(["-show_entries", "frame_tags=lavfi.signalstats.SATAVG", "-of", "default=nw=1:nk=1"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// An HLG clip's thumbnail is tone-mapped like normalize does it: its
+    /// colour comes out close to the SDR original, not washed out.
+    #[tokio::test]
+    async fn hdr_thumbnails_are_tone_mapped_like_normalize() {
+        let support = vibecut::video_renderer::color_filter_support();
+        if !ffmpeg_ok(&["-version"]) || !(support.zscale && support.tonemap) {
+            eprintln!("ffmpeg with zscale + tonemap not available; skipping");
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("vibecut_frames_hdr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (hlg, sdr) = (d.join("GX010077.MP4"), d.join("sdr.mp4"));
+        // SDR testsrc2 placed at HLG reference white (BT.2408), 10-bit HEVC
+        // tagged HLG / BT.2020 — what a GoPro "HLG HDR" clip carries.
+        let hlg_vf = "format=yuv444p,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,\
+                      zscale=t=linear:npl=203,format=gbrpf32le,\
+                      zscale=p=bt2020:t=arib-std-b67:m=bt2020nc:r=tv:npl=203,format=yuv420p10le";
+        let made = ffmpeg_ok(&[
+            "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=1", "-vf", hlg_vf,
+            "-c:v", "libx265", "-preset", "ultrafast",
+            "-x265-params", "log-level=error:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc",
+            "-color_primaries", "bt2020", "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc",
+            "-color_range", "tv", hlg.to_str().unwrap(),
+        ]);
+        if !made {
+            eprintln!("this ffmpeg can't make an HLG test clip (libx265); skipping");
+            return;
+        }
+        assert!(ffmpeg_ok(&[
+            "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=1",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264", "-crf", "16", sdr.to_str().unwrap(),
+        ]));
+        let color = color_filter_for(&hlg).await;
+        assert!(color.as_deref().is_some_and(|c| c.contains("tonemap")), "no tone map planned: {color:?}");
+        assert_eq!(color_filter_for(&sdr).await, None, "an SDR clip gets no conversion");
+
+        let raw = extract_frame_jpeg(&hlg, 0.5, 480, None).await.unwrap();
+        let shown = extract_frames_parallel(&hlg, &[0.5], 480).await.remove(0).1.unwrap();
+        let reference = extract_frames_parallel(&sdr, &[0.5], 480).await.remove(0).1.unwrap();
+        let (raw, shown, reference) =
+            (saturation(&raw, &d, "raw.jpg"), saturation(&shown, &d, "shown.jpg"), saturation(&reference, &d, "ref.jpg"));
+        assert!(raw < reference * 0.6, "the unconverted grab should look washed out: {raw} vs {reference}");
+        assert!(
+            (shown - reference).abs() < reference * 0.25,
+            "the thumbnail should look like the SDR original: {shown} vs {reference} (unconverted {raw})"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn even_timestamps_basic() {

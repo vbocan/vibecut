@@ -791,6 +791,44 @@ pub fn plan_color_conversion(
     }
 }
 
+/// The colour filters this process's `ffmpeg` has — only `zscale`,
+/// `tonemap` and `colorspace` are filled in — detected once, with one
+/// `ffmpeg -filters` (none of [`HwSupport::detect`]'s encoder smoke tests).
+/// Enough for [`plan_color_conversion`] outside a render: the UI's frame
+/// grabs ([`frame_color_conversion`]).
+pub fn color_filter_support() -> HwSupport {
+    static SUPPORT: std::sync::OnceLock<HwSupport> = std::sync::OnceLock::new();
+    SUPPORT
+        .get_or_init(|| match capture("ffmpeg", &["-v", "error", "-filters"]) {
+            Ok(filters) => {
+                let f = filters.to_lowercase();
+                HwSupport {
+                    zscale: lists_filter(&f, "zscale"),
+                    tonemap: lists_filter(&f, "tonemap"),
+                    colorspace: lists_filter(&f, "colorspace"),
+                    ..HwSupport::default()
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "ffmpeg -filters failed; HDR frame grabs stay unconverted");
+                HwSupport::default()
+            }
+        })
+        .clone()
+}
+
+/// How a still frame of `path` (a thumbnail, a frame the UI or an LLM
+/// inspects) is converted so it looks like the clip normalize makes of it:
+/// the same [`plan_color_conversion`], so HDR (HLG / PQ) footage isn't shown
+/// washed out. [`ColorConversion::None`] for SDR and for files that don't
+/// probe.
+pub fn frame_color_conversion(path: &Utf8Path) -> ColorConversion {
+    match crate::media_probe::probe_metadata(path).ok().and_then(|p| p.media?.video) {
+        Some(v) => plan_color_conversion(&v.color, &color_filter_support()),
+        None => ColorConversion::None,
+    }
+}
+
 impl ColorConversion {
     /// Filter-chain fragment that converts the clip, inserted right after
     /// the letterbox scale (so the float tone-map runs at output size).
