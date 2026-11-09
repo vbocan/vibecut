@@ -92,8 +92,8 @@ fn default_seed() -> u64 {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RenderArgs {
     /// Path to a TOML config file inside the container — typically the
-    /// `config_path` returned by `propose_vibe`. Absolute or relative to
-    /// `/projects`.
+    /// `config_path` returned by `propose_vibe`. Relative to `/projects`,
+    /// or absolute under it — paths outside `/projects` are rejected.
     pub config_path: String,
 }
 

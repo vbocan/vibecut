@@ -63,3 +63,59 @@ pub async fn write_config_structured(
         vibecut_ops::config_io::write_config_structured(&body.config_path, &body.config).await?;
     Ok(Json(cfg))
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    fn status<T>(r: Result<T, ApiError>) -> Option<StatusCode> {
+        r.err().map(|e| e.into_response().status())
+    }
+
+    /// `GET /api/config?config_path=/proc/self/environ` used to hand back
+    /// the server's environment, `ANTHROPIC_API_KEY` included.
+    #[tokio::test]
+    async fn reads_outside_projects_are_a_400() {
+        for p in ["/proc/self/environ", "../etc/passwd", "..\\..\\etc\\passwd"] {
+            let q = || Query(ConfigPathQuery { config_path: p.into() });
+            assert_eq!(status(read_config(q()).await), Some(StatusCode::BAD_REQUEST), "{p:?}");
+            assert_eq!(
+                status(read_config_structured(q()).await),
+                Some(StatusCode::BAD_REQUEST),
+                "{p:?}"
+            );
+        }
+    }
+
+    /// A config that parses and validates, so only the path can be at fault.
+    const VALID_TOML: &str = r#"
+schema_version = 1
+[project]
+name = "x"
+target_duration = "10s"
+fps = 30
+[input]
+folder = "."
+[[outputs]]
+path = "out.mp4"
+resolution = "1920x1080"
+"#;
+
+    #[tokio::test]
+    async fn writes_outside_projects_or_to_non_toml_are_a_400() {
+        for p in ["/etc/cron.d/x.toml", "../x.toml", "out/render.mp4"] {
+            let body = WriteConfigBody {
+                config_path: p.into(),
+                config_toml: VALID_TOML.into(),
+            };
+            assert_eq!(
+                status(write_config(Json(body)).await),
+                Some(StatusCode::BAD_REQUEST),
+                "{p:?}"
+            );
+        }
+    }
+}

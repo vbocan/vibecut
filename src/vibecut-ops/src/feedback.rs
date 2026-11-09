@@ -18,6 +18,7 @@
 //! a `[[selection.exclude]]` mechanism on the picker side that doesn't
 //! exist yet.
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -29,7 +30,7 @@ use vibecut::project_config::{
 };
 
 use crate::error::OpsError;
-use crate::paths::resolve_projects;
+use crate::paths::{ensure_toml_extension, resolve_under, PROJECTS_ROOT};
 
 /// One discrete pattern of feedback. Each variant is a self-contained
 /// deterministic mutation against a [`Config`]; the LLM picks the
@@ -606,11 +607,40 @@ pub struct ApplyFeedbackResult {
 /// tool (and, eventually, the web UI's quick-feedback buttons) call
 /// this directly instead of hand-rolling the load/mutate/validate/save
 /// round-trip themselves.
+///
+/// `config_path` is confined to `/projects` and must be a `.toml`
+/// (this writes to it), and so is a drop-segment's explicit
+/// `manifest_path` — both arrive from unauthenticated callers.
 pub async fn apply_feedback_to_file(
     config_path: &str,
     action: &FeedbackAction,
 ) -> Result<ApplyFeedbackResult, OpsError> {
-    let cfg_path = resolve_projects(config_path);
+    apply_feedback_to_file_in(Path::new(PROJECTS_ROOT), config_path, action).await
+}
+
+async fn apply_feedback_to_file_in(
+    root: &Path,
+    config_path: &str,
+    action: &FeedbackAction,
+) -> Result<ApplyFeedbackResult, OpsError> {
+    let cfg_path = resolve_under(root, config_path)?;
+    ensure_toml_extension(&cfg_path)?;
+
+    let confined;
+    let action = match action {
+        FeedbackAction::DropSegment {
+            at_seconds,
+            manifest_path: Some(p),
+        } => {
+            confined = FeedbackAction::DropSegment {
+                at_seconds: *at_seconds,
+                manifest_path: Some(resolve_under(root, p)?.to_string_lossy().into_owned()),
+            };
+            &confined
+        }
+        other => other,
+    };
+
     if !cfg_path.exists() {
         return Err(OpsError::not_found_with(
             "config",
@@ -1111,5 +1141,63 @@ stabilize = false
         assert_eq!(fmt_duration(Duration::from_secs(45)), "45s");
         assert_eq!(fmt_duration(Duration::from_millis(750)), "750ms");
         assert_eq!(fmt_duration(Duration::from_secs(3600)), "1h");
+    }
+
+    /// A fresh, empty temp dir standing in for `/projects`.
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sv_feedback_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn file_level_feedback_is_confined_to_the_root() {
+        let root = temp_root("root");
+        let outside = temp_root("outside");
+        let original = toml::to_string_pretty(&base_config()).unwrap();
+        std::fs::write(root.join("cfg.toml"), &original).unwrap();
+        std::fs::write(root.join("cfg.json"), &original).unwrap();
+        let outside_cfg = outside.join("cfg.toml");
+        std::fs::write(&outside_cfg, &original).unwrap();
+        let outside_name = outside.file_name().unwrap().to_string_lossy().into_owned();
+
+        // The config itself: outside the root, traversal, and non-.toml.
+        for p in [
+            outside_cfg.to_string_lossy().into_owned(),
+            format!("../{outside_name}/cfg.toml"),
+            format!("..\\{outside_name}\\cfg.toml"),
+            "cfg.json".to_string(),
+        ] {
+            let r = apply_feedback_to_file_in(&root, &p, &FeedbackAction::Calmer).await;
+            assert!(
+                matches!(r, Err(OpsError::InvalidInput { .. })),
+                "{p:?} should be rejected, got {r:?}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&outside_cfg).unwrap(), original);
+
+        // A drop-segment's explicit manifest path.
+        for m in ["/etc/passwd", "../manifest.json", "..\\manifest.json"] {
+            let action = FeedbackAction::DropSegment {
+                at_seconds: 1.0,
+                manifest_path: Some(m.to_string()),
+            };
+            let r = apply_feedback_to_file_in(&root, "cfg.toml", &action).await;
+            assert!(
+                matches!(r, Err(OpsError::InvalidInput { .. })),
+                "manifest {m:?} should be rejected, got {r:?}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(root.join("cfg.toml")).unwrap(), original);
+
+        // The same call on a config inside the root goes through.
+        let r = apply_feedback_to_file_in(&root, "cfg.toml", &FeedbackAction::Calmer)
+            .await
+            .expect("a config under the root should accept feedback");
+        assert_eq!(std::path::PathBuf::from(r.config_path), root.join("cfg.toml"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

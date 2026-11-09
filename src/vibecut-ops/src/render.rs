@@ -9,7 +9,7 @@ use camino::Utf8PathBuf;
 
 use crate::error::OpsError;
 use crate::jobs::{JobRegistry, JobState};
-use crate::paths::resolve_projects;
+use crate::paths::resolve_projects_checked;
 
 /// Render `config_path` to an mp4. Blocking under the hood — the
 /// pipeline is a sync, CPU/GPU-bound function that spawns ffmpeg — but
@@ -17,7 +17,7 @@ use crate::paths::resolve_projects;
 /// Takes 1–10 minutes. Returns the same result shape whether called
 /// here or polled via [`render_status`] after [`submit_async`].
 pub async fn render_sync(config_path: &str) -> Result<serde_json::Value, OpsError> {
-    let cfg = resolve_projects(config_path);
+    let cfg = resolve_projects_checked(config_path)?;
     if !cfg.exists() {
         return Err(OpsError::not_found_with(
             "config",
@@ -54,7 +54,7 @@ pub async fn render_sync(config_path: &str) -> Result<serde_json::Value, OpsErro
 /// runs in the background via `tokio::spawn` + `spawn_blocking`; poll
 /// with [`render_status`].
 pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<String, OpsError> {
-    let cfg = resolve_projects(config_path);
+    let cfg = resolve_projects_checked(config_path)?;
     if !cfg.exists() {
         return Err(OpsError::not_found_with(
             "config",
@@ -231,4 +231,24 @@ fn manifest_for_output(p: &PathBuf) -> PathBuf {
 fn load_json(p: &Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(p).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn config_paths_outside_projects_are_rejected() {
+        let jobs = JobRegistry::new();
+        for p in ["/etc/passwd", "../etc/passwd", "..\\..\\etc\\passwd"] {
+            assert!(matches!(
+                render_sync(p).await,
+                Err(OpsError::InvalidInput { .. })
+            ));
+            assert!(matches!(
+                submit_async(&jobs, p).await,
+                Err(OpsError::InvalidInput { .. })
+            ));
+        }
+    }
 }

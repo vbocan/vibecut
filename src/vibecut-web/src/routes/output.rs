@@ -13,7 +13,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use vibecut_ops::error::OpsError;
-use vibecut_ops::paths::{resolve_projects, PROJECTS_ROOT};
+use vibecut_ops::paths::resolve_projects_checked;
 
 use crate::error::ApiError;
 
@@ -23,15 +23,9 @@ pub struct OutputFileQuery {
 }
 
 pub async fn serve_output(Query(q): Query<OutputFileQuery>) -> Result<Response, ApiError> {
-    if !is_safe_projects_path(&q.path) {
-        return Err(OpsError::invalid(format!(
-            "path escapes the /projects mount: {:?}",
-            q.path
-        ))
-        .into());
-    }
-
-    let resolved = resolve_projects(&q.path);
+    // Confined to /projects (traversal, absolute paths elsewhere, and
+    // symlinks out of the mount are all a 400) by the shared resolver.
+    let resolved = resolve_projects_checked(&q.path)?;
     if !resolved.exists() {
         return Err(
             OpsError::not_found_with("output file", resolved.to_string_lossy().into_owned())
@@ -57,68 +51,43 @@ pub async fn serve_output(Query(q): Query<OutputFileQuery>) -> Result<Response, 
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], Body::from(bytes)).into_response())
 }
 
-/// Pure, filesystem-free traversal guard: reject any `..` path
-/// component outright, and require a rooted input to already sit
-/// under [`PROJECTS_ROOT`] rather than resolving it as-is.
-///
-/// Deliberately does its own string-level "is this rooted" check
-/// instead of `Path::is_absolute()` — that method is
-/// platform-dependent, and the mismatch is exactly the kind of bug
-/// that hides until it matters: on Windows, `Path::new("/etc/passwd")
-/// .is_absolute()` is **false** (no drive prefix), which would have
-/// let a POSIX-rooted path fall through to the "relative, get
-/// anchored under PROJECTS_ROOT" branch as if it were harmless — on
-/// Linux (where this actually runs, inside the container) the same
-/// string IS absolute and IS the traversal this guard exists to
-/// catch. `PROJECTS_ROOT` is always the container's POSIX path
-/// regardless of dev host, so the check has to be POSIX-aware
-/// unconditionally, not deferred to a platform-native primitive. A
-/// dev-host unit test running on Windows caught this; see
-/// `rejects_absolute_paths_outside_projects` below.
-fn is_safe_projects_path(user_path: &str) -> bool {
-    use std::path::{Component, Path};
-
-    if Path::new(user_path)
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
-        return false;
-    }
-
-    let normalized = user_path.replace('\\', "/");
-    // Rooted = POSIX-absolute ("/...") or a Windows drive prefix
-    // ("C:...", "D:...", …) — either way, must already live under
-    // PROJECTS_ROOT to be allowed through.
-    let looks_rooted = normalized.starts_with('/') || normalized.as_bytes().get(1) == Some(&b':');
-    if looks_rooted {
-        return normalized.starts_with(PROJECTS_ROOT);
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn rejects_parent_dir_traversal() {
-        assert!(!is_safe_projects_path("../../etc/passwd"));
-        assert!(!is_safe_projects_path("out/../../etc/passwd"));
-        assert!(!is_safe_projects_path("..\\..\\Windows\\System32"));
+    async fn status_for(path: &str) -> StatusCode {
+        match serve_output(Query(OutputFileQuery { path: path.into() })).await {
+            Ok(resp) => resp.status(),
+            Err(e) => e.into_response().status(),
+        }
     }
 
-    #[test]
-    fn rejects_absolute_paths_outside_projects() {
-        assert!(!is_safe_projects_path("/etc/passwd"));
-        assert!(!is_safe_projects_path("C:/Windows/System32"));
-        assert!(!is_safe_projects_path("C:\\Windows\\System32"));
-        assert!(!is_safe_projects_path("D:/anything"));
+    #[tokio::test]
+    async fn rejects_parent_dir_traversal() {
+        for p in ["../../etc/passwd", "out/../../etc/passwd", "..\\..\\Windows\\System32"] {
+            assert_eq!(status_for(p).await, StatusCode::BAD_REQUEST, "{p:?}");
+        }
     }
 
-    #[test]
-    fn accepts_relative_and_projects_rooted_paths() {
-        assert!(is_safe_projects_path("out/render.mp4"));
-        assert!(is_safe_projects_path("render.mp4"));
-        assert!(is_safe_projects_path("/projects/out/render.mp4"));
+    #[tokio::test]
+    async fn rejects_absolute_paths_outside_projects() {
+        for p in [
+            "/etc/passwd",
+            "/proc/self/environ",
+            "/projects-evil/render.mp4",
+            "C:/Windows/System32",
+            "C:\\Windows\\System32",
+            "D:/anything",
+        ] {
+            assert_eq!(status_for(p).await, StatusCode::BAD_REQUEST, "{p:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn projects_paths_get_past_the_guard() {
+        // Not on disk in a test environment, so a 404 — not a 400.
+        for p in ["out/render.mp4", "render.mp4", "/projects/out/render.mp4"] {
+            assert_eq!(status_for(p).await, StatusCode::NOT_FOUND, "{p:?}");
+        }
     }
 }

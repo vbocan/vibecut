@@ -16,7 +16,7 @@ use serde::Serialize;
 use tokio::process::Command;
 
 use crate::error::OpsError;
-use crate::paths::resolve_projects;
+use crate::paths::resolve_projects_checked;
 
 /// Output JPEG width in pixels. 480 px wide at quality 5 (JPEG q≈75)
 /// lands around 30–60 KB per frame for typical GoPro content; that
@@ -212,7 +212,7 @@ pub async fn inspect_output(
     output_path: &str,
     max_frames: Option<u32>,
 ) -> Result<FrameExtractionResult, OpsError> {
-    let mp4 = resolve_projects(output_path);
+    let mp4 = resolve_projects_checked(output_path)?;
     if !mp4.exists() {
         return Err(OpsError::not_found_with(
             "output mp4",
@@ -235,7 +235,7 @@ pub async fn inspect_at(
     output_path: &str,
     timestamps: &[f32],
 ) -> Result<FrameExtractionResult, OpsError> {
-    let mp4 = resolve_projects(output_path);
+    let mp4 = resolve_projects_checked(output_path)?;
     if !mp4.exists() {
         return Err(OpsError::not_found_with(
             "output mp4",
@@ -331,5 +331,19 @@ mod tests {
         // Kept: 5.0, 50.0 (102 > duration is rejected; -1, NaN, ∞ rejected).
         assert_eq!(kept, vec![5.0, 50.0]);
         assert_eq!(rejected, 4);
+    }
+
+    #[tokio::test]
+    async fn output_paths_outside_projects_are_rejected() {
+        for p in ["/etc/passwd", "../etc/passwd", "out\\..\\..\\etc\\passwd"] {
+            assert!(matches!(
+                inspect_output(p, None).await,
+                Err(OpsError::InvalidInput { .. })
+            ));
+            assert!(matches!(
+                inspect_at(p, &[1.0]).await,
+                Err(OpsError::InvalidInput { .. })
+            ));
+        }
     }
 }
