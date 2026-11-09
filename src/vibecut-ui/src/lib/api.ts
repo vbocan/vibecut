@@ -138,6 +138,8 @@ export interface VibeEntry {
 	name: string;
 	rationale: string;
 	default_target_duration: string;
+	/** The music it suits (what the auto pick looks for). */
+	music?: { bpm: [number, number]; energy: [number, number]; moods: string[] };
 }
 
 export function listVibes(): Promise<{ vibes: VibeEntry[] }> {
@@ -601,6 +603,18 @@ export function addMusicFolder(
 	path: string
 ): Promise<MusicLibrary & { added: { path: string; container_path: string; already: boolean } }> {
 	return sendJson('/music/folders', { path });
+}
+
+/** A folder on a drive that probably holds songs (someone's Downloads). */
+export interface SuggestedFolder {
+	path: string;
+	container_path: string;
+	n_songs: number;
+}
+
+/** `GET /music/suggestions`: Downloads / Music folders not read yet. */
+export function musicSuggestions(): Promise<{ folders: SuggestedFolder[] }> {
+	return getJson('/music/suggestions');
 }
 
 /** `POST /music/folders/remove`: take a picked folder out of the library. */

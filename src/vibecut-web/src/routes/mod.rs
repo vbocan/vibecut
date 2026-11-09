@@ -69,6 +69,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/music/file", get(music::serve_music_file))
         .route("/music/pick", get(music::pick_music))
         .route("/music/folders", post(music::add_music_folder))
+        .route("/music/suggestions", get(music::music_suggestions))
         .route("/music/folders/remove", post(music::remove_music_folder))
         .route("/sessions", get(sessions::list_sessions))
         .route("/watch", get(watch::get_watch).put(watch::put_watch))

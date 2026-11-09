@@ -72,6 +72,26 @@ export interface RenderHistoryEntry {
 	config_toml?: string;
 }
 
+const SEEN_TRACKS_KEY = 'vibecut.seenTracks';
+
+function loadSeen(): string[] | null {
+	try {
+		const raw = localStorage.getItem(SEEN_TRACKS_KEY);
+		const v = raw ? JSON.parse(raw) : null;
+		return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : null;
+	} catch {
+		return null;
+	}
+}
+
+function saveSeen(paths: string[]) {
+	try {
+		localStorage.setItem(SEEN_TRACKS_KEY, JSON.stringify(paths));
+	} catch {
+		/* a private window: New badges just don't persist */
+	}
+}
+
 /** What survives a page reload (localStorage). */
 interface Persisted {
 	v: 1;
@@ -269,7 +289,53 @@ class AppState {
 	/** Where to put downloaded songs, as the user knows the folder. */
 	musicImportDirDisplay = $state<string | null>(null);
 
+	// ---------- "Change the music" ----------
+	/** The Change the music sheet: which tab is open, or closed. */
+	musicSheet = $state<'songs' | 'more' | null>(null);
+	/** "Next song": the song offered before it's used (Studio). */
+	songOffer = $state<string | null>(null);
+	/** Library songs this browser has already shown; the rest are New. */
+	seenTracks = $state<string[] | null>(loadSeen());
+
+	/** Songs added since the library was last looked at. */
+	get newTrackPaths(): Set<string> {
+		const seen = new Set(this.seenTracks ?? []);
+		return new Set(this.tracks.map((t) => t.path).filter((p) => !seen.has(p)));
+	}
+
+	/** Everything in the library now counts as seen. */
+	markTracksSeen() {
+		this.seenTracks = this.tracks.map((t) => t.path);
+		saveSeen(this.seenTracks);
+	}
+
+	/** Offer the song after `after` (default: the offered or current one). */
+	offerNextSong(after?: string | null) {
+		if (this.tracks.length < 2) return;
+		const cur = this.effectiveTrack?.path ?? null;
+		const from = after ?? this.songOffer ?? cur;
+		let i = this.tracks.findIndex((t) => t.path === from);
+		for (let k = 0; k < this.tracks.length; k++) {
+			i = (i + 1) % this.tracks.length;
+			if (this.tracks[i].path !== cur) break;
+		}
+		this.songOffer = this.tracks[i].path;
+	}
+
+	/** Use a song: in the Studio it re-renders (offering to stop a running
+	 *  render first), before the first video it's only the choice. */
+	useSong(path: string, from: PendingFrom = 'tweaks') {
+		const title = this.tracks.find((t) => t.path === path)?.title ?? 'new song';
+		this.songOffer = null;
+		this.requestChange(`Song: ${title}`, () => this.changeSong(path), from);
+	}
+
 	private setLibrary(lib: api.MusicLibrary) {
+		// The first library this browser sees isn't "new".
+		if (this.seenTracks === null) {
+			this.seenTracks = lib.tracks.map((t) => t.path);
+			saveSeen(this.seenTracks);
+		}
 		this.tracks = lib.tracks;
 		this.musicWarnings = lib.warnings ?? [];
 		this.musicImportDir = lib.import_dir ?? null;

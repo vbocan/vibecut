@@ -91,6 +91,12 @@ mod tests {
     }
 }
 
+/// `GET /api/music/suggestions`: people's Downloads / Music folders with
+/// songs that the library doesn't read yet.
+pub async fn music_suggestions() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "folders": vibecut_ops::music::suggested_folders().await }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FolderBody {
     /// A display path (`D:\Music`) or a container path.

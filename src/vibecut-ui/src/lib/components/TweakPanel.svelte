@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
 	import type { FeedbackAction } from '$lib/api';
+	import { tick } from 'svelte';
 	import PendingChangeOffer from './PendingChangeOffer.svelte';
 
 	// Six one-tap changes. Each rewrites the project deterministically and
@@ -10,7 +11,7 @@
 		{ label: 'Longer', icon: '⇥', hint: 'A quarter longer', action: { kind: 'scale_duration', factor: 1.25 } },
 		{ label: 'Calmer', icon: '◡', hint: 'Softer transitions, fewer whip-ups', action: { kind: 'calmer' } },
 		{ label: 'More energy', icon: '⚡', hint: 'Snappier cuts, more whip-ups', action: { kind: 'punchier' } },
-		{ label: 'New song', icon: '♪', hint: 'Try the next song in your library', action: 'song' },
+		{ label: 'Next song', icon: '♪', hint: 'Suggest the next song in your library', action: 'song' },
 		{ label: 'Shuffle', icon: '↻', hint: 'Different moments, same style', action: { kind: 'reroll' } }
 	];
 
@@ -25,23 +26,31 @@
 	function tryRun(t: (typeof TWEAKS)[number] | 'mix') {
 		if (busy) return;
 		if (t === 'mix') s.requestChange('Another mix', () => s.anotherMix());
+		else if (t.action === 'song') offerSong();
 		else s.requestChange(t.label, () => run(t));
 	}
 
-	function nextSong(): string | null {
-		if (s.tracks.length === 0) return null;
-		const cur = s.effectiveTrack?.path;
-		const i = s.tracks.findIndex((t) => t.path === cur);
-		return s.tracks[(i + 1) % s.tracks.length].path;
+	function run(t: (typeof TWEAKS)[number]) {
+		if (t.action !== 'song') void s.tweakAndRender(t.action, t.label);
 	}
 
-	function run(t: (typeof TWEAKS)[number]) {
-		if (t.action === 'song') {
-			const p = nextSong();
-			if (p) void s.changeSong(p);
-		} else {
-			void s.tweakAndRender(t.action, t.label);
-		}
+	// "Next song" shows the song first: use it, hear another, or leave it.
+	const offered = $derived(s.tracks.find((t) => t.path === s.songOffer) ?? null);
+	let offerBox: HTMLElement | undefined = $state();
+	async function offerSong() {
+		s.offerNextSong();
+		await tick();
+		offerBox?.querySelector<HTMLElement>('.use-it')?.focus();
+	}
+	function dismissOffer() {
+		s.songOffer = null;
+		panel?.querySelector<HTMLElement>('.tweak.song')?.focus();
+	}
+
+	/** A song path in a change → its title. */
+	function songTitle(v: string): string | null {
+		const t = s.tracks.find((x) => x.path === v || v.endsWith(`/${x.path.split('/').pop()}`));
+		return t ? t.title : null;
 	}
 
 	/** "transition.duration: 400ms → 600ms" → friendlier text. */
@@ -66,7 +75,7 @@
 		if (ms) return `${(Number(ms[1]) / 1000).toFixed(Number(ms[1]) % 1000 ? 1 : 0)} s`;
 		const sec = /^(\d+(?:\.\d+)?)s$/.exec(v.trim());
 		if (sec) return `${sec[1]} s`;
-		if (v.includes('/')) return v.split('/').pop() ?? v;
+		if (v.includes('/')) return songTitle(v) ?? v.split('/').pop() ?? v;
 		return v;
 	}
 </script>
@@ -82,6 +91,7 @@
 			<button
 				type="button"
 				class="tweak"
+				class:song={t.action === 'song'}
 				disabled={t.action === 'song' && s.tracks.length < 2}
 				aria-disabled={busy}
 				title={t.hint}
@@ -92,6 +102,23 @@
 			</button>
 		{/each}
 	</div>
+	{#if offered}
+		<div class="song-offer" bind:this={offerBox} role="group" aria-label="Next song">
+			<span class="so-text"
+				><span class="eyebrow">Next song</span> <strong>♪ {offered.title}</strong>
+				<span class="so-meta">{offered.mood} · {Math.round(offered.bpm)} BPM</span></span
+			>
+			<span class="so-actions">
+				<button class="btn small primary use-it" type="button" aria-disabled={busy} onclick={() => {
+						if (!busy && s.songOffer) s.useSong(s.songOffer);
+					}}>Use it</button
+				>
+				<button class="btn small ghost" type="button" onclick={() => s.offerNextSong()}>Another</button>
+				<button class="btn small ghost" type="button" onclick={() => (s.musicSheet = 'songs')}>All songs…</button>
+				<button class="btn small ghost" type="button" aria-label="Keep the current song" onclick={dismissOffer}>✕</button>
+			</span>
+		</div>
+	{/if}
 	<PendingChangeOffer from="tweaks" returnFocus={() => panel?.querySelector<HTMLElement>('.mix') ?? null} />
 	{#if s.lastChanges.length > 0}
 		<ul class="changes" aria-label="Last change">
@@ -112,6 +139,35 @@
 
 	.eyebrow {
 		margin: 0;
+	}
+
+	.song-offer {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 10px 12px;
+		border-radius: var(--r-md);
+		border: 1px solid var(--line-strong);
+		background: rgba(255, 255, 255, 0.04);
+	}
+
+	.so-text {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 4px 8px;
+	}
+
+	.so-meta {
+		font-size: var(--fs-xs);
+		color: var(--text-dim);
+		text-transform: capitalize;
+	}
+
+	.so-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
 	}
 
 	.mix {

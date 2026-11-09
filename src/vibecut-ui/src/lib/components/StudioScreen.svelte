@@ -53,11 +53,15 @@
 		['?', 'This list']
 	];
 
-	function nextSongPath(): string | null {
-		if (s.tracks.length === 0) return null;
-		const i = s.tracks.findIndex((t) => t.path === s.effectiveTrack?.path);
-		return s.tracks[(i + 1) % s.tracks.length].path;
-	}
+	/** The song of the latest earlier version that used a different one. */
+	const backTo = $derived.by(() => {
+		const now = s.effectiveTrack?.title ?? null;
+		for (let i = s.renderHistory.length - 1; i >= 0; i--) {
+			const song = s.renderHistory[i].song;
+			if (song && song !== now) return s.tracks.find((t) => t.title === song) ?? null;
+		}
+		return null;
+	});
 
 	function moveMoment(delta: number) {
 		const n = s.segmentLayout.length;
@@ -131,11 +135,8 @@
 		else if (k === 's') ask('Shuffle', () => s.tweakAndRender({ kind: 'reroll' }, 'Shuffle'));
 		else if (k === 'm') ask('Another mix', () => s.anotherMix());
 		else if (k === 'n') {
-			if (s.tracks.length > 1)
-				ask('New song', () => {
-					const p = nextSongPath();
-					if (p) return s.changeSong(p);
-				});
+			// Offer the next song in the tweak panel; nothing renders yet.
+			if (s.tracks.length > 1) s.offerNextSong();
 		} else if ((k === 'Delete' || k === 'Backspace') && s.selectedSegmentIndex !== null) {
 			const g = s.segmentLayout[s.selectedSegmentIndex];
 			const label = g ? `Dropped moment ${g.index + 1}` : '';
@@ -373,6 +374,30 @@
 					/>
 				</div>
 			{/if}
+		</div>
+
+		<div class="glass songbar" role="group" aria-label="Song">
+			<span class="eyebrow">Song</span>
+			<span class="sb-title serif">{s.effectiveTrack ? `♪ ${s.effectiveTrack.title}` : 'Original sound'}</span>
+			{#if s.effectiveTrack}
+				<span class="sb-facts"
+					>{Math.round(s.effectiveTrack.bpm)} BPM{#if beat && beat.n_cuts > 0}
+						· {beat.within_tolerance}/{beat.n_cuts} cuts on the beat{/if}</span
+				>
+			{/if}
+			<span class="sb-actions">
+				{#if backTo}
+					<button class="btn ghost small" type="button" onclick={() => backTo && s.useSong(backTo.path)}
+						>Back to {backTo.title}</button
+					>
+				{/if}
+				<button class="btn small primary" type="button" aria-haspopup="dialog" onclick={() => (s.musicSheet = 'songs')}
+					>Change the music</button
+				>
+				<button class="btn ghost small" type="button" aria-haspopup="dialog" onclick={() => (s.musicSheet = 'more')}
+					>Get more music</button
+				>
+			</span>
 		</div>
 
 		{#if s.segmentLayout.length > 0}
@@ -835,5 +860,30 @@
 		100% {
 			transform: scale(1);
 		}
+	}
+
+	.songbar {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px 14px;
+		padding: 12px 16px;
+	}
+
+	.sb-title {
+		font-size: 20px;
+		font-style: italic;
+	}
+
+	.sb-facts {
+		font-size: var(--fs-sm);
+		color: var(--text-dim);
+	}
+
+	.sb-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		margin-left: auto;
 	}
 </style>

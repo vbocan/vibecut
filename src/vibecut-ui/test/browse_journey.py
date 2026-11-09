@@ -123,7 +123,7 @@ def main() -> int:
         page.wait_for_selector("h2#trip-h")
 
         print("Open the dialog from the keyboard")
-        opener = page.get_by_role("button", name="Browse your drives…")
+        opener = page.locator("section", has=page.locator("#trip-h")).get_by_role("button", name="Browse your drives…")
         opener.focus()
         page.keyboard.press("Enter")
         page.wait_for_selector("dialog[open]")

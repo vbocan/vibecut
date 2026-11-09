@@ -6,6 +6,7 @@
 	import CuttingRoom from '$lib/components/CuttingRoom.svelte';
 	import StudioScreen from '$lib/components/StudioScreen.svelte';
 	import ProDrawer from '$lib/components/ProDrawer.svelte';
+	import MusicSheet from '$lib/components/MusicSheet.svelte';
 	import UndoToast from '$lib/components/UndoToast.svelte';
 	import ReelToast from '$lib/components/ReelToast.svelte';
 	import { deepLinkId } from '$lib/watch';
@@ -156,6 +157,7 @@
 <p class="sr-only" role="status">{screen === 'studio' && s.renderMode === 'done' ? 'Your video is ready.' : ''}</p>
 
 <ProDrawer bind:open={proOpen} />
+<MusicSheet />
 <UndoToast />
 <ReelToast />
 

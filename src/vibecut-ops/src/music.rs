@@ -305,6 +305,102 @@ fn add_in(file: &Path, have: &[PathBuf], dir: PathBuf, display: String) -> Resul
     Ok(AddedFolder { container_path: dir.to_string_lossy().into_owned(), path: display, already })
 }
 
+/// A folder on a drive that likely holds the user's songs and isn't in
+/// the library yet: someone's Downloads or Music folder.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SuggestedFolder {
+    /// As the user knows it (`C:\Users\me\Downloads`): what [`add_folder`] takes.
+    pub path: String,
+    pub container_path: String,
+    /// Songs in it and one level below (a lower bound past 500).
+    pub n_songs: u32,
+}
+
+/// Folder names that hold songs: browsers save to Downloads.
+const LIKELY_MUSIC: [&str; 2] = ["Downloads", "Music"];
+/// Profile folders that are never a person's.
+const NOT_PEOPLE: [&str; 4] = ["Public", "Default", "Default User", "All Users"];
+
+/// Downloads and Music folders of every user on every drive (Windows
+/// `Users\*`, Linux `home/*`, a macOS `/Users` mount's `*`) that hold
+/// songs and aren't read already. For "Read my Downloads folder".
+pub async fn suggested_folders() -> Vec<SuggestedFolder> {
+    tokio::task::spawn_blocking(|| {
+        let have: Vec<PathBuf> = music_dirs().into_iter().map(|(d, _)| d).collect();
+        suggested_in(&crate::browse::roots(), &have)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+pub(crate) fn suggested_in(roots: &[crate::browse::BrowseRoot], have: &[PathBuf]) -> Vec<SuggestedFolder> {
+    let have: Vec<PathBuf> = have.iter().filter_map(|d| d.canonicalize().ok()).collect();
+    let mut out = Vec::new();
+    for r in roots.iter().filter(|r| r.kind != crate::browse::RootKind::Footage) {
+        // People's folders: `<root>/Users/<name>`, `<root>/home/<name>`,
+        // or `<root>/<name>` when the root is a users folder itself.
+        let mut people: Vec<Vec<String>> = Vec::new();
+        for base in [Some("Users"), Some("home"), None] {
+            let dir = match base {
+                Some(b) => r.container.join(b),
+                None => r.container.clone(),
+            };
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten().take(200) {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+                if !is_dir || crate::browse::is_hidden_name(&name) || NOT_PEOPLE.contains(&name.as_str()) {
+                    continue;
+                }
+                let mut rel: Vec<String> = base.map(|b| vec![b.to_string()]).unwrap_or_default();
+                rel.push(name);
+                people.push(rel);
+            }
+        }
+        for person in people {
+            for sub in LIKELY_MUSIC {
+                let mut rel = person.clone();
+                rel.push(sub.to_string());
+                let dir = rel.iter().fold(r.container.clone(), |p, c| p.join(c));
+                let Ok(canon) = dir.canonicalize() else { continue };
+                if !canon.is_dir() || have.iter().any(|h| canon.starts_with(h)) || out.iter().any(|s: &SuggestedFolder| Path::new(&s.container_path) == dir) {
+                    continue;
+                }
+                let n = count_songs(&dir, 1, 500);
+                if n > 0 {
+                    out.push(SuggestedFolder {
+                        path: r.display_of(&rel),
+                        container_path: dir.to_string_lossy().into_owned(),
+                        n_songs: n,
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.n_songs.cmp(&a.n_songs).then(a.path.cmp(&b.path)));
+    out.truncate(6);
+    out
+}
+
+/// Audio files in `dir` and up to `depth` levels below, stopping at `cap`.
+fn count_songs(dir: &Path, depth: usize, cap: u32) -> u32 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let mut n = 0;
+    for e in entries.flatten().take(5000) {
+        if n >= cap {
+            break;
+        }
+        let Ok(ft) = e.file_type() else { continue };
+        let name = e.file_name().to_string_lossy().into_owned();
+        if ft.is_file() && is_audio_name(&name) {
+            n += 1;
+        } else if ft.is_dir() && depth > 0 && !name.starts_with('.') {
+            n += count_songs(&e.path(), depth - 1, cap - n);
+        }
+    }
+    n.min(cap)
+}
+
 /// Take a picked folder out of the library (its songs stay on the drive).
 /// `path` is the container path [`music_dirs`] lists, or its display path.
 /// Returns whether it was there.
@@ -1214,5 +1310,32 @@ mod tests {
     fn audio_names_are_counted_by_extension() {
         assert!(is_audio_name("Road.MP3") && is_audio_name("a.flac") && is_audio_name("b.opus"));
         assert!(!is_audio_name(".hidden.mp3") && !is_audio_name("clip.mp4") && !is_audio_name("notes.txt"));
+    }
+
+    /// People's Downloads / Music folders with songs are suggested once,
+    /// biggest first; empty ones, shared profiles and folders the library
+    /// already reads are not.
+    #[test]
+    fn downloads_and_music_folders_are_suggested() {
+        let base = std::env::temp_dir().join(format!("vibecut_suggest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let c = base.join("host/c");
+        let touch = |p: PathBuf| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        };
+        touch(c.join("Users/me/Downloads/a.mp3"));
+        touch(c.join("Users/me/Downloads/b.wav"));
+        touch(c.join("Users/me/Downloads/setup.exe"));
+        touch(c.join("Users/me/Music/Road trip/c.flac"));
+        touch(c.join("Users/you/Downloads/notes.txt"));
+        touch(c.join("Users/Public/Music/d.mp3"));
+        touch(c.join("Users/them/Music/e.mp3"));
+        let roots = crate::browse::roots_from(Some("auto"), &base.join("footage"), &base.join("host"));
+        let have = vec![c.join("Users/them/Music")];
+        let got = suggested_in(&roots, &have);
+        let paths: Vec<(&str, u32)> = got.iter().map(|s| (s.path.as_str(), s.n_songs)).collect();
+        assert_eq!(paths, vec![(r"C:\Users\me\Downloads", 2), (r"C:\Users\me\Music", 1)], "{got:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

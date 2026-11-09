@@ -215,3 +215,36 @@ export const MUSIC_SOURCES: readonly MusicSource[] = [
 		badge: 'Account, credit'
 	}
 ];
+
+/** One "does it fit?" badge for a song against the video. */
+export interface FitBadge {
+	text: string;
+	tone: LicenceTone;
+}
+
+/**
+ * How a song fits: tempo against the vibe's range, length against the
+ * video (a short song loops), a steady beat, and a credit to give.
+ * `vibe` may be missing (no vibe catalogue yet); `targetSecs` 0 skips length.
+ */
+export function fitBadges(
+	t: Pick<Track, 'bpm' | 'duration_secs' | 'grid_tight' | 'attribution_required'>,
+	vibe: { name: string; bpm: [number, number] } | null,
+	targetSecs: number
+): FitBadge[] {
+	const out: FitBadge[] = [];
+	if (vibe && t.bpm > 0) {
+		const [lo, hi] = vibe.bpm;
+		// Half or double time counts: 60 BPM drives a 120 BPM edit fine.
+		const fits = [t.bpm, t.bpm * 2, t.bpm / 2].some((b) => b >= lo - 3 && b <= hi + 3);
+		if (fits) out.push({ text: 'Tempo fits', tone: 'ok' });
+		else out.push({ text: `${t.bpm > hi ? 'Fast' : 'Slow'} for ${vibe.name}`, tone: 'caution' });
+	}
+	if (targetSecs > 0 && t.duration_secs > 0) {
+		if (t.duration_secs + 0.5 >= targetSecs) out.push({ text: 'Long enough', tone: 'ok' });
+		else out.push({ text: `Short: loops ${Math.ceil(targetSecs / t.duration_secs)}×`, tone: 'caution' });
+	}
+	if (t.grid_tight) out.push({ text: 'Steady beat', tone: 'ok' });
+	if (t.attribution_required) out.push({ text: 'Needs credit', tone: 'credit' });
+	return out;
+}

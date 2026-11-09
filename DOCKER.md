@@ -267,7 +267,10 @@ absolute `VIBECUT_PROJECTS`).
 [CONFIG.md](CONFIG.md#footage-from-any-drive). MCP: `browse_folders`.
 Music folders: `POST /api/music/folders` `{"path": "D:\\Music"}` and
 `POST /api/music/folders/remove` `{"path": …}`; `GET /api/music` marks
-them `"picked": true`.
+them `"picked": true`. `GET /api/music/suggestions` lists people's
+Downloads and Music folders (`C:\Users\*\Downloads`, `home/*/Music`, …)
+that hold songs and aren't read yet; the Studio's **Change the music**
+sheet offers them as one-click "Read …" buttons.
 
 ## Test the server in isolation
 

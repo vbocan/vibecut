@@ -215,6 +215,9 @@
 				<button class="btn ghost small" type="button" aria-expanded={showManual} onclick={() => (showManual = !showManual)}>
 					{showManual ? 'Hide' : 'Type a folder'}
 				</button>
+				<button class="btn ghost small" type="button" aria-haspopup="dialog" onclick={() => (s.musicSheet = 'more')}>
+					Free music…
+				</button>
 			</span>
 		</div>
 	{/if}
@@ -262,6 +265,16 @@
 			</div>
 		</div>
 	{:else}
+		{#if compact}
+			<div class="compact-actions">
+				<button class="btn small" type="button" aria-haspopup="dialog" onclick={() => (s.musicSheet = 'songs')}
+					>Hear songs over the video…</button
+				>
+				<button class="btn ghost small" type="button" aria-haspopup="dialog" onclick={() => (s.musicSheet = 'more')}
+					>Get more music</button
+				>
+			</div>
+		{/if}
 		{#if showFolders}
 			<div class="folders-row">
 				<div class="folders" role="radiogroup" aria-label="Music folder" use:radiogroup>
@@ -512,6 +525,12 @@
 		display: flex;
 		flex-wrap: wrap;
 		gap: 6px;
+	}
+
+	.compact-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
 	}
 
 	.head-actions {
