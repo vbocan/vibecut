@@ -40,7 +40,7 @@ Enable multi-angle grouping, choose a sync method (auto, creation-time, audio cr
 
 ### 8. Advanced
 
-The eight scoring weights that decide what counts as an interesting moment (HiLight tags, accelerometer peaks, GPS speed, faces, motion, sharpness/exposure floors, diversity), and the stabilization toggle.
+The scoring weights that decide what counts as an interesting moment (HiLight tags, accelerometer peaks, GPS speed, gyro spins and turns, jumps, faces, motion, sharpness/exposure floors, diversity — see [CONFIG.md](CONFIG.md#scoring-optional)), and the stabilization toggle.
 
 ## Vibe-aware guidance
 

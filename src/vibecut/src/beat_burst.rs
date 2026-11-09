@@ -625,6 +625,7 @@ mod tests {
                 virtual_start_secs: k as f64 * len,
                 reason: "test".into(),
                 score: None,
+                signals: Vec::new(),
             })
             .collect();
         let spans = (0..n).map(|k| (k as f64 * len, (k + 1) as f64 * len)).collect();

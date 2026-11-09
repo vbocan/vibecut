@@ -527,13 +527,92 @@ sensible — only override when you know what you're tuning.
 [scoring]
 hilight_tags         = 1.0               # GoPro HiLight button presses
 accel_peaks          = 0.6               # accelerometer spikes (above-baseline)
-gps_speed            = 0.4               # high-speed moments
-faces                = 0.3               # ML face-detection peaks
+gps_speed            = 0.4               # fast stretches, speed bursts, hard braking (GoPro GPS)
+gyro                 = 0.4               # spins, flips, carving (GoPro gyroscope)
+landings             = 0.7               # jumps: free fall then a landing (accelerometer)
+faces                = 0.3               # reserved: no face model is bundled, so unused
 motion_peaks         = 0.3               # visual frame-difference MSD
 sharpness_floor      = 0.2               # reject bottom 20% by Laplacian variance (0 = no floor)
 exposure_floor       = 0.15              # reject bottom 15% by exposure score (0 = no floor)
 diversity_per_source = 0.5               # boost segments far from already-picked moments in same source
 ```
+
+A weight of `0` turns a signal off. Configs written before `gyro` and
+`landings` existed get the defaults above.
+
+### Telemetry signals
+
+GoPro cameras record a metadata track (GPMF) next to the video. Each
+signal below is used **only when that camera recorded the stream behind
+it** — a phone clip, a drone clip or a GoPro with GPS off simply goes
+without — and footage with no telemetry is scored exactly as before
+(the demo footage's picks are unchanged). `vibecut gpmf <file>` lists
+what a file has.
+
+| Signal | Stream | What scores |
+|---|---|---|
+| `hilight_tags` | HiLight tags (GPMF or the MP4's `HMMT` atom) | a bump at every tag |
+| `accel_peaks` | `ACCL` | jolts above the take's steady vibration |
+| `gps_speed` | `GPS5` (HERO5–10) or `GPS9` (HERO11+) | half speed (against the take's top speed, never below 18 km/h), half bursts above the ~20 s cruising speed — or sudden deceleration (1.5–5 m/s²), whichever is higher |
+| `gyro` | `GYRO` | net rotation rate: 0 below ~30°/s, full at ~230°/s; vibration averages out |
+| `landings` | `ACCL` | free fall (< 0.45 g for 0.2–3 s) followed within 0.4 s by a ≥ 1.8 g landing; the bump peaks mid-flight and grows with airtime |
+| `motion_peaks` | the video itself | on-screen movement above the local baseline |
+
+GPS samples are dropped when the camera reports no lock (`GPSF` < 2, or
+`GPS9`'s per-sample fix) or a dilution of precision above 5 (`GPSP` >
+500), and as glitches (a 0,0 position, faster than 360 km/h); short
+gaps (< 3 s) are bridged, longer ones score nothing. Every stream is
+timed by its own stamps — `STMP` (the camera clock, anchored to the
+file), else `TSMP` (so dropped samples leave a gap), else spread evenly
+over each one-second payload.
+
+How they combine: the **continuous** signals (`accel_peaks`,
+`gps_speed`, `gyro`, `motion_peaks`) are a weighted mean over the ones
+the camera has — a missing stream's weight is shared by the rest —
+scaled so each take's most eventful moment scores `motion_peaks`. So a
+GoPro with GPS and gyro neither outranks a phone clip just for having
+more sensors nor loses to it because its sensors rarely all fire at
+once; the telemetry decides *which* moments of a take are its best.
+HiLight tags and landings are **events**, added on top at their own
+weight: they decide what beats a take's best. The sharpness and exposure
+floors apply last.
+
+Faces: `faces` is accepted but does nothing yet — it needs a face
+detection model, which isn't bundled (and isn't downloaded).
+
+### Scene cuts
+
+When the visual analysis runs (any of `motion_peaks`, `sharpness_floor`,
+`exposure_floor` above 0), it also finds **hard scene cuts** (a frame
+difference at least 4× the typical one around it and 2× either
+neighbour) and **big changes** (a 2.5× jump that comes with a lasting
+exposure or sharpness shift: into a tunnel, under water). A picked clip
+that would straddle one moves into the scene its middle is in, and a
+clip that starts within 1 s after one starts right on it — unless that
+would run into another pick from the same take. One continuous recording
+split into chapter files is never a cut.
+
+### Why a moment was picked
+
+Each scored pick in the manifest carries `signals`: its strongest
+scoring signals (up to three), strongest first, each with its share of
+the moment's score and the measured value in plain words — then a
+placement note when it opens on a scene cut:
+
+```json
+"signals": [
+  { "kind": "landing", "share": 0.61, "label": "airtime 0.6 s" },
+  { "kind": "accel", "share": 0.26, "label": "3.0 g jolt" },
+  { "kind": "scene_start", "share": 0.0, "label": "opens on a scene change" }
+]
+```
+
+`kind` is one of `hilight`, `accel`, `gps_speed` ("38 km/h", "52 km/h,
+top speed", "hard braking from 40 km/h", "hard stop from 31 km/h"),
+`gyro` ("fast spin (458°/s)", "spin", "sharp turn", "turning"),
+`landing`, `motion` ("lots of movement on screen") and `scene_start`.
+Photos, forced ranges, beat-burst cuts and filler picks have none. The
+web UI's moment inspector shows them as "why this moment".
 
 ---
 

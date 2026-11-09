@@ -1023,6 +1023,14 @@
 						<input class="text-input mono" type="number" step="0.05" min="0" bind:value={cfg.scoring.gps_speed} />
 					</label>
 					<label class="field narrow">
+						<span>Gyro (spins, turns)</span>
+						<input class="text-input mono" type="number" step="0.05" min="0" bind:value={cfg.scoring.gyro} />
+					</label>
+					<label class="field narrow">
+						<span>Jumps (airtime)</span>
+						<input class="text-input mono" type="number" step="0.05" min="0" bind:value={cfg.scoring.landings} />
+					</label>
+					<label class="field narrow">
 						<span>Faces</span>
 						<input class="text-input mono" type="number" step="0.05" min="0" bind:value={cfg.scoring.faces} />
 					</label>

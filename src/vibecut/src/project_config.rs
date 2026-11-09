@@ -471,7 +471,15 @@ fn default_soundtrack_fade_out() -> Duration {
 pub struct Scoring {
     pub hilight_tags: f32,
     pub accel_peaks: f32,
+    /// GPS speed: fast stretches, speed bursts and hard stops (GoPro
+    /// `GPS5` / `GPS9`; cameras without GPS ignore it).
     pub gps_speed: f32,
+    /// Gyroscope rotation energy: spins, flips, carving (GoPro `GYRO`).
+    pub gyro: f32,
+    /// Jumps: accelerometer free fall followed by a landing spike. Added
+    /// on top like HiLight tags, scaled by airtime.
+    pub landings: f32,
+    /// Not used yet: face detection needs a model that isn't bundled.
     pub faces: f32,
     /// Visual motion peaks weight (frame-difference MSD).
     pub motion_peaks: f32,
@@ -491,6 +499,8 @@ impl Default for Scoring {
             hilight_tags: 1.0,
             accel_peaks: 0.6,
             gps_speed: 0.4,
+            gyro: 0.4,
+            landings: 0.7,
             faces: 0.3,
             motion_peaks: 0.3,
             sharpness_floor: 0.2,
@@ -1262,6 +1272,17 @@ stabilize = false
         cfg2.validate().expect("re-validate");
         assert_eq!(cfg.project.name, cfg2.project.name);
         assert_eq!(cfg.project.target_duration, cfg2.project.target_duration);
+    }
+
+    #[test]
+    fn scoring_blocks_without_the_telemetry_weights_get_their_defaults() {
+        // SAMPLE's [scoring] predates `gyro` / `landings`.
+        let cfg: Config = toml::from_str(SAMPLE).expect("parse");
+        assert_eq!((cfg.scoring.gps_speed, cfg.scoring.gyro, cfg.scoring.landings), (0.4, 0.4, 0.7));
+        let tuned = SAMPLE.replace("faces                 = 0.3", "faces = 0.3\ngyro = 0.9\nlandings = 0");
+        assert_ne!(tuned, SAMPLE);
+        let cfg: Config = toml::from_str(&tuned).expect("parse");
+        assert_eq!((cfg.scoring.gyro, cfg.scoring.landings), (0.9, 0.0));
     }
 
     #[test]

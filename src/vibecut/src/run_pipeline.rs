@@ -295,6 +295,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 virtual_start_secs: img.duration.as_secs_f64() * i as f64,
                 reason: format!("image (effect={:?})", img.effect),
                 score: Some(0.5),
+                signals: Vec::new(),
             }
         })
         .collect();
@@ -509,8 +510,15 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 format!("  vis_frames={}  sharp_avg={:.0}  expo_avg={:.2}",
                     tel.visual_sharpness.len(), avg_sharp, avg_expo)
             } else { String::new() };
+            // GPS / gyro / scene cuts, only for footage that has them.
+            let tele_extra = if tel.gps_speed_mps.is_empty() && tel.gyro_rad_s.is_empty() && tel.scene_cuts.is_empty() {
+                String::new()
+            } else {
+                format!("  gps={}  gyro={}  scene_cuts={}",
+                    tel.gps_speed_mps.len(), tel.gyro_rad_s.len(), tel.scene_cuts.len())
+            };
             println!(
-                "  · {:<8}  hilights={}  accel={}  curve peak={:.3} mean={:.3}{vis_extra}",
+                "  · {:<8}  hilights={}  accel={}  curve peak={:.3} mean={:.3}{vis_extra}{tele_extra}",
                 source.id,
                 tel.hilights_secs.len(),
                 tel.accel_mag.len(),
@@ -697,6 +705,13 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         cfg.selection.variety,
         cfg.project.seed.unwrap_or(0),
     );
+    // Keep picks off hard scene cuts in the footage, then record why each
+    // one was chosen (the manifest's `segments[].signals`).
+    let moved_off_cuts = crate::moment_signals::avoid_scene_cuts(&mut segments, &sources, &telemetries);
+    if moved_off_cuts > 0 {
+        println!("\nscene cuts: moved {moved_off_cuts} pick{} clear of a scene change", plural(moved_off_cuts));
+    }
+    crate::moment_signals::explain_segments(&mut segments, &sources, &telemetries, &cfg.scoring, 4.0);
 
     // For each segment whose source_id is a group master, pick the
     // best angle to actually display. Rewrites the segment's source/chapter/
@@ -828,6 +843,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             virtual_start_secs: start,
             reason: format!("forced via [[input.ranges]] {start:.2}s..{clamped_end:.2}s"),
             score: Some(1.0),
+            signals: Vec::new(),
         });
         forced_added += 1;
     }
@@ -1010,6 +1026,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                             c.score
                         ),
                         score: Some(c.score),
+                        signals: Vec::new(),
                     })
                     .collect();
                 let start = plan.replace_at;
@@ -1623,6 +1640,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 // the energy_arc placement keeps it near the peak (it's the
                 // most kinetic moment of the cut by construction).
                 score: Some(1.0),
+                signals: Vec::new(),
             };
             normalized.splice(bs..be, std::iter::once(burst_intermediate));
             burst_parts = segments.splice(bs..be, std::iter::once(synth)).collect();
@@ -3193,6 +3211,7 @@ mod tests {
             virtual_start_secs: 0.0,
             reason: String::new(),
             score: Some(score),
+            signals: Vec::new(),
         }
     }
 
@@ -3272,6 +3291,7 @@ mod tests {
                 virtual_start_secs: 0.0,
                 reason: "video".into(),
                 score: Some(0.7),
+                signals: Vec::new(),
             }
         }
         fn iseg(stem: &str) -> Segment {
@@ -3284,6 +3304,7 @@ mod tests {
                 virtual_start_secs: 0.0,
                 reason: "image".into(),
                 score: Some(0.5),
+                signals: Vec::new(),
             }
         }
 

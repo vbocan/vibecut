@@ -25,6 +25,7 @@ pub mod rng;
 pub mod gopro_metadata;
 pub mod media_probe;
 pub mod ml_engine;
+pub mod moment_signals;
 pub mod multi_angle;
 pub mod output_timeline;
 pub mod output_format;
