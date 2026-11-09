@@ -27,7 +27,10 @@ the same analysis a render uses (fitted beat grid, energy curve, loud
 region), so the BPM and mood the library shows are what the render sees.
 Results are cached in memory and in `/projects/.vibecut-cache`
 (`*.music.json`, keyed by path, size and modification time), so a large
-folder is analysed once rather than on every server start.
+folder is analysed once rather than on every server start. The web and MCP
+servers start analysing the library as soon as they start, and only one
+scan runs at a time: a listing or proposal that arrives while one is
+running waits for it and shares its result, so new songs are decoded once.
 
 `GET /api/music` returns every track with its analysis, licence, credit
 line and metadata source, plus `import_dir` (where downloads go),
@@ -78,7 +81,12 @@ Tracks within 0.04 of the best score are equally good; the proposal's
 `seed` chooses among up to three of them. The same vibe, length, seed and
 library always give the same song; a new seed may give another.
 
-- `soundtrack = "<path>"` in the propose request uses that file instead.
+- `soundtrack = "<path>"` in the propose request uses that file instead. It
+  must be an audio file inside the projects folder (`/projects`, which holds
+  `/projects/music`) or a `VIBECUT_MUSIC_DIRS` folder, after resolving `..`
+  and symlinks; a relative path is read from `/projects`. Anything else is
+  refused with 400 whether or not it exists; a missing file inside those
+  folders is a 404.
 - `soundtrack = "none"` proposes without music (the clips keep their sound).
 - `GET /api/music/pick?vibe=…&target_duration=…&seed=…` returns the pick a
   proposal with those settings would make — the web UI shows it as
@@ -115,7 +123,7 @@ next to the music — never from the audio file. Most specific first:
 |---|---|
 | `title` | Display title (default: from the file name). |
 | `artist` | Who made it. |
-| `licence` (or `license`) | `CC0-1.0`, `CC-BY-4.0`, `CC-BY-SA-4.0`, `CC-BY-NC-4.0`, `Pixabay`, `YouTube-Audio-Library`, `custom`, or any other text (treated as a custom licence). Spelling is forgiving: `CC BY 4.0`, `cc-by-3.0`, `public domain`. |
+| `licence` (or `license`) | `CC0-1.0`, `CC-BY-4.0`, `CC-BY-SA-4.0`, `CC-BY-NC-4.0`, `Pixabay`, `YouTube-Audio-Library`, `custom`, or any other text (treated as a custom licence). Spelling is forgiving: `CC BY 4.0`, `cc-by-3.0`, `public domain`, and a CC licence the way sites and deeds write it — `Attribution 4.0 International (CC BY 4.0)` (Free Music Archive), `Creative Commons: By Attribution 4.0` (Incompetech), `Creative Commons Attribution-ShareAlike 4.0`, `CC0 1.0 Universal`, or the deed URL (`https://creativecommons.org/licenses/by/4.0/`). |
 | `source_url` (or `url`) | Where it was downloaded from. |
 | `credit` (or `attribution`) | The exact credit line the site asks for. |
 | `bpm` | Tempo the site declares (informational — renders use the detected beat grid). |
@@ -139,7 +147,12 @@ What each licence means when you post:
 | CC BY-ND | yes | No adaptations: cutting it into a video may not be allowed. |
 | Pixabay | no | Free to use, but some Pixabay tracks are registered with Content ID (the shield icon on the site), so YouTube may flag the video — the licence lets you dispute it. |
 | YouTube Audio Library | when marked | Safe on YouTube; terms on other platforms are unclear. |
-| custom | when a `credit` is given | Read its terms before posting publicly. |
+| custom | when a `credit` is given, or its text asks for one | Read its terms before posting publicly. |
+
+A custom licence whose text mentions attribution, credit or Creative
+Commons ("Free with attribution", "credit required") counts as needing
+credit, unless it says it doesn't ("no attribution required"); set
+`attribution_required` to override either way.
 
 When credit is required and no `credit` line is given, Vibecut builds one
 in the form Creative Commons recommends (title, author, source, licence):
@@ -149,7 +162,10 @@ Music: "Night Drive" by Ada (https://example.org/night) — licensed under CC BY
 ```
 
 The web UI's share caption uses that line for tracks that need credit,
-and `Music: <title>` otherwise.
+and `Music: <title>` otherwise. It credits the song the shared video
+actually has: the render's own record in the manifest (below), or the
+project's `[soundtrack]` file — never a fresh "Picked for you", which can
+differ after a reload or once new songs are added.
 
 ### Credits in the manifest
 

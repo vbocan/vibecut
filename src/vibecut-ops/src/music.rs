@@ -20,17 +20,22 @@
 //! [`auto_pick`] chooses a song for a vibe so every first render has
 //! music; `propose` and `GET /api/music/pick` both call it, so the UI's
 //! "Picked for you" and the proposed config can't disagree.
+//!
+//! Only one scan runs at a time: callers that arrive while one is in
+//! flight wait for it and share its result, so a cold library (first
+//! start, a batch of new downloads) is decoded once, not once per request.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use vibecut::disk_cache::{Cache, Scope};
 use vibecut::track_meta::{FolderMeta, Licence, LicenceKind, MetaSource, TrackMeta};
 
 use crate::error::OpsError;
-use crate::paths::PROJECTS_ROOT;
+use crate::paths::{resolve_projects, PROJECTS_ROOT};
 use crate::vibes::Vibe;
 
 /// Audio file extensions the library picks up.
@@ -82,7 +87,7 @@ pub struct LicenceInfo {
 
 impl From<Licence> for LicenceInfo {
     fn from(l: Licence) -> Self {
-        LicenceInfo { note: l.kind.note(), id: l.id, label: l.label, kind: l.kind }
+        LicenceInfo { note: l.note(), id: l.id, label: l.label, kind: l.kind }
     }
 }
 
@@ -135,29 +140,71 @@ fn cache() -> &'static Mutex<HashMap<CacheKey, TrackAnalysis>> {
     CACHE.get_or_init(Default::default)
 }
 
-fn disk_cache() -> Option<&'static Cache> {
-    static DISK: OnceLock<Option<Cache>> = OnceLock::new();
-    DISK.get_or_init(|| {
-        let root = Path::new(PROJECTS_ROOT);
-        // Tests never write into a real projects folder.
-        if cfg!(test) || !root.is_dir() {
-            return None;
-        }
-        let dir = camino::Utf8PathBuf::from_path_buf(root.join(".vibecut-cache")).ok()?;
+/// Where the library lives, when not the default (`/projects/music` plus
+/// `VIBECUT_MUSIC_DIRS`, analysis cache in `/projects/.vibecut-cache`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryRoots {
+    /// The user's own folder: where downloads go.
+    pub own: PathBuf,
+    /// Further folders, listed as `"library"`.
+    pub extra: Vec<PathBuf>,
+    /// Folder for the on-disk analysis cache; `None` = memory only.
+    pub cache_dir: Option<PathBuf>,
+}
+
+static ROOTS: RwLock<Option<LibraryRoots>> = RwLock::new(None);
+
+/// Serve the library from `roots` instead of the default folders, for this
+/// whole process. For tests of crates that serve the library (they must
+/// never scan or write into a real `/projects`) and for embedders.
+pub fn use_roots(roots: LibraryRoots) {
+    *ROOTS.write().unwrap_or_else(|e| e.into_inner()) = Some(roots);
+}
+
+fn roots_override() -> Option<LibraryRoots> {
+    ROOTS.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The analysis cache a scan should use: the override's folder, else
+/// `/projects/.vibecut-cache` when `/projects` exists. This crate's own
+/// tests never touch the default one; other crates' tests use [`use_roots`].
+fn disk_cache() -> Option<Cache> {
+    let open = |dir: PathBuf| {
+        let dir = camino::Utf8PathBuf::from_path_buf(dir).ok()?;
         Cache::open(&dir, true)
             .map_err(|e| tracing::warn!(error = %e, "music analysis cache unavailable"))
             .ok()
-    })
-    .as_ref()
+    };
+    if let Some(r) = roots_override() {
+        return r.cache_dir.and_then(open);
+    }
+    static DEFAULT: OnceLock<Option<Cache>> = OnceLock::new();
+    DEFAULT
+        .get_or_init(|| {
+            let root = Path::new(PROJECTS_ROOT);
+            if cfg!(test) || !root.is_dir() {
+                return None;
+            }
+            open(root.join(".vibecut-cache"))
+        })
+        .clone()
 }
 
 /// The user's own music folder (`/projects/music`): where to put downloads.
 pub fn own_music_dir() -> PathBuf {
-    Path::new(PROJECTS_ROOT).join("music")
+    match roots_override() {
+        Some(r) => r.own,
+        None => Path::new(PROJECTS_ROOT).join("music"),
+    }
 }
 
 /// Music directories, user's own first.
 pub fn music_dirs() -> Vec<(PathBuf, &'static str)> {
+    if let Some(r) = roots_override() {
+        let mut dirs = vec![(r.own, "yours")];
+        dirs.extend(r.extra.into_iter().map(|d| (d, "library")));
+        return dirs;
+    }
     let mut dirs = vec![(own_music_dir(), "yours")];
     if let Ok(extra) = std::env::var("VIBECUT_MUSIC_DIRS") {
         // OS path-list syntax (';' on Windows, ':' elsewhere), absolute
@@ -188,6 +235,44 @@ fn is_audio(p: &Path) -> bool {
         .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
+/// Check a soundtrack file a caller named (propose's `soundtrack`): an
+/// audio file inside the projects folder or a music directory, after
+/// resolving `..` and symlinks. A relative path is taken from the
+/// projects folder. Returns the path to write into the config.
+///
+/// A path outside those folders is refused the same way whether or not it
+/// exists, so the check can't be used to probe the server's filesystem.
+pub fn check_soundtrack_file(requested: &str) -> Result<PathBuf, OpsError> {
+    let mut roots: Vec<PathBuf> = music_dirs().into_iter().map(|(d, _)| d).collect();
+    roots.push(PathBuf::from(PROJECTS_ROOT));
+    soundtrack_file_in(&resolve_projects(requested.trim()), &roots)
+}
+
+fn soundtrack_file_in(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, OpsError> {
+    let refuse = || {
+        OpsError::invalid_with_hint(
+            format!("soundtrack must be an audio file in your music folder or projects folder: {:?}", path.display().to_string()),
+            format!("put the song in {} and pick it from the library", own_music_dir().display()),
+        )
+    };
+    let lexical_ok = path.is_absolute()
+        && is_audio(path)
+        && !path.components().any(|c| matches!(c, Component::ParentDir))
+        && roots.iter().any(|r| path.starts_with(r));
+    if !lexical_ok {
+        return Err(refuse());
+    }
+    // Named inside a root: now it may be missing, or a link out of it.
+    let canon = match path.canonicalize() {
+        Ok(c) if c.is_file() => c,
+        _ => return Err(OpsError::not_found_with("soundtrack file", path.display().to_string())),
+    };
+    if !roots.iter().filter_map(|r| r.canonicalize().ok()).any(|r| canon.starts_with(r)) || !is_audio(&canon) {
+        return Err(refuse());
+    }
+    Ok(path.to_path_buf())
+}
+
 /// List and analyse every track. New or changed files are analysed on
 /// a blocking thread (a fraction of a second each); the rest come from
 /// the cache.
@@ -197,12 +282,50 @@ pub async fn list_tracks() -> Result<Vec<TrackInfo>, OpsError> {
 
 /// [`list_tracks`] plus the warnings the scan produced.
 pub async fn list_library() -> Result<Library, OpsError> {
-    tokio::task::spawn_blocking(|| scan(&music_dirs()))
-        .await
-        .map_err(|e| OpsError::internal(format!("music scan panicked: {e}")))
+    scan_shared(music_dirs()).await
 }
 
-fn scan(dirs: &[(PathBuf, &'static str)]) -> Library {
+/// Start analysing the library in the background at server start, so the
+/// first proposal doesn't wait for a cold library; a request that arrives
+/// meanwhile joins this scan instead of starting its own.
+pub fn warm_up() {
+    tokio::spawn(async {
+        match list_library().await {
+            Ok(lib) => tracing::info!(tracks = lib.tracks.len(), "music library analysed"),
+            Err(e) => tracing::warn!(error = %e, "music library warm-up failed"),
+        }
+    });
+}
+
+/// The most recent scan, kept so callers that queued behind it can share it.
+struct LastScan {
+    dirs: Vec<(PathBuf, &'static str)>,
+    finished: Instant,
+    lib: Library,
+}
+
+static SCAN: tokio::sync::Mutex<Option<LastScan>> = tokio::sync::Mutex::const_new(None);
+
+/// Scan `dirs`, one scan at a time. A caller that arrives while a scan of
+/// the same folders is running waits for it and gets its result rather
+/// than starting a second scan over the same uncached files.
+async fn scan_shared(dirs: Vec<(PathBuf, &'static str)>) -> Result<Library, OpsError> {
+    let asked = Instant::now();
+    let mut last = SCAN.lock().await;
+    if let Some(prev) = last.as_ref() {
+        if prev.finished >= asked && prev.dirs == dirs {
+            return Ok(prev.lib.clone());
+        }
+    }
+    let scan_dirs = dirs.clone();
+    let lib = tokio::task::spawn_blocking(move || scan(&scan_dirs, disk_cache().as_ref()))
+        .await
+        .map_err(|e| OpsError::internal(format!("music scan panicked: {e}")))?;
+    *last = Some(LastScan { dirs, finished: Instant::now(), lib: lib.clone() });
+    Ok(lib)
+}
+
+fn scan(dirs: &[(PathBuf, &'static str)], disk_cache: Option<&Cache>) -> Library {
     let mut lib = Library::default();
     for (dir, collection) in dirs {
         let mut files = Vec::new();
@@ -210,7 +333,7 @@ fn scan(dirs: &[(PathBuf, &'static str)]) -> Library {
         files.sort();
         let mut folders: HashMap<PathBuf, FolderMeta> = HashMap::new();
         for f in files {
-            let analysis = match analyse(&f) {
+            let analysis = match analyse_with(&f, disk_cache) {
                 Ok(a) => a,
                 Err(e) => {
                     tracing::warn!(path = %f.display(), error = %e, "skipping unreadable track");
@@ -285,11 +408,12 @@ fn collect_audio(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Analyse one file, via the memory cache, then the disk cache.
-fn analyse(path: &Path) -> anyhow::Result<TrackAnalysis> {
-    analyse_with(path, disk_cache())
-}
+/// How many times each file was actually decoded (tests: one scan at a time
+/// means each new file is decoded once).
+#[cfg(test)]
+static DECODES: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
 
+/// Analyse one file, via the memory cache, then the disk cache.
 fn analyse_with(path: &Path, disk_cache: Option<&Cache>) -> anyhow::Result<TrackAnalysis> {
     let meta = std::fs::metadata(path)?;
     let mtime = meta
@@ -311,6 +435,11 @@ fn analyse_with(path: &Path, disk_cache: Option<&Cache>) -> anyhow::Result<Track
     if let Some(hit) = disk.as_ref().and_then(|(c, k)| c.load::<TrackAnalysis>(k, CACHE_SCOPE)) {
         cache().lock().unwrap_or_else(|e| e.into_inner()).insert(key, hit.clone());
         return Ok(hit);
+    }
+    #[cfg(test)]
+    {
+        let mut d = DECODES.lock().unwrap_or_else(|e| e.into_inner());
+        *d.get_or_insert_with(HashMap::new).entry(path.to_path_buf()).or_default() += 1;
     }
     let a = vibecut::audio_analysis::analyze_file(utf8)?;
     let energy_mean = if a.energy_curve.is_empty() {
@@ -833,7 +962,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("starter/unvetted.wav.json"), "{ broken").unwrap();
 
-        let lib = scan(&[(root.clone(), "library")]);
+        let lib = scan(&[(root.clone(), "library")], None);
         let by_title: HashMap<&str, &TrackInfo> = lib.tracks.iter().map(|t| (t.title.as_str(), t)).collect();
         assert_eq!(lib.tracks.len(), 3, "{:?}", lib.tracks.iter().map(|t| &t.title).collect::<Vec<_>>());
         let mine = by_title["Mine"];
@@ -850,5 +979,74 @@ mod tests {
         assert!(lib.warnings.iter().any(|w| w.contains("unvetted.wav.json")), "{:?}", lib.warnings);
         assert!(lib.warnings.iter().any(|w| w.contains("starter pack folder")), "{:?}", lib.warnings);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The page load's listing and an early propose arrive together on a
+    /// cold library: they share one scan, so each file is decoded once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_listings_share_one_scan() {
+        let root = std::env::temp_dir().join(format!("vibecut_music_single_flight_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_click_wav(&root.join("a.wav"));
+        write_click_wav(&root.join("b.wav"));
+        let dirs = vec![(root.clone(), "yours")];
+        let decodes = |f: &str| {
+            let d = DECODES.lock().unwrap();
+            d.as_ref().and_then(|m| m.get(&root.join(f)).copied()).unwrap_or(0)
+        };
+
+        let (x, y) = tokio::join!(scan_shared(dirs.clone()), scan_shared(dirs.clone()));
+        assert_eq!((x.unwrap().tracks.len(), y.unwrap().tracks.len()), (2, 2));
+        assert_eq!((decodes("a.wav"), decodes("b.wav")), (1, 1), "one decode per file");
+
+        // A later listing ("Look again") scans afresh and finds new files,
+        // without decoding the known ones again.
+        write_click_wav(&root.join("c.wav"));
+        let z = scan_shared(dirs).await.unwrap();
+        assert_eq!(z.tracks.len(), 3);
+        assert_eq!((decodes("a.wav"), decodes("c.wav")), (1, 1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// propose's `soundtrack` may name only audio inside the projects or
+    /// music folders, and the answer outside them never depends on whether
+    /// the file exists.
+    #[test]
+    fn soundtrack_paths_must_be_audio_inside_the_library_or_projects() {
+        let base = std::env::temp_dir().join(format!("vibecut_music_paths_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let projects = base.join("projects");
+        let outside = base.join("elsewhere");
+        std::fs::create_dir_all(projects.join("music")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(projects.join("music/song.mp3"), b"x").unwrap();
+        std::fs::write(projects.join("notes.txt"), b"x").unwrap();
+        std::fs::write(outside.join("secret.mp3"), b"x").unwrap();
+        let roots = vec![projects.join("music"), projects.clone()];
+        let check = |p: &Path| soundtrack_file_in(p, &roots);
+
+        let song = projects.join("music/song.mp3");
+        assert_eq!(check(&song).unwrap(), song);
+        assert!(matches!(check(&projects.join("music/missing.mp3")), Err(OpsError::NotFound { .. })));
+        for p in [
+            outside.join("secret.mp3"),
+            outside.join("missing.mp3"),
+            projects.join("notes.txt"),
+            projects.join("music/../../elsewhere/secret.mp3"),
+            PathBuf::from("music/song.mp3"),
+        ] {
+            assert!(matches!(check(&p), Err(OpsError::InvalidInput { .. })), "{p:?}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("secret.mp3"), projects.join("music/link.mp3")).unwrap();
+            assert!(matches!(check(&projects.join("music/link.mp3")), Err(OpsError::InvalidInput { .. })));
+        }
+        // The real roots: system files are refused, existing or not.
+        for p in ["/etc/passwd", "/proc/self/environ", "/etc/nonexistent.mp3"] {
+            assert!(matches!(check_soundtrack_file(p), Err(OpsError::InvalidInput { .. })), "{p}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

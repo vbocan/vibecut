@@ -2,7 +2,6 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { outputFileUrl } from '$lib/api';
 	import { clock } from '$lib/vibes';
-	import { musicCaptionLine } from '$lib/music';
 
 	// Decision 2: get the video out. Download, the phone's own share sheet
 	// where the browser supports sharing files, and a ready-to-paste caption
@@ -32,8 +31,9 @@
 	const caption = $derived(
 		[
 			title,
-			// CC BY and friends: the credit the licence asks for.
-			s.effectiveTrack ? musicCaptionLine(s.effectiveTrack) : null,
+			// CC BY and friends: the credit the licence asks for, from the
+			// shared version's own render record when it has one.
+			...s.captionMusic,
 			// Only claim the beat lock when the report backs it up.
 			beat && beat.n_cuts > 0 && beat.within_tolerance === beat.n_cuts
 				? 'Edited with Vibecut — every cut on the beat.'

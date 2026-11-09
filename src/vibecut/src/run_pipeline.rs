@@ -1979,11 +1979,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         resolution: cfg.outputs[0].resolution.clone(),
         fps: cfg.project.fps,
         seed: cfg.project.seed,
-        soundtrack: cfg
-            .soundtrack
-            .as_ref()
-            .map(|s| crate::track_meta::soundtrack_credits(&s.files))
-            .unwrap_or_default(),
+        soundtrack: crate::track_meta::manifest_soundtrack(cfg),
         sources,
         segments,
         duck_windows,

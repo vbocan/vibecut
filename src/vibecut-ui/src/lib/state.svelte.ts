@@ -8,6 +8,7 @@ import type { FeedbackAction } from './api';
 import type { Manifest } from './types/generated/Manifest';
 import type { Segment } from './types/generated/Segment';
 import type { Config } from './types/generated/Config';
+import { captionMusicLines, labelsFollowProject, projectSongPath, trackForPath } from './music';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
 
@@ -48,6 +49,10 @@ interface Persisted {
 	proposeResult: api.ProposeResult | null;
 	renderResult: api.RenderResult | null;
 	renderHistory: RenderHistoryEntry[];
+	/** The settings the song pick depends on (absent in older saves). */
+	targetDuration?: string;
+	seed?: number;
+	proposedPickKey?: string;
 }
 
 const STORAGE_KEY = 'vibecut.session.v1';
@@ -207,20 +212,62 @@ class AppState {
 		}
 	}
 
-	/** What "Let Vibecut pick" means right now: the proposal's pick while
-	 *  the vibe / length / seed are the ones it was made with, else the
-	 *  server's preview for the current settings. */
+	/** Labels describe the project (its video, its render) rather than what
+	 *  the next "Make my video" would use (see `labelsFollowProject`). */
+	private followProject = $derived.by(() =>
+		labelsFollowProject({
+			hasProposal: this.proposeResult !== null,
+			versions: this.renderHistory.length,
+			makeStep: this.makeStep,
+			makeError: this.makeError
+		})
+	);
+
+	/** `config_path` of the proposal `configStructured` was read from. */
+	private structuredFor = $state<string | null>(null);
+
+	/** The song file the project's config uses (`undefined`: unknown). */
+	private projectSong = $derived.by((): string | null | undefined => {
+		const p = this.proposeResult;
+		if (!p) return undefined;
+		const loaded = this.configStructured !== null && this.structuredFor === p.config_path;
+		return projectSongPath({
+			configLoaded: loaded,
+			configFiles: loaded ? this.configStructured?.soundtrack?.files : undefined,
+			proposalSong: p.soundtrack
+		});
+	});
+
+	/** What "Let Vibecut pick" means right now. On the project: the pick it
+	 *  was made with (what choosing it switches back to). Otherwise what the
+	 *  next proposal would pick: the proposal's own pick while the vibe /
+	 *  length / seed are the ones it was made with, else the server's preview. */
 	autoPick = $derived.by((): api.MusicPick | null => {
 		const p = this.proposeResult;
+		if (p && this.followProject && p.auto_pick !== undefined) return p.auto_pick;
 		if (p && p.auto_pick !== undefined && this.proposedPickKey === this.pickKey()) return p.auto_pick;
 		return this.previewPick;
 	});
 
-	/** The song a render will use: the chosen one, else the server's pick. */
+	/** The song in use. On the project: the one its config names — never a
+	 *  fresh pick, which can differ after a reload or a library change.
+	 *  Before it: the chosen one, else the server's pick. A song missing
+	 *  from the library list keeps what is known about it (see `trackForPath`). */
 	effectiveTrack = $derived.by((): api.Track | null => {
-		const path = this.selectedTrackPath ?? this.autoPick?.path ?? null;
-		return path ? (this.tracks.find((t) => t.path === path) ?? null) : null;
+		const fromProject = this.followProject ? this.projectSong : undefined;
+		const path = fromProject !== undefined ? fromProject : (this.selectedTrackPath ?? this.autoPick?.path ?? null);
+		if (!path) return null;
+		const p = this.proposeResult;
+		return trackForPath(path, this.tracks, {
+			credit: (this.manifest?.soundtrack ?? []).find((c) => c.file === path) ?? null,
+			title: p?.soundtrack?.path === path ? p.soundtrack.title : this.autoPick?.path === path ? this.autoPick.title : null
+		});
 	});
+
+	/** Music lines for the share caption: what the shown version's render
+	 *  recorded (every file, with the credit its licence needs), else the
+	 *  project's song. */
+	captionMusic = $derived.by(() => captionMusicLines(this.manifest?.soundtrack, this.effectiveTrack));
 
 	// ---------- One-tap "make my video" ----------
 	makeStep = $state<MakeStep>('idle');
@@ -602,7 +649,9 @@ class AppState {
 		if (!this.proposeResult) return;
 		this.configStructuredError = null;
 		try {
-			this.configStructured = await api.readConfigStructured(this.proposeResult.config_path);
+			const path = this.proposeResult.config_path;
+			this.configStructured = await api.readConfigStructured(path);
+			this.structuredFor = path;
 			this.configStructuredSnapshot = JSON.stringify(this.configStructured);
 		} catch (e) {
 			this.configStructuredError = e instanceof api.ApiError ? e.describe() : String(e);
@@ -614,8 +663,10 @@ class AppState {
 		this.savingConfig = true;
 		this.configStructuredError = null;
 		try {
-			const r = await api.writeConfigStructured(this.proposeResult.config_path, this.configStructured);
+			const path = this.proposeResult.config_path;
+			const r = await api.writeConfigStructured(path, this.configStructured);
 			this.configStructured = r;
+			this.structuredFor = path;
 			this.configStructuredSnapshot = JSON.stringify(r);
 			this.configChangedSinceRender = true;
 			// Keep the Raw tab's textarea in sync too, same reasoning in
@@ -1047,7 +1098,10 @@ class AppState {
 			selectedTrackPath: this.selectedTrackPath,
 			proposeResult: this.proposeResult,
 			renderResult: this.renderMode === 'done' ? this.renderResult : null,
-			renderHistory: this.renderHistory
+			renderHistory: this.renderHistory,
+			targetDuration: this.targetDuration,
+			seed: this.seed,
+			proposedPickKey: this.proposedPickKey
 		};
 		try {
 			localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
@@ -1071,11 +1125,14 @@ class AppState {
 		this.selectedVibe = p.selectedVibe;
 		this.selectedTrackPath = p.selectedTrackPath;
 		this.renderHistory = p.renderHistory ?? [];
+		if (typeof p.targetDuration === 'string') this.targetDuration = p.targetDuration;
+		if (typeof p.seed === 'number') this.seed = p.seed;
 		if (p.folder) void this.discover();
 		if (p.proposeResult) {
 			try {
 				const cfg = await api.readConfig(p.proposeResult.config_path);
 				this.proposeResult = { ...p.proposeResult, config_toml: cfg.config_toml };
+				this.proposedPickKey = p.proposedPickKey ?? '';
 				this.configToml = cfg.config_toml;
 				await this.loadStructuredConfig();
 			} catch {
@@ -1115,6 +1172,7 @@ class AppState {
 		this.proposeResult = null;
 		this.configToml = '';
 		this.configStructured = null;
+		this.structuredFor = null;
 		this.makeStep = 'idle';
 		this.makeError = null;
 		this.renderHistory = [];

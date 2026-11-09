@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
 
     tracing::info!("vibecut-mcp starting on {bind_addr}");
+    vibecut_ops::music::warm_up();
 
     // The factory is invoked once per session by the tower service.
     let service_factory = move || Ok::<_, std::io::Error>(VibecutMcpServer::new());

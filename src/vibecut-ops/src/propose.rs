@@ -226,11 +226,13 @@ pub async fn propose_vibe(args: ProposeArgs<'_>) -> Result<ProposeResult, OpsErr
     let project_name = final_title.clone();
     let folder = target_folder.to_string_lossy();
 
-    let request = music_request(args.soundtrack);
+    // Only audio in the music or projects folders: the path goes into the
+    // config and its metadata is read, so it must not reach anywhere else.
+    let checked;
+    let mut request = music_request(args.soundtrack);
     if let MusicRequest::File(p) = request {
-        if !Path::new(p).is_file() {
-            return Err(OpsError::not_found_with("soundtrack file", p.to_string()));
-        }
+        checked = music::check_soundtrack_file(p)?.to_string_lossy().into_owned();
+        request = MusicRequest::File(&checked);
     }
 
     let subs = |soundtrack| vibes::Substitutions {

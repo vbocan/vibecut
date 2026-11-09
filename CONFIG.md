@@ -159,7 +159,8 @@ Proposals (`POST /api/propose`, MCP `propose_vibe`) fill in `file`
 themselves: without a `soundtrack` in the request they pick a library song
 whose tempo, energy and length suit the vibe, write the vibe's own
 `[soundtrack]` settings around it, and explain the pick in a comment above
-the section. `soundtrack = "none"` in the request leaves the section out.
+the section. `soundtrack = "none"` in the request leaves the section out;
+a path there must be an audio file in the projects or music folders.
 A song's title, artist, licence and credit line come from an optional
 `<track>.json` or `library.json` next to it; every render writes them, with
 the file's SHA-256, to the manifest's `soundtrack` list. See

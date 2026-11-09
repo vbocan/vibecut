@@ -107,10 +107,60 @@ mod tests {
         assert_eq!(body["vibes"].as_array().unwrap().len(), 6);
     }
 
-    /// The library listing tells the import view where downloads go and
-    /// what went wrong reading metadata, even when it is empty.
+    /// 6 s of 120 BPM clicks, mono 22.05 kHz 16-bit PCM WAV.
+    fn write_click_wav(p: &Path) {
+        let rate = 22_050u32;
+        let n = rate as usize * 6;
+        let mut pcm = vec![0i16; n];
+        for beat in 0..12 {
+            let s = beat * rate as usize / 2;
+            for i in 0..400.min(n - s) {
+                pcm[s + i] = ((i as f32 * 0.3).sin() * 20_000.0 * (1.0 - i as f32 / 400.0)) as i16;
+            }
+        }
+        let data_len = (n * 2) as u32;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        for v in [16u32.to_le_bytes(), [1, 0, 1, 0], rate.to_le_bytes(), (rate * 2).to_le_bytes(), [2, 0, 16, 0]] {
+            b.extend_from_slice(&v);
+        }
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        pcm.iter().for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
+        std::fs::write(p, b).unwrap();
+    }
+
+    /// Serve the music routes from one generated song in a temp folder:
+    /// tests must never scan, or write a cache into, a real /projects.
+    fn test_music_library() -> &'static Path {
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let root = DIR.get_or_init(|| {
+            let root = std::env::temp_dir().join(format!("vibecut_web_music_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("music")).unwrap();
+            write_click_wav(&root.join("music/click_120.wav"));
+            std::fs::write(
+                root.join("music/click_120.wav.json"),
+                r#"{ "title": "Click", "artist": "Test", "licence": "Attribution 4.0 International (CC BY 4.0)" }"#,
+            )
+            .unwrap();
+            root
+        });
+        vibecut_ops::music::use_roots(vibecut_ops::music::LibraryRoots {
+            own: root.join("music"),
+            extra: vec![],
+            cache_dir: Some(root.join(".vibecut-cache")),
+        });
+        root
+    }
+
+    /// The library listing tells the import view where downloads go, each
+    /// track's licence and credit, and what went wrong reading metadata.
     #[tokio::test]
     async fn music_lists_tracks_import_dir_and_warnings() {
+        let root = test_music_library();
         let app = router(AppState::default());
         let res = app
             .oneshot(Request::builder().uri("/api/music").body(Body::empty()).unwrap())
@@ -118,15 +168,25 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_json(res).await;
-        assert!(body["tracks"].is_array());
         assert!(body["warnings"].is_array());
-        assert_eq!(body["import_dir"], "/projects/music");
+        let own = root.join("music");
+        assert_eq!(body["import_dir"], own.to_string_lossy().as_ref());
         assert_eq!(body["dirs"][0]["collection"], "yours");
-        assert!(body["dirs"][0]["exists"].is_boolean());
+        assert_eq!(body["dirs"][0]["exists"], true);
+        let tracks = body["tracks"].as_array().unwrap();
+        assert_eq!(tracks.len(), 1, "{body}");
+        let t = &tracks[0];
+        assert_eq!(t["path"], own.join("click_120.wav").to_string_lossy().as_ref());
+        assert_eq!((t["title"].as_str(), t["licence"]["kind"].as_str()), (Some("Click"), Some("cc_by")));
+        assert_eq!(t["attribution_required"], true);
+        assert!(t["credit"].as_str().unwrap().contains("CC BY 4.0"), "{t}");
+        // The analysis was cached in the given folder, not under /projects.
+        assert!(std::fs::read_dir(root.join(".vibecut-cache")).unwrap().count() >= 1);
     }
 
     #[tokio::test]
-    async fn music_pick_validates_the_vibe_and_answers_null_without_music() {
+    async fn music_pick_validates_the_vibe_and_names_a_library_track() {
+        let root = test_music_library();
         let app = router(AppState::default());
         let res = app
             .clone()
@@ -145,20 +205,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        // No /projects/music where tests run: a valid request picks nothing.
-        if !std::path::Path::new("/projects/music").is_dir() && std::env::var_os("VIBECUT_MUSIC_DIRS").is_none() {
-            let res = app
-                .oneshot(
-                    Request::builder()
-                        .uri("/api/music/pick?vibe=kid_reel&target_duration=30s&seed=7")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::OK);
-            assert!(body_json(res).await["pick"].is_null());
-        }
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/music/pick?vibe=kid_reel&target_duration=30s&seed=7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let pick = &body_json(res).await["pick"];
+        assert_eq!(pick["path"], root.join("music/click_120.wav").to_string_lossy().as_ref());
+        assert!(pick["reason"].as_str().unwrap().contains("Kid reel"), "{pick}");
     }
 
     /// `/footage` won't exist on a host running `cargo test` (it's a

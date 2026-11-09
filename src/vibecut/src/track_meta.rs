@@ -109,15 +109,16 @@ impl TrackMeta {
 
     /// Whether a public post must credit the track: the sidecar's explicit
     /// `attribution_required`, else the licence's rule (every CC BY
-    /// variant), else "a credit line was supplied" for licences that
-    /// don't settle it either way (YouTube Audio Library, custom, unknown).
+    /// variant, and a custom licence whose text asks for credit), else "a
+    /// credit line was supplied" for licences that don't settle it either
+    /// way (YouTube Audio Library, custom, unknown).
     pub fn attribution_required(&self) -> bool {
         if let Some(explicit) = self.attribution_required {
             return explicit;
         }
-        let kind = self.licence().kind;
-        kind.requires_attribution()
-            || (self.credit.is_some() && !matches!(kind, LicenceKind::Cc0 | LicenceKind::Pixabay))
+        let lic = self.licence();
+        lic.asks_for_credit()
+            || (self.credit.is_some() && !matches!(lic.kind, LicenceKind::Cc0 | LicenceKind::Pixabay))
     }
 
     /// The line a caption or description should carry: the supplied
@@ -236,46 +237,27 @@ impl Licence {
             return lic("unknown", "Unknown licence", LicenceKind::Unknown);
         }
         if norm.starts_with("CC0") || norm == "PUBLIC-DOMAIN" || norm == "PD" {
-            return lic("CC0-1.0", "CC0 1.0", LicenceKind::Cc0);
+            return cc0();
         }
         if let Some(rest) = norm.strip_prefix("CC-BY").or_else(|| norm.strip_prefix("CCBY")) {
             let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
-            let version = parts.iter().find(|p| p.contains('.') || p.parse::<u32>().is_ok());
-            let mods: Vec<&str> = parts
-                .iter()
-                .filter(|p| matches!(**p, "SA" | "NC" | "ND"))
-                .copied()
-                .collect();
+            let version = parts.iter().copied().find(|p| p.contains('.') || p.parse::<u32>().is_ok());
             let unknown_part = parts
                 .iter()
-                .any(|p| Some(p) != version && !matches!(*p, "SA" | "NC" | "ND" | "INTERNATIONAL"));
+                .any(|p| Some(*p) != version && !matches!(*p, "SA" | "NC" | "ND" | "INTERNATIONAL"));
             if !unknown_part {
-                let kind = if mods.contains(&"NC") {
-                    LicenceKind::CcByNc
-                } else if mods.contains(&"ND") {
-                    LicenceKind::CcByNd
-                } else if mods.contains(&"SA") {
-                    LicenceKind::CcBySa
-                } else {
-                    LicenceKind::CcBy
-                };
-                let suffix = mods.join("-");
-                let mut id = String::from("CC-BY");
-                let mut label = String::from("CC BY");
-                if !suffix.is_empty() {
-                    id.push_str(&format!("-{suffix}"));
-                    label.push_str(&format!("-{suffix}"));
-                }
-                if let Some(v) = version {
-                    let v = if v.contains('.') { v.to_string() } else { format!("{v}.0") };
-                    id.push_str(&format!("-{v}"));
-                    label.push_str(&format!(" {v}"));
-                }
-                return Licence { id, label, kind };
+                let has = |m: &str| parts.contains(&m);
+                return cc_by(has("NC"), has("SA"), has("ND"), version);
             }
         }
         if norm.starts_with("PIXABAY") {
             return lic("Pixabay", "Pixabay Content License", LicenceKind::Pixabay);
+        }
+        // CC named inside longer text, the way sites and deeds write it:
+        // "Attribution 4.0 International (CC BY 4.0)", "Creative Commons:
+        // By Attribution 4.0", a creativecommons.org URL.
+        if let Some(cc) = find_cc(raw) {
+            return cc;
         }
         if norm.contains("YOUTUBE") || norm == "YTAL" {
             return lic("YouTube-Audio-Library", "YouTube Audio Library", LicenceKind::YoutubeAudioLibrary);
@@ -299,6 +281,109 @@ impl Licence {
         let (terms, version) = path.rsplit_once('-')?;
         version.contains('.').then(|| format!("https://creativecommons.org/licenses/{terms}/{version}/"))
     }
+
+    /// Whether the licence asks for credit: every CC BY variant, and — as a
+    /// safety net for terms Vibecut can't classify — a custom licence whose
+    /// text mentions attribution, credit or Creative Commons ("Free with
+    /// attribution", "credit required"), unless it says it doesn't ("no
+    /// attribution required"). Over-crediting is harmless; a missing
+    /// credit is what gets videos taken down.
+    pub fn asks_for_credit(&self) -> bool {
+        if self.kind.requires_attribution() {
+            return true;
+        }
+        if self.kind != LicenceKind::Custom {
+            return false;
+        }
+        let w = words(&self.id);
+        let has = |x: &str| w.iter().any(|t| t == x);
+        let mentions = ["ATTRIBUTION", "ATTRIBUTE", "CREDIT", "CREDITS", "CC"].iter().any(|x| has(x))
+            || mentions_creative_commons(&w);
+        let negated = ["NO", "NOT", "WITHOUT", "NONE"].iter().any(|x| has(x));
+        mentions && !negated
+    }
+
+    /// Plain-language advice for posting a video with it.
+    pub fn note(&self) -> &'static str {
+        if self.kind == LicenceKind::Custom && self.asks_for_credit() {
+            "Custom licence that asks for credit — Vibecut adds it to your caption. Read its terms before posting publicly."
+        } else {
+            self.kind.note()
+        }
+    }
+}
+
+fn cc0() -> Licence {
+    Licence { id: "CC0-1.0".into(), label: "CC0 1.0".into(), kind: LicenceKind::Cc0 }
+}
+
+/// A CC BY licence in its canonical spelling: `CC-BY[-NC][-SA|-ND][-4.0]`.
+fn cc_by(nc: bool, sa: bool, nd: bool, version: Option<&str>) -> Licence {
+    let (kind, terms) = match (nc, nd, sa) {
+        (true, true, _) => (LicenceKind::CcByNc, "-NC-ND"),
+        (true, false, true) => (LicenceKind::CcByNc, "-NC-SA"),
+        (true, false, false) => (LicenceKind::CcByNc, "-NC"),
+        (false, true, _) => (LicenceKind::CcByNd, "-ND"),
+        (false, false, true) => (LicenceKind::CcBySa, "-SA"),
+        (false, false, false) => (LicenceKind::CcBy, ""),
+    };
+    let mut id = format!("CC-BY{terms}");
+    let mut label = format!("CC BY{terms}");
+    if let Some(v) = version {
+        let v = if v.contains('.') { v.to_string() } else { format!("{v}.0") };
+        id.push_str(&format!("-{v}"));
+        label.push_str(&format!(" {v}"));
+    }
+    Licence { id, label, kind }
+}
+
+/// Upper-case words of `text`, split on anything but letters, digits and
+/// dots (so versions like `4.0` and `creativecommons.org` stay whole).
+fn words(text: &str) -> Vec<String> {
+    text.to_ascii_uppercase()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+        .map(|t| t.trim_matches('.'))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn mentions_creative_commons(w: &[String]) -> bool {
+    w.windows(2).any(|p| p[0] == "CREATIVE" && p[1] == "COMMONS")
+        || w.iter().any(|t| t.starts_with("CREATIVECOMMONS"))
+}
+
+/// A Creative Commons licence named anywhere in `raw`: a `CC BY-SA 4.0`
+/// token inside parentheses, the deed's own title ("Attribution-ShareAlike
+/// 4.0 International"), "Creative Commons: By Attribution 4.0", or a
+/// creativecommons.org URL. `None` when the text doesn't name one.
+fn find_cc(raw: &str) -> Option<Licence> {
+    let w = words(raw);
+    let has = |x: &str| w.iter().any(|t| t == x);
+    let pair = |a: &str, b: &str| w.windows(2).any(|p| p[0] == a && p[1] == b);
+    // Only dotted CC versions: a bare "4" is too likely to be something else.
+    let version = w
+        .iter()
+        .map(String::as_str)
+        .find(|t| matches!(*t, "1.0" | "2.0" | "2.1" | "2.5" | "3.0" | "4.0"));
+    let named = has("CC") || has("CCBY") || mentions_creative_commons(&w);
+    let deed_title = has("ATTRIBUTION")
+        && version.is_some()
+        && (has("INTERNATIONAL") || has("UNPORTED") || has("GENERIC"));
+    if has("CC0") || has("CCZERO") || (has("ZERO") && (named || has("PUBLICDOMAIN"))) {
+        return Some(cc0());
+    }
+    if !(named || deed_title) || !(has("BY") || has("CCBY") || has("ATTRIBUTION")) {
+        return None;
+    }
+    let sa = has("SA") || has("SHAREALIKE") || pair("SHARE", "ALIKE");
+    let nc = has("NC") || has("NONCOMMERCIAL") || pair("NON", "COMMERCIAL");
+    let nd = has("ND")
+        || has("NODERIVATIVES")
+        || has("NODERIVS")
+        || pair("NO", "DERIVATIVES")
+        || pair("NO", "DERIVS");
+    Some(cc_by(nc, sa, nd, version))
 }
 
 /// Where a track's metadata came from.
@@ -506,6 +591,12 @@ impl SoundtrackCredit {
 /// Credits for every soundtrack file, in order.
 pub fn soundtrack_credits(files: &[Utf8PathBuf]) -> Vec<SoundtrackCredit> {
     files.iter().map(|f| SoundtrackCredit::for_file(f)).collect()
+}
+
+/// The manifest's `soundtrack` list for a render of `cfg`: one credit per
+/// `[soundtrack]` file, in order; empty without music.
+pub fn manifest_soundtrack(cfg: &crate::project_config::Config) -> Vec<SoundtrackCredit> {
+    cfg.soundtrack.as_ref().map(|s| soundtrack_credits(&s.files)).unwrap_or_default()
 }
 
 // ---------- SHA-256 (FIPS 180-4) ----------
@@ -880,6 +971,110 @@ mod tests {
         // Older manifests (no field) still load.
         let old: Manifest = serde_json::from_value(v).unwrap();
         assert!(old.soundtrack.is_empty());
+    }
+
+    /// CC licences as the sites and deeds write them, not only as ids.
+    #[test]
+    fn cc_licences_named_the_way_sites_write_them() {
+        let p = |s: &str| Licence::parse(Some(s));
+        let by4 = Licence { id: "CC-BY-4.0".into(), label: "CC BY 4.0".into(), kind: LicenceKind::CcBy };
+        // Free Music Archive, Incompetech, the deed's own title, CC's URL.
+        assert_eq!(p("Attribution 4.0 International (CC BY 4.0)"), by4);
+        assert_eq!(p("Creative Commons: By Attribution 4.0"), by4);
+        assert_eq!(p("Creative Commons Attribution 4.0 International License"), by4);
+        assert_eq!(p("Attribution 4.0 International"), by4);
+        assert_eq!(p("https://creativecommons.org/licenses/by/4.0/"), by4);
+        assert_eq!(p("Attribution 3.0 Unported (CC BY 3.0)").id, "CC-BY-3.0");
+        assert_eq!(p("Creative Commons Attribution").id, "CC-BY");
+        // Variants, written in words or as tokens, in canonical order.
+        let sa = p("Creative Commons Attribution-ShareAlike 4.0 International");
+        assert_eq!((sa.id.as_str(), sa.kind), ("CC-BY-SA-4.0", LicenceKind::CcBySa));
+        let nc = p("Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)");
+        assert_eq!((nc.id.as_str(), nc.label.as_str(), nc.kind), ("CC-BY-NC-SA-4.0", "CC BY-NC-SA 4.0", LicenceKind::CcByNc));
+        assert_eq!(p("Creative Commons Attribution-NoDerivatives 4.0").kind, LicenceKind::CcByNd);
+        assert_eq!(p("https://creativecommons.org/licenses/by-nc/3.0/").id, "CC-BY-NC-3.0");
+        assert_eq!(p("CC-BY-SA-NC-4.0").id, "CC-BY-NC-SA-4.0", "modifier order doesn't matter");
+        // Deed URLs follow.
+        assert_eq!(nc.url().as_deref(), Some("https://creativecommons.org/licenses/by-nc-sa/4.0/"));
+        // CC0 written out.
+        for s in ["CC0 1.0 Universal", "Creative Commons Zero", "Public Domain Dedication (CC0)", "http://creativecommons.org/publicdomain/zero/1.0/"] {
+            assert_eq!(p(s).kind, LicenceKind::Cc0, "{s}");
+        }
+        // A YouTube Audio Library track under CC BY needs its credit.
+        assert_eq!(p("YouTube Audio Library (Creative Commons Attribution 4.0)").kind, LicenceKind::CcBy);
+        // Not CC: stays as written.
+        for s in ["GPL-3.0", "Free with attribution", "Bensound Free License", "Pixabay Content License"] {
+            assert!(!p(s).kind.requires_attribution(), "{s}");
+        }
+    }
+
+    /// A licence Vibecut can't classify still gets its credit when its
+    /// text asks for one.
+    #[test]
+    fn custom_licence_that_asks_for_credit_is_credited() {
+        let meta = |l: &str| TrackMeta { title: Some("Sunny".into()), artist: Some("Ben".into()), licence: Some(l.into()), ..Default::default() };
+        for l in ["Free with attribution", "Uppbeat: credit required", "Creative Commons", "CC licence, see site"] {
+            let m = meta(l);
+            assert_eq!(m.licence().kind, LicenceKind::Custom, "{l}");
+            assert!(m.attribution_required(), "{l}");
+            assert_eq!(m.credit_line("x").unwrap(), format!("Music: \"Sunny\" by Ben — licensed under {l}"));
+            assert!(m.licence().note().contains("asks for credit"), "{l}");
+        }
+        for l in ["No attribution required", "Free, credit not required", "custom", "Bensound Free License"] {
+            let m = meta(l);
+            assert!(!m.attribution_required(), "{l}");
+            assert_eq!(m.credit_line("x"), None, "{l}");
+            assert_eq!(m.licence().note(), LicenceKind::Custom.note(), "{l}");
+        }
+        // The sites' CC spellings are credited as CC BY, with the deed link.
+        let fma = meta("Attribution 4.0 International (CC BY 4.0)");
+        assert!(fma.attribution_required());
+        assert_eq!(
+            fma.credit_line("x").unwrap(),
+            "Music: \"Sunny\" by Ben — licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)"
+        );
+    }
+
+    /// What the render writes into the manifest: one credit per
+    /// `[soundtrack]` file, none without music.
+    #[test]
+    fn manifest_soundtrack_credits_every_configured_file() {
+        let dir = tmp_dir("manifest_soundtrack");
+        std::fs::write(dir.join("a.mp3"), b"abc").unwrap();
+        std::fs::write(dir.join("b.mp3"), b"").unwrap();
+        std::fs::write(dir.join("a.mp3.json"), r#"{ "title": "Night Drive", "licence": "Attribution 4.0 International (CC BY 4.0)" }"#).unwrap();
+        let base = |extra: &str| {
+            format!(
+                "schema_version = 1\n[project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\n[input]\nfolder = \".\"\n[[outputs]]\npath = \"out.mp4\"\nresolution = \"1920x1080\"\n{extra}"
+            )
+        };
+        let a = dir.join("a.mp3").to_string_lossy().replace('\\', "/");
+        let b = dir.join("b.mp3").to_string_lossy().replace('\\', "/");
+        let cfg: crate::project_config::Config =
+            toml::from_str(&base(&format!("[soundtrack]\nfiles = [\"{a}\", \"{b}\"]\n"))).unwrap();
+        let credits = manifest_soundtrack(&cfg);
+        assert_eq!(credits.len(), 2);
+        assert_eq!(credits[0].file.as_str(), a);
+        assert_eq!(credits[0].title, "Night Drive");
+        assert!(credits[0].attribution_required);
+        assert_eq!(credits[0].sha256.as_deref(), Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        assert_eq!((credits[1].title.as_str(), credits[1].size_bytes), ("B", 0));
+        let silent: crate::project_config::Config = toml::from_str(&base("")).unwrap();
+        assert!(manifest_soundtrack(&silent).is_empty());
+    }
+
+    /// The pipeline has no unit-test harness (a render needs ffmpeg and
+    /// footage), so guard the one line that wires the credits into every
+    /// manifest: a merge that drops it would otherwise leave the suite green.
+    #[test]
+    fn pipeline_manifest_is_built_with_the_soundtrack_credits() {
+        let src = include_str!("run_pipeline.rs");
+        let literal = src.split("let manifest = Manifest {").nth(1).expect("pipeline builds a Manifest literal");
+        let literal = &literal[..literal.find("};").expect("end of the literal")];
+        assert!(
+            literal.contains("soundtrack: crate::track_meta::manifest_soundtrack(cfg),"),
+            "run_pipeline's Manifest literal must fill `soundtrack` from manifest_soundtrack(cfg)"
+        );
     }
 
     #[test]
