@@ -260,6 +260,10 @@ def main() -> int:
         ctx = browser.new_context(viewport={"width": 1400, "height": 1000}, reduced_motion=motion)
         ctx.add_init_script(DELAY_FETCH)
         ctx.add_init_script(HELPERS)
+        # Full-quality renders: Fast previews (on by default) makes drafts,
+        # and Share on a draft finishes it first instead of opening the
+        # sheet (draft_journey.py covers that).
+        ctx.add_init_script("try { localStorage.setItem('vibecut.fastPreviews', 'off') } catch {}")
         page = ctx.new_page()
         page.on("pageerror", lambda e: FAILS.append(f"page error: {e}"))
         page.goto(args.url)
