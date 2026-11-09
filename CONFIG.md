@@ -809,6 +809,96 @@ elsewhere); for the model the Docker image bundles, set
 
 ---
 
+## Style codes (recipes)
+
+A **style code** shares how a video was made — not what it was made of —
+as one short line anyone can paste to get the same look on their own
+footage:
+
+```
+VC1-gwGhssPU5faoChVGdWxsIFNlbmQgTmlnaHQgRHJpdmUAAgABEqwCIy25
+```
+
+In the web UI: **Share this style** in the Studio copies the code (and can
+save it by name); **Use a style code** in Create previews what a code sets
+and which song it gets from your library, and **Make my video** then makes
+the video from it. The MCP server has `share_style`, `describe_style`,
+`apply_style` and `list_styles`.
+
+### What a code carries
+
+| Carried | Not carried |
+|---|---|
+| The vibe it started from | `[input]`: the footage, ranges, images |
+| `[project]` `target_duration`, `fps`, `seed`, `fade_in`, `fade_out` | `[project]` `name` (the title), `temp_dir`, `models_dir` |
+| `[soundtrack]` everything but the files: beat alignment, ducking, beat-burst, fade-out | `[soundtrack].files` — the song travels as a reference (below) |
+| `[intro]` / `[outro]` cards and their text layers | Image layers (a logo is a file on your disk) |
+| `[scoring]`, `[transition]` | `[selection]` `exclude` and `source_weights` (per-clip choices) |
+| `[selection]` clip lengths, order, variety, `max_per_source` | `[multi_angle].groups` (camera ids) |
+| `[multi_angle]` `enabled`, `sync`, `min_hold`; `[grading].stabilize` | `[grading].lut` (a file path) |
+| Each `[[outputs]]`: `preset`, `resolution`, `crf`, `audio_bitrate`, `fit`, `max_bitrate` | `path`, `encoder`, `encoder_preset` (machine-specific) |
+
+Card text keeps its style but not the trip: text that is the project's
+title becomes `{title}`, dates (`YYYY-MM-DD`) become `{date}`, and the trip
+folder's name — alone, or before `" · "` — becomes `{trip}`. Applying the
+code fills them in for the new footage (title: the one you give, else
+`"<folder> · <today>"`). Other card text ("See you next ride") is shared as
+written.
+
+**Music** is the clips' own sound, "let Vibecut pick" (a library song for
+the vibe and length), or the song itself, named by its *track id* — a
+fingerprint of the file's size and first 256 KiB, so the same file matches
+on any machine whatever it's called — with its title, artist and tempo.
+Applying a code looks for the same file, then a library song with the same
+title (and artist, when both have one), then — when the song isn't there —
+a library song within 8 % of its tempo (half or double counts), then
+Vibecut's pick for the vibe. The preview and the new config's header say
+which, in words. Sharing with **Let Vibecut pick their song** sends
+"auto" instead of the song.
+
+### The format
+
+`VC<version>-` + URL-safe base64 of a binary payload and a 24-bit checksum.
+The payload names the vibe, the music, and only the settings that differ
+from the vibe's own style — paths and common values from two built-in
+dictionaries, durations as numbers, floats in their shortest decimal form —
+sorted, so the same style always gives the same code. An untouched vibe is
+10 characters; a vibe with its length changed and a song about 60; the demo
+project (action highlight, 30 s, its song with title and artist) 76; a heavily
+tweaked one (hard cuts, a Reels output, a new end card) about 190.
+
+Format 1's settings are differences from the six vibes' styles as they were
+when it was defined (`src/vibecut-ops/src/recipe_baselines_v1.json`), so a
+later change to a vibe template doesn't change what an old code means. A
+code is refused, with a message saying why, when its checksum doesn't match
+(a typo, a cut-off paste, an edit), when it is from a newer format (`VC2-…`:
+"made by a newer Vibecut"), or when it sets something this version doesn't
+know. Whitespace, line breaks and quotes around a pasted code are ignored.
+The checksum catches accidents, not forgery; a hand-made code still can't
+set a path (footage, output, LUT, temp dir, image layer) — those keys are
+dropped before anything is written.
+
+### Saved styles
+
+Named styles live in `/projects/recipes/<name>.json` (`{ "name", "code",
+"created_at" }`); saving under an existing name replaces it. Anywhere a
+code is accepted, a saved style's name works too.
+
+### Routes
+
+| Route | Does |
+|---|---|
+| `POST /api/recipes/code` `{config_path, manifest_path?, vibe?, let_vibecut_pick?}` | The code for a project's style, with a summary. `manifest_path` (a render's) fills in a song the library doesn't know from its credit and tempo. |
+| `GET /api/recipes/preview?code=` | What a code (or saved name) sets — `style.chips` in words, `style.settings` that differ from the vibe — and `music_match`: the song it gets here and why. |
+| `POST /api/recipes/apply` `{code, folder, title?}` | A proposal for `folder` in that style: written to `/projects` and answered like `POST /api/propose` (plus `code`, `style`, `music_match`), ready for `POST /api/render/async`. |
+| `GET /api/recipes` | Saved styles, newest first, with any unreadable files in `warnings`. |
+| `POST /api/recipes` `{name, code}` or `{name, config_path, …}` | Save a style by name. |
+
+Bad codes answer `400` with `error` and `hint`; an unknown footage folder or
+saved name `404`.
+
+---
+
 ## Complete kitchen-sink example
 
 ```toml

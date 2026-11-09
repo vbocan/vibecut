@@ -22,7 +22,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use vibecut_ops::error::OpsError;
-use vibecut_ops::{discover, feedback, frames, jobs, logger, propose, render};
+use vibecut_ops::{discover, feedback, frames, jobs, logger, propose, recipe, render};
 
 #[derive(Clone)]
 pub struct VibecutMcpServer {
@@ -136,6 +136,41 @@ pub struct ReformatArgs {
     /// `blur` (default), `crop` or `pad`.
     #[serde(default)]
     pub fit: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ShareStyleArgs {
+    /// The project config to share the style of (a `config_path` from
+    /// `propose_vibe`, `apply_style` or `apply_feedback`).
+    pub config_path: String,
+    /// A render's manifest (`manifest_path` from `render`): its song
+    /// credit and tempo fill in a song the music library doesn't know.
+    pub manifest_path: Option<String>,
+    /// The vibe the project was made from, when known; omitted = the
+    /// closest one.
+    pub vibe: Option<String>,
+    /// Share "let Vibecut pick a song" instead of the song itself.
+    #[serde(default)]
+    pub let_vibecut_pick: bool,
+    /// Also save the style under this name (`/projects/recipes/<name>.json`).
+    pub save_as: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct StyleCodeArgs {
+    /// A style code (`VC1-…`) or the name of a saved style.
+    pub code: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ApplyStyleArgs {
+    /// A style code (`VC1-…`) or the name of a saved style.
+    pub code: String,
+    /// Footage folder (same convention as `discover_sources`).
+    #[serde(default)]
+    pub folder: String,
+    /// Intro-card title. Defaults to `"<folder> · YYYY-MM-DD"`.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -331,6 +366,86 @@ impl VibecutMcpServer {
             }
             Err(e) => ops_error_to_string_result(e),
         }
+    }
+
+    /// Share a project's style as a short code anyone can paste to get
+    /// the same vibe, length, song, cuts and cards on their own footage.
+    #[tool(description = "Make a short share code (VC1-…) for a project's style: vibe, length, pacing, transitions, cards, song (by id, title, artist and tempo) and output formats — never the footage or the title. Paste it into Vibecut's Create screen or pass it to `apply_style` to reproduce the style on other footage. Optionally saves it under a name.")]
+    async fn share_style(&self, Parameters(args): Parameters<ShareStyleArgs>) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result = async {
+            let shared = recipe::share_style(recipe::ShareArgs {
+                config_path: &args.config_path,
+                manifest_path: args.manifest_path.as_deref(),
+                vibe: args.vibe.as_deref(),
+                let_vibecut_pick: args.let_vibecut_pick,
+            })
+            .await?;
+            let saved = match args.save_as.as_deref().filter(|n| !n.trim().is_empty()) {
+                Some(name) => Some(recipe::save_style(name, &shared.code).await?),
+                None => None,
+            };
+            Ok::<_, OpsError>(serde_json::json!({
+                "code": shared.code,
+                "chars": shared.chars,
+                "style": shared.style,
+                "saved_as": saved.map(|s| s.file),
+                "next_step": "Give the user the code. Anyone can paste it into Vibecut's Create screen (\"Use a style code\"), or call `apply_style` with it and a footage folder.",
+            }))
+        }
+        .await;
+        let result = match result {
+            Ok(body) => Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())),
+            Err(e) => ops_error_to_string_result(e),
+        };
+        self.log_string_call("share_style", args_json, &result, started);
+        result
+    }
+
+    /// Say what a style code would make before using it.
+    #[tool(description = "Read a style code (or a saved style's name) and say what it sets — vibe, length, song, cuts, cards, formats — and which song it would get from this music library. Rejects damaged codes and codes from a newer Vibecut with a clear error.")]
+    async fn describe_style(&self, Parameters(args): Parameters<StyleCodeArgs>) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result = match recipe::preview_style(&args.code).await {
+            Ok(r) => Ok(serde_json::to_string_pretty(&r).unwrap_or_else(|_| "{}".into())),
+            Err(e) => ops_error_to_string_result(e),
+        };
+        self.log_string_call("describe_style", args_json, &result, started);
+        result
+    }
+
+    /// Like `propose_vibe`, but the style comes from a code.
+    #[tool(description = "Make a starting TOML config for a footage folder in a shared style (a VC1-… code or a saved style's name), exactly like `propose_vibe` does for a vibe. The song is the code's own when the library has it (same file, else same title), else one at a similar tempo. Returns config_path; call `render` next.")]
+    async fn apply_style(&self, Parameters(args): Parameters<ApplyStyleArgs>) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result = match recipe::apply_style(recipe::ApplyArgs {
+            code: &args.code,
+            folder: &args.folder,
+            title: args.title.as_deref(),
+        })
+        .await
+        {
+            Ok(r) => {
+                let mut body = serde_json::to_value(&r).unwrap_or_default();
+                body["next_step"] = "Call `render` with this config_path to produce the edit.".into();
+                Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
+            }
+            Err(e) => ops_error_to_string_result(e),
+        };
+        self.log_string_call("apply_style", args_json, &result, started);
+        result
+    }
+
+    /// The styles saved by name.
+    #[tool(description = "List the styles saved by name (/projects/recipes): name, code and what each sets.")]
+    async fn list_styles(&self) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let result = Ok(serde_json::to_string_pretty(&recipe::list_styles().await).unwrap_or_else(|_| "{}".into()));
+        self.log_string_call("list_styles", serde_json::Value::Null, &result, started);
+        result
     }
 
     /// Extract a curated set of overview frames from a rendered mp4

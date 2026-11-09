@@ -10,6 +10,7 @@ import type { Segment } from './types/generated/Segment';
 import type { Config } from './types/generated/Config';
 import { captionMusicLines, labelsFollowProject, projectSongPath, trackForPath } from './music';
 import { decideChange } from './changes';
+import { extractStyleCode } from './stylecode';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
 
@@ -318,12 +319,15 @@ class AppState {
 	 * Every step goes through the same calls the advanced controls use,
 	 * so the config it writes is an ordinary, editable proposal.
 	 */
-	async makeVideo(opts: { bed?: boolean } = {}) {
-		if (!this.folder || !this.effectiveVibe) return;
+	async makeVideo(opts: { bed?: boolean; style?: boolean } = {}) {
+		// A style code in use (Create) makes the proposal instead of the
+		// vibe / song pickers; `style: false` ignores it ("Another mix").
+		const useStyle = opts.style !== false && this.stylePreview !== null;
+		if (!this.folder || !(this.effectiveVibe || useStyle)) return;
 		this.makeError = null;
 		// Start the song now, inside the tap (autoplay rules), so the wait
 		// has the music in it; the finished reel takes over when it's ready.
-		if (opts.bed !== false) this.startBed(this.effectiveTrack);
+		if (opts.bed !== false) this.startBed(useStyle ? this.styleTrack : this.effectiveTrack);
 		// A Stop before the render starts (or a newer run) bumps `makeRun`:
 		// this run then quits at its next step instead of rendering.
 		const run = ++this.makeRun;
@@ -343,8 +347,8 @@ class AppState {
 			}
 			this.makeStep = 'planning';
 			// The proposal carries the song: the chosen one, else the
-			// server's pick for the vibe.
-			await this.propose();
+			// server's pick for the vibe (or the style code's song).
+			await (useStyle ? this.proposeFromStyle() : this.propose());
 			if (!live()) return;
 			if (this.proposeError) throw new Error(this.proposeError);
 			this.startRenderAsync();
@@ -552,7 +556,7 @@ class AppState {
 		await this.withUndo(`Mix: ${name}`, async () => {
 			this.selectedVibe = next;
 			this.selectedTrackPath = null;
-			await this.makeVideo({ bed: false });
+			await this.makeVideo({ bed: false, style: false });
 		}, { render: false });
 	}
 
@@ -681,6 +685,120 @@ class AppState {
 			this.configToml = r.config_toml;
 			this.configDirty = false;
 			// A fresh proposal invalidates whatever the previous one rendered.
+			this.resetRender();
+			await this.loadStructuredConfig();
+		} catch (e) {
+			this.proposeError = e instanceof api.ApiError ? e.describe() : String(e);
+		} finally {
+			this.proposing = false;
+		}
+	}
+
+	// ---------- Style codes ----------
+	//
+	// A style code ("VC1-…") carries another video's creative choices. In
+	// Create a pasted code is previewed — what it sets, which song it gets
+	// from this library — and while it's in use "Make my video" builds the
+	// proposal from it (`proposeFromStyle`) instead of the vibe and song
+	// pickers. In the Studio the project's own style becomes a code.
+
+	/** What's in the "Use a style code" field. */
+	styleInput = $state('');
+	/** The code in use: set once the field holds a code the server read. */
+	stylePreview = $state<api.StylePreview | null>(null);
+	styleError = $state<string | null>(null);
+	styleChecking = $state(false);
+	/** Styles saved by name, newest first. */
+	savedStyles = $state<api.SavedStyle[]>([]);
+	/** Only the latest check's answer lands. */
+	private styleSeq = 0;
+
+	/** The library track the code in use gets here (for the build bed). */
+	get styleTrack(): api.Track | null {
+		const path = this.stylePreview?.music_match.files[0];
+		return path ? (this.tracks.find((t) => t.path === path) ?? null) : null;
+	}
+
+	/** Read whatever was typed or pasted: preview the code in it, or say
+	 *  why there isn't one. */
+	async checkStyle(text: string) {
+		this.styleInput = text;
+		const seq = ++this.styleSeq;
+		const code = extractStyleCode(text);
+		this.styleError = null;
+		if (!code) {
+			this.stylePreview = null;
+			this.styleChecking = false;
+			if (text.trim()) this.styleError = 'That isn’t a style code — they start with VC1-.';
+			return;
+		}
+		if (this.stylePreview?.code === code) return;
+		this.styleChecking = true;
+		try {
+			const p = await api.previewStyle(code);
+			if (seq === this.styleSeq) this.stylePreview = p;
+		} catch (e) {
+			if (seq !== this.styleSeq) return;
+			this.stylePreview = null;
+			this.styleError = e instanceof api.ApiError ? e.describe() : String(e);
+		} finally {
+			if (seq === this.styleSeq) this.styleChecking = false;
+		}
+	}
+
+	/** Stop using a code: the pickers decide again. */
+	clearStyle() {
+		this.styleSeq++;
+		this.styleInput = '';
+		this.stylePreview = null;
+		this.styleError = null;
+		this.styleChecking = false;
+	}
+
+	async loadSavedStyles() {
+		try {
+			this.savedStyles = (await api.listStyles()).styles;
+		} catch {
+			this.savedStyles = [];
+		}
+	}
+
+	/** The project's style as a code. The version on screen's manifest
+	 *  fills in a song the music library doesn't know. */
+	async shareStyle(opts: { letVibecutPick?: boolean } = {}): Promise<api.StyleShare> {
+		const p = this.proposeResult;
+		if (!p) throw new Error('Make a video first.');
+		return api.shareStyle({
+			config_path: p.config_path,
+			manifest_path: this.manifestPath ?? undefined,
+			vibe: p.vibe,
+			let_vibecut_pick: opts.letVibecutPick || undefined
+		});
+	}
+
+	async saveStyle(name: string, code: string): Promise<api.SavedStyle> {
+		const saved = await api.saveStyle(name, code);
+		await this.loadSavedStyles();
+		return saved;
+	}
+
+	/** `propose()` for the code in use: the style's vibe, length, cards
+	 *  and song on this footage, as an ordinary editable proposal. */
+	private async proposeFromStyle() {
+		const style = this.stylePreview;
+		if (!style) return;
+		this.proposing = true;
+		this.proposeError = null;
+		try {
+			const r = await api.applyStyle({ code: style.code, folder: this.folder, title: this.title || undefined });
+			// "Another mix" and the vibe labels start from the style's vibe.
+			this.selectedVibe = r.vibe;
+			this.proposeResult = r;
+			// Its song pick was made for the style's length and seed, not
+			// the pickers': never reuse it as the pickers' pick.
+			this.proposedPickKey = '';
+			this.configToml = r.config_toml;
+			this.configDirty = false;
 			this.resetRender();
 			await this.loadStructuredConfig();
 		} catch (e) {
