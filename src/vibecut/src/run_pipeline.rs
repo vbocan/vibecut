@@ -430,6 +430,8 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 sources
                     .par_iter()
                     .map(|source| {
+                        // This pool thread's ffmpeg runs obey the render's Stop.
+                        let _entered = analysis_reporter.as_ref().map(|r| r.enter());
                         let tel = extract_telemetry_with(source, &extract_opts);
                         let curve = build_score_curve(&tel, &cfg.scoring, 4.0);
                         let done = analysed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -444,6 +446,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                     })
                     .collect()
             });
+        // Analysis failures are only warnings, so a Stop during this stage
+        // must be caught here rather than picking from half the footage.
+        crate::cancel::check()?;
         let (tels, crvs): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
         // Print per-source summary in source order so logs stay readable, even
@@ -1717,9 +1722,13 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     progress(Stage::Mixing, 0.0, None);
     // 7. Mux soundtrack into a body+audio file. Per-output transcoding to
     // each `[[outputs]]` target happens after.
+    // Outputs are written under staging names and renamed into place only
+    // once the whole render has succeeded: a failed or stopped render never
+    // replaces the last good video with half of a new one.
+    let staged = crate::staging::StagedOutputs::new(cfg.outputs.iter().map(|o| o.path.as_path()));
     let muxed_body: Utf8PathBuf = if cfg.outputs.len() == 1 {
-        // Single output: write straight to the user's chosen path.
-        let p = cfg.outputs[0].path.clone();
+        // Single output: write straight to the user's chosen path (staged).
+        let p = staged.path(0).to_path_buf();
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -1908,7 +1917,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // 7b. Per-output transcode pass. With a single output, the muxed body IS
     // the user's output (no extra pass). With multiple, transcode each.
     let final_outputs: Vec<Utf8PathBuf> = if cfg.outputs.len() == 1 {
-        vec![muxed_body.clone()]
+        vec![cfg.outputs[0].path.clone()]
     } else {
         let mut paths = Vec::with_capacity(cfg.outputs.len());
         println!("\ntranscoding to {} output{}...", cfg.outputs.len(), plural(cfg.outputs.len()));
@@ -1933,7 +1942,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             crate::video_renderer::transcode_output(
                 &runner,
                 &muxed_body,
-                &o.path,
+                staged.path(i),
                 ow,
                 oh,
                 o.crf,
@@ -1961,7 +1970,7 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
                 fade_out_secs: snd.fade_out.as_secs_f32(),
                 duck_windows: &duck_windows,
                 soundtrack: snd_path,
-                rendered: primary_output,
+                rendered: staged.path(0),
                 fps: cfg.project.fps,
             })
         }
@@ -2002,6 +2011,9 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         beat_sync,
         generator: format!("vibecut {}", env!("CARGO_PKG_VERSION")),
     };
+    // Last chance to stop: past this point the new video replaces the old.
+    crate::cancel::check()?;
+    staged.commit()?;
     manifest
         .write_to(&manifest_path)
         .with_context(|| format!("writing manifest {manifest_path}"))?;

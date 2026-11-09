@@ -139,6 +139,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jobs_list_is_newest_first_and_cancel_stops_a_queued_job() {
+        let state = AppState::default();
+        let older = state.jobs.submit_for("/projects/a.toml").await;
+        let newer = state.jobs.submit_for("/projects/b.toml").await;
+        let app = router(state.clone());
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/jobs/{newer}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["state"], "cancelled");
+        assert_eq!(body["cancel_requested"], true);
+
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/jobs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs[0]["job_id"], newer.as_str());
+        assert_eq!(jobs[0]["state"], "cancelled");
+        assert_eq!(jobs[1]["job_id"], older.as_str());
+        assert_eq!(jobs[1]["state"], "queued");
+        assert_eq!(jobs[1]["config_path"], "/projects/a.toml");
+
+        // The per-job status reports the same state.
+        let res = app
+            .oneshot(Request::builder().uri(format!("/api/render/{newer}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body_json(res).await["state"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_job_is_404() {
+        let app = router(AppState::default());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/no-such-job/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn propose_unknown_vibe_is_400() {
         let app = router(AppState::default());
         let res = app

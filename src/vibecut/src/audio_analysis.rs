@@ -55,6 +55,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::Serialize;
 use std::process::Command;
 
+use crate::cancel::CancellableCommand as _;
+
 /// Concatenate multiple audio files into a single AAC-in-M4A track at
 /// `output`. Used to fuse a `[soundtrack].files = [...]` list into one
 /// virtual track before analysis. ffmpeg's `concat` filter handles
@@ -101,7 +103,7 @@ pub fn concat_soundtrack_files(
     let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
     let status = Command::new("ffmpeg")
         .args(&refs)
-        .status()
+        .cancellable_status()
         .with_context(|| "spawning ffmpeg for soundtrack concat")?;
     anyhow::ensure!(
         status.success(),
@@ -292,7 +294,7 @@ pub fn decode_pcm_range(
 
     let output = Command::new("ffmpeg")
         .args(&args)
-        .output()
+        .cancellable_output()
         .with_context(|| "spawning ffmpeg for audio decode")?;
     if !output.status.success() {
         anyhow::bail!(

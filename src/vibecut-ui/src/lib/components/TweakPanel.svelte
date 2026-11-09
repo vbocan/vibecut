@@ -13,7 +13,24 @@
 		{ label: 'Shuffle', icon: '↻', hint: 'Different moments, same style', action: { kind: 'reroll' } }
 	];
 
-	const busy = $derived(s.feedbackBusy || s.renderMode === 'queued' || s.renderMode === 'running');
+	// Tweaks stay live during a render: picking one offers to stop it.
+	const busy = $derived(s.feedbackBusy || s.stopping);
+	let offer = $state<(typeof TWEAKS)[number] | 'mix' | null>(null);
+
+	function tryRun(t: (typeof TWEAKS)[number] | 'mix') {
+		if (s.rendering) offer = t;
+		else if (t === 'mix') void s.anotherMix();
+		else run(t);
+	}
+
+	async function stopAndApply() {
+		const t = offer;
+		if (!t) return;
+		await s.stopRender({ quiet: true });
+		if (s.rendering) return; // couldn't stop; the toast says why
+		offer = null;
+		tryRun(t);
+	}
 
 	function nextSong(): string | null {
 		if (s.tracks.length === 0) return null;
@@ -60,7 +77,7 @@
 
 <div class="tweaks">
 	<p class="eyebrow">Make it…</p>
-	<button class="mix" type="button" disabled={busy} onclick={() => s.anotherMix()}>
+	<button class="mix" type="button" disabled={busy} onclick={() => tryRun('mix')}>
 		<span class="mix-icon" aria-hidden="true">⤨</span>
 		<span><strong>Try another mix</strong><small>A different vibe with its own best song</small></span>
 	</button>
@@ -71,13 +88,26 @@
 				class="tweak"
 				disabled={busy || (t.action === 'song' && s.tracks.length < 2)}
 				title={t.hint}
-				onclick={() => run(t)}
+				onclick={() => tryRun(t)}
 			>
 				<span class="icon" aria-hidden="true">{t.icon}</span>
 				<span>{t.label}</span>
 			</button>
 		{/each}
 	</div>
+	{#if offer}
+		<div class="offer" role="status">
+			<span>{s.rendering ? 'Still rendering the last change.' : 'The last change is ready.'}</span>
+			<button class="btn primary small" type="button" disabled={s.stopping} onclick={stopAndApply}>
+				{s.stopping
+					? 'Stopping…'
+					: `${s.rendering ? 'Stop and apply' : 'Apply'} “${offer === 'mix' ? 'Another mix' : offer.label}”${s.rendering ? ' instead' : ''}`}
+			</button>
+			<button class="btn ghost small" type="button" disabled={s.stopping} onclick={() => (offer = null)}
+				>{s.rendering ? 'Keep rendering' : 'Never mind'}</button
+			>
+		</div>
+	{/if}
 	{#if s.lastChanges.length > 0}
 		<ul class="changes" aria-label="Last change">
 			{#each s.lastChanges as c, i (i)}
@@ -93,6 +123,23 @@
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
+	}
+
+	.offer {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+		padding: 10px 12px;
+		border-radius: var(--r-md);
+		border: 1px solid var(--line-strong);
+		color: var(--text-dim);
+		font-size: var(--fs-sm);
+	}
+
+	.offer .small {
+		padding: 6px 12px;
+		font-size: var(--fs-xs);
 	}
 
 	.eyebrow {

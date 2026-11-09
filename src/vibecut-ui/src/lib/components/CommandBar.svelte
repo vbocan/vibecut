@@ -67,13 +67,28 @@
 		return true;
 	}
 
+	/** A request that came in mid-render, waiting on "Stop and apply this instead". */
+	let offer = $state<string | null>(null);
+
+	async function stopAndApply() {
+		const text = offer;
+		if (!text) return;
+		await s.stopRender({ quiet: true });
+		if (s.rendering) return; // couldn't stop; the toast says why
+		offer = null;
+		s.briefText = text;
+		await submit();
+	}
+
 	async function submit() {
 		const text = s.briefText.trim();
 		if (!text || s.briefBusy) return;
 		note = null;
+		offer = null;
 		s.briefError = null;
 		if (studio && s.rendering) {
-			note = 'Still rendering the last change — try again when it’s ready.';
+			note = 'Still rendering the last change.';
+			offer = text;
 			return;
 		}
 		const handled = studio ? await runStudio(text) : runCreate(text);
@@ -118,7 +133,14 @@
 	{#if s.briefError}
 		<p class="error" role="alert">{s.briefError}</p>
 	{:else if note}
-		<p class="why">{note}</p>
+		<p class="why">
+			{offer && !s.rendering ? 'The last change is ready.' : note}
+			{#if offer}
+				<button class="btn small offer" type="button" disabled={s.stopping} onclick={stopAndApply}>
+					{s.stopping ? 'Stopping…' : s.rendering ? 'Stop and apply this instead' : 'Apply it now'}
+				</button>
+			{/if}
+		</p>
 	{:else if s.briefRationale}
 		<p class="why"><span class="serif">“{s.briefRationale}”</span></p>
 	{/if}
@@ -204,6 +226,12 @@
 
 	.why .serif {
 		font-size: 17px;
+	}
+
+	.offer {
+		margin-left: 8px;
+		padding: 5px 12px;
+		font-size: var(--fs-xs);
 	}
 
 	.error {

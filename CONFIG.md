@@ -97,6 +97,12 @@ resolution among all entries, then transcoded to each output's resolution +
 encoder + CRF settings — so adding a 1080p alongside a 4K render only adds
 a fast resize pass.
 
+Each `path` is written as `<name>.partial.<ext>` next to it while the render
+runs and only renamed into place once the whole render has succeeded, so a
+failed or stopped render (the web UI's **Stop**, `POST /api/jobs/{id}/cancel`,
+the MCP `cancel_render` tool) leaves the previous video and its manifest
+exactly as they were.
+
 ```toml
 [[outputs]]
 path          = "out/edit_4k.mp4"

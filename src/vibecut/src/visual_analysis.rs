@@ -208,36 +208,47 @@ fn run_visual_chain(
 
     let mut stdout = child.stdout.take().expect("stdout configured");
     let frame_size = (w as usize) * (h as usize);
-    let mut frame = vec![0u8; frame_size];
-    let mut prev = vec![0u8; frame_size];
-    let mut have_prev = false;
 
-    let mut sharpness: Vec<f32> = Vec::new();
-    let mut exposure: Vec<f32> = Vec::new();
-    let mut motion: Vec<f32> = Vec::new();
+    // Frames are scored on a reader thread while this one waits on ffmpeg,
+    // so a cancelled render kills the decode at once instead of whenever
+    // the next frame happens to arrive. The kill closes the pipe, which
+    // ends the reader.
+    let reader = std::thread::spawn(move || -> std::io::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let mut frame = vec![0u8; frame_size];
+        let mut prev = vec![0u8; frame_size];
+        let mut have_prev = false;
 
-    loop {
-        match stdout.read_exact(&mut frame) {
-            Ok(()) => {
-                sharpness.push(laplacian_variance(&frame, w as usize, h as usize));
-                exposure.push(exposure_score(&frame));
-                motion.push(if have_prev {
-                    frame_diff_msd(&frame, &prev)
-                } else {
-                    0.0
-                });
-                prev.copy_from_slice(&frame);
-                have_prev = true;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                let _ = child.kill();
-                return Err(e).context("reading raw frames from ffmpeg stdout");
+        let mut sharpness: Vec<f32> = Vec::new();
+        let mut exposure: Vec<f32> = Vec::new();
+        let mut motion: Vec<f32> = Vec::new();
+
+        loop {
+            match stdout.read_exact(&mut frame) {
+                Ok(()) => {
+                    sharpness.push(laplacian_variance(&frame, w as usize, h as usize));
+                    exposure.push(exposure_score(&frame));
+                    motion.push(if have_prev {
+                        frame_diff_msd(&frame, &prev)
+                    } else {
+                        0.0
+                    });
+                    prev.copy_from_slice(&frame);
+                    have_prev = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                // Returning drops the pipe, so ffmpeg can't block on it.
+                Err(e) => return Err(e),
             }
         }
-    }
+        Ok((sharpness, exposure, motion))
+    });
 
-    let status = child.wait().context("waiting on ffmpeg")?;
+    let status = crate::cancel::wait_child(&mut child).context("waiting on ffmpeg");
+    let frames = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("visual-analysis reader panicked"))?;
+    let status = status?;
+    let (sharpness, exposure, motion) = frames.context("reading raw frames from ffmpeg stdout")?;
     if !status.success() {
         let mut stderr = String::new();
         if let Some(mut e) = child.stderr {

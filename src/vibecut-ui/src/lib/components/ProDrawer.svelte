@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
+	import { outputFileUrl, type JobListEntry } from '$lib/api';
 	import ConfigWizard from './ConfigWizard.svelte';
 
 	let { open = $bindable(false) }: { open?: boolean } = $props();
@@ -16,6 +17,54 @@
 	// Save whichever view holds the edits (not just the visible tab), then
 	// render. Only this save's own errors count.
 	const bothDirty = $derived(s.structuredConfigDirty && s.configDirty);
+
+	// ---- Renders list: recent jobs, refreshed whenever it's shown and
+	// whenever a render starts or ends while it is.
+	let rendersOpen = $state(false);
+	$effect(() => {
+		void s.renderMode;
+		if (open && rendersOpen) void s.loadJobs();
+	});
+
+	const JOB_LABEL: Record<JobListEntry['state'], string> = {
+		queued: 'Queued',
+		running: 'Rendering',
+		done: 'Done',
+		failed: 'Failed',
+		cancelled: 'Stopped'
+	};
+
+	function isFinished(j: JobListEntry): boolean {
+		return j.state === 'done' || j.state === 'failed' || j.state === 'cancelled';
+	}
+
+	function clockTime(iso: string): string {
+		const d = new Date(iso);
+		return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+	}
+
+	function took(j: JobListEntry): string {
+		if (!('elapsed_ms' in j) || (j.state === 'cancelled' && !j.started_at)) return '';
+		const secs = Math.round(j.elapsed_ms / 1000);
+		return ` · ${secs < 60 ? `${secs} s` : `${Math.floor(secs / 60)} min ${secs % 60} s`}`;
+	}
+
+	/** `/projects/proposal_coastline_20261108T101500.toml` → `proposal_coastline_20261108T101500`. */
+	function projectName(path: string): string {
+		return (path.split('/').pop() ?? path).replace(/\.toml$/, '') || '—';
+	}
+
+	function belongsHere(j: JobListEntry): boolean {
+		const file = j.state === 'done' ? (j.version_path ?? j.output_path) : undefined;
+		return (
+			!!file &&
+			(j.config_path === s.proposeResult?.config_path || s.renderHistory.some((v) => v.output_path === file))
+		);
+	}
+
+	async function openJob(j: JobListEntry) {
+		if (await s.openJob(j)) open = false;
+	}
 
 	async function saveAndRender() {
 		if (s.rendering) return;
@@ -87,6 +136,37 @@
 				{s.rendering ? 'Rendering…' : dirty ? 'Save & re-render' : 'Re-render'}
 			</button>
 		</footer>
+
+		<details class="logs renders" bind:open={rendersOpen}>
+			<summary>Renders</summary>
+			<button class="btn ghost small" type="button" onclick={() => s.loadJobs()} disabled={s.loadingJobs}>
+				{s.loadingJobs ? 'Loading…' : 'Refresh'}
+			</button>
+			{#if s.jobsError}<p class="error">{s.jobsError}</p>{/if}
+			<ul>
+				{#each s.jobs as j (j.job_id)}
+					{@const file = j.state === 'done' ? (j.version_path ?? j.output_path) : undefined}
+					<li>
+						<span class="job-state {j.state}">{JOB_LABEL[j.state]}{j.cancel_requested && !isFinished(j) ? ' · stopping' : ''}</span>
+						<span class="when mono">{clockTime(j.submitted_at)}{took(j)}</span>
+						<span class="what" title={j.config_path}>{projectName(j.config_path)}</span>
+						{#if j.state === 'queued' || j.state === 'running'}
+							<button class="btn ghost small" type="button" disabled={j.cancel_requested} onclick={() => s.stopJob(j.job_id)}
+								>Stop</button
+							>
+						{:else if file}
+							{#if belongsHere(j)}
+								<button class="btn ghost small" type="button" disabled={s.rendering} onclick={() => openJob(j)}>Open</button>
+							{:else}
+								<a class="btn ghost small" href={outputFileUrl(file)} target="_blank" rel="noopener">Watch</a>
+							{/if}
+						{/if}
+					</li>
+				{:else}
+					<li class="dim">{s.loadingJobs ? 'Loading…' : 'No renders yet.'}</li>
+				{/each}
+			</ul>
+		</details>
 
 		<details class="logs">
 			<summary>Session logs</summary>
@@ -236,6 +316,45 @@
 	.logs li span {
 		color: var(--text-faint);
 		margin-left: 8px;
+	}
+
+	.renders li {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		padding: 4px 0;
+		border-bottom: 1px solid var(--line);
+	}
+
+	.renders li .job-state {
+		margin-left: 0;
+		min-width: 82px;
+		font-weight: 700;
+	}
+
+	.renders .job-state.running,
+	.renders .job-state.queued {
+		color: var(--cyan);
+	}
+
+	.renders .job-state.done {
+		color: var(--good);
+	}
+
+	.renders .job-state.failed {
+		color: var(--bad);
+	}
+
+	.renders .what {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.renders li .small {
+		margin-top: 0;
 	}
 
 	.small {

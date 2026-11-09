@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use camino::Utf8PathBuf;
 
 use crate::error::OpsError;
-use crate::jobs::{JobRegistry, JobState};
+use crate::jobs::{JobInfo, JobRegistry, JobState};
 use crate::paths::resolve_projects;
 
 /// One lock per project config. Two renders of the same config share a
@@ -79,7 +79,11 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
     let cfg_camino = Utf8PathBuf::from_path_buf(cfg.clone())
         .map_err(|_| OpsError::invalid(format!("non-UTF-8 config path: {}", cfg.display())))?;
 
-    let job_id = jobs.submit().await;
+    let job_id = jobs.submit_for(&cfg.to_string_lossy()).await;
+    let cancel = jobs
+        .cancel_token(&job_id)
+        .await
+        .ok_or_else(|| OpsError::internal("job vanished right after submit"))?;
     let jobs_handle = jobs.clone();
     let job_id_for_task = job_id.clone();
 
@@ -88,25 +92,25 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
         let lock = project_lock(cfg_camino.as_std_path());
         let _guard = lock.lock().await;
         let started_at = chrono::Utc::now().to_rfc3339();
-        jobs_handle
-            .set(
-                &job_id_for_task,
-                JobState::Running {
-                    started_at: started_at.clone(),
-                    progress: None,
-                },
-            )
-            .await;
+        // Cancelled while it waited: it never starts.
+        if !jobs_handle.begin(&job_id_for_task, &started_at).await {
+            return;
+        }
         let t0 = std::time::Instant::now();
         let cfg_for_blocking = cfg_camino.clone();
         let progress_jobs = jobs_handle.clone();
         let progress_id = job_id_for_task.clone();
-        let inner = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let render_cancel = cancel.clone();
+        let inner = tokio::task::spawn_blocking(move || -> Result<(), RenderStop> {
             // Every stage report lands on the job, where the status
-            // endpoint and the WebSocket feed pick it up.
-            vibecut::progress::with_sink(
+            // endpoint and the WebSocket feed pick it up; the job's cancel
+            // token rides along, so Stop kills the pipeline's ffmpeg runs.
+            vibecut::progress::with_sink_and_cancel(
                 move |p| progress_jobs.set_progress_blocking(&progress_id, p.clone()),
+                render_cancel.clone(),
                 || {
+                    // Stopped between `begin` and here.
+                    vibecut::cancel::check()?;
                     vibecut::run_pipeline::run_cmd(
                         &cfg_for_blocking,
                         /*dry_run*/ false,
@@ -118,7 +122,7 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
                     )
                 },
             )
-            .map_err(|e| format!("{e:#}"))
+            .map_err(|e| RenderStop::classify(&e, &render_cancel))
         })
         .await;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -154,7 +158,12 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
                     result_json,
                 }
             }
-            Ok(Err(msg)) => JobState::Failed {
+            Ok(Err(RenderStop::Cancelled)) => JobState::Cancelled {
+                started_at: Some(started_at),
+                finished_at,
+                elapsed_ms,
+            },
+            Ok(Err(RenderStop::Failed(msg))) => JobState::Failed {
                 started_at,
                 finished_at,
                 elapsed_ms,
@@ -173,10 +182,59 @@ pub async fn submit_async(jobs: &JobRegistry, config_path: &str) -> Result<Strin
     Ok(job_id)
 }
 
+/// Why an async render's pipeline returned early.
+#[derive(Debug, PartialEq)]
+enum RenderStop {
+    /// Stopped on request.
+    Cancelled,
+    /// A real failure, as a human-readable message.
+    Failed(String),
+}
+
+impl RenderStop {
+    /// A render whose token was cancelled counts as cancelled whatever
+    /// error it surfaced with: killing ffmpeg can show up as some other
+    /// stage failing first.
+    fn classify(e: &anyhow::Error, token: &vibecut::cancel::CancelToken) -> Self {
+        if token.is_cancelled() || vibecut::cancel::is_cancelled(e) {
+            RenderStop::Cancelled
+        } else {
+            RenderStop::Failed(format!("{e:#}"))
+        }
+    }
+}
+
 /// Look up a submitted job's current state. `None` means the id was
 /// never issued (or was evicted — see [`JobRegistry`]'s retention cap).
 pub async fn render_status(jobs: &JobRegistry, job_id: &str) -> Option<JobState> {
     jobs.get(job_id).await
+}
+
+/// Stop a job: a queued one never starts, a running one has its ffmpeg
+/// children killed and turns `cancelled` within about a second (poll it,
+/// or watch the progress feed). The last good output stays in place.
+/// Returns the job's JSON (see [`job_info_json`]) right after the
+/// request; `None` for an unknown id.
+pub async fn cancel(jobs: &JobRegistry, job_id: &str) -> Option<serde_json::Value> {
+    jobs.cancel(job_id).await.map(|info| job_info_json(&info))
+}
+
+/// Every retained job, newest first, as `{ "jobs": [...] }`.
+pub async fn list_jobs(jobs: &JobRegistry) -> serde_json::Value {
+    let list: Vec<serde_json::Value> = jobs.list().await.iter().map(job_info_json).collect();
+    serde_json::json!({ "jobs": list })
+}
+
+/// [`job_state_json`] plus what the jobs list needs: the config it
+/// renders, when it was submitted, and whether a Stop is pending.
+pub fn job_info_json(info: &JobInfo) -> serde_json::Value {
+    let mut v = job_state_json(&info.id, info.state.clone());
+    if let serde_json::Value::Object(map) = &mut v {
+        map.insert("config_path".into(), info.config_path.clone().into());
+        map.insert("submitted_at".into(), info.submitted_at.clone().into());
+        map.insert("cancel_requested".into(), info.cancel_requested.into());
+    }
+    v
 }
 
 /// Render a job's state as one JSON shape, shared by every transport
@@ -223,6 +281,17 @@ pub fn job_state_json(job_id: &str, state: JobState) -> serde_json::Value {
             "finished_at": finished_at,
             "elapsed_ms": elapsed_ms,
             "error": error,
+        }),
+        JobState::Cancelled {
+            started_at,
+            finished_at,
+            elapsed_ms,
+        } => serde_json::json!({
+            "job_id": job_id,
+            "state": "cancelled",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed_ms": elapsed_ms,
         }),
     }
 }
@@ -344,6 +413,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_path_from_toml(&cfg), Some(PathBuf::from("/projects/out/reel.mp4")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_stopped_render_is_cancelled_not_failed() {
+        let token = vibecut::cancel::CancelToken::new();
+        let boom = anyhow::anyhow!("ffmpeg failed (exit 1)");
+        assert_eq!(
+            RenderStop::classify(&boom, &token),
+            RenderStop::Failed("ffmpeg failed (exit 1)".into())
+        );
+        let stopped = anyhow::Error::from(vibecut::cancel::Cancelled).context("normalize segment 2");
+        assert_eq!(RenderStop::classify(&stopped, &token), RenderStop::Cancelled);
+        // Once Stop was pressed, whatever the kill surfaced as is a cancel.
+        token.cancel();
+        assert_eq!(RenderStop::classify(&boom, &token), RenderStop::Cancelled);
+    }
+
+    #[test]
+    fn cancelled_state_json() {
+        let v = job_state_json(
+            "job_1",
+            JobState::Cancelled { started_at: None, finished_at: "t1".into(), elapsed_ms: 0 },
+        );
+        assert_eq!(v["state"], "cancelled");
+        assert_eq!(v["job_id"], "job_1");
+        assert!(v["started_at"].is_null());
+    }
+
+    /// A job cancelled while it waits for the project lock never runs:
+    /// the config here isn't even valid, so running it would end `failed`.
+    #[tokio::test]
+    async fn a_cancelled_queued_render_never_starts() {
+        let d = tmp("queued");
+        let cfg = d.join("p.toml");
+        std::fs::write(&cfg, "this is not a vibecut config").unwrap();
+        let jobs = JobRegistry::new();
+        let lock = project_lock(&cfg);
+        let held = lock.lock().await; // another render of this project
+        let id = submit_async(&jobs, &cfg.to_string_lossy()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(matches!(jobs.get(&id).await.unwrap(), JobState::Queued));
+        let after = cancel(&jobs, &id).await.unwrap();
+        assert_eq!(after["state"], "cancelled");
+        assert_eq!(after["cancel_requested"], true);
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        match jobs.get(&id).await.unwrap() {
+            JobState::Cancelled { started_at: None, .. } => {}
+            other => panic!("cancelled job ran anyway: {other:?}"),
+        }
+        let listed = list_jobs(&jobs).await;
+        assert_eq!(listed["jobs"][0]["job_id"], id.as_str());
+        assert!(listed["jobs"][0]["config_path"].as_str().unwrap().ends_with("p.toml"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

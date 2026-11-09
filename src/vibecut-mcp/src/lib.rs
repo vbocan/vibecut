@@ -440,9 +440,9 @@ impl VibecutMcpServer {
 
     /// Poll the state of a render job submitted via
     /// `render_async`. States are `queued` / `running` / `done` /
-    /// `failed`; for `done` the response includes the same manifest
+    /// `failed` / `cancelled`; for `done` the response includes the same manifest
     /// summary the synchronous `render` tool returns.
-    #[tool(description = "Poll the state of a job submitted via render_async. Returns queued/running/done/failed plus the manifest summary when done.")]
+    #[tool(description = "Poll the state of a job submitted via render_async. Returns queued/running/done/failed/cancelled plus the manifest summary when done.")]
     async fn render_status(
         &self,
         Parameters(args): Parameters<RenderStatusArgs>,
@@ -469,6 +469,24 @@ impl VibecutMcpServer {
         // per job state regardless of transport.
         let body = render::job_state_json(&args.job_id, st);
         Ok(serde_json::to_string_pretty(&body).unwrap_or_default())
+    }
+
+    /// Stop a job submitted via `render_async`: a queued one never
+    /// starts, a running one has its ffmpeg processes killed and turns
+    /// `cancelled` within about a second. The last good output stays.
+    #[tool(description = "Stop a job submitted via render_async. A queued job never starts; a running one is killed and reports `cancelled` within about a second. The previous output file is left untouched.")]
+    async fn cancel_render(
+        &self,
+        Parameters(args): Parameters<RenderStatusArgs>,
+    ) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result = match render::cancel(&self.jobs, &args.job_id).await {
+            Some(body) => Ok(serde_json::to_string_pretty(&body).unwrap_or_default()),
+            None => Ok(json_error(&format!("unknown job_id: {}", args.job_id), None)),
+        };
+        self.log_string_call("cancel_render", args_json, &result, started);
+        result
     }
 
     /// Render a TOML config to an mp4. Blocking; takes 1–10 minutes.

@@ -359,13 +359,19 @@ class AppState {
 		if (this.configError || this.makeError) return;
 		if (opts.render !== false) void this.startRenderAsync();
 		this.undo = snapshot && snapshot.versionIndex >= 0 ? snapshot : null;
+		// The render just started is this change's: a Stop undoes it.
+		this.renderUndo = this.undo;
 	}
 
 	async undoLast() {
 		const u = this.undo;
 		if (!u) return;
 		this.undo = null;
-		if (this.renderMode === 'queued' || this.renderMode === 'running') this.resetRender();
+		if (this.renderMode === 'queued' || this.renderMode === 'running') {
+			// The render of the change being undone must stop server-side too.
+			if (this.jobId) void api.cancelJob(this.jobId).catch(() => {});
+			this.resetRender();
+		}
 		try {
 			await api.writeConfig(u.configPath, u.configToml);
 			this.proposeResult = { ...u.propose, config_toml: u.configToml };
@@ -640,6 +646,9 @@ class AppState {
 		// One render at a time: a second one would share the workspace and
 		// the output file with the first.
 		if (!this.proposeResult || this.rendering) return;
+		// Not a change's render until `withUndo` says so (set synchronously,
+		// before the first await, so `withUndo` marks it right after).
+		this.renderUndo = null;
 		// Render what the user sees: unsaved edits in the Pro settings
 		// would otherwise be silently ignored by this render.
 		if (this.structuredConfigDirty) await this.saveStructuredConfig();
@@ -647,6 +656,8 @@ class AppState {
 		const old = this.ws;
 		this.ws = null;
 		old?.close();
+		// Where a Stop goes back to (the version on screen right now).
+		this.versionBeforeRender = this.renderHistory.findIndex((v) => v.output_path === this.outputPath);
 		this.renderMode = 'queued';
 		this.jobId = null; // a stale poll of the previous job must stop
 		this.renderError = null;
@@ -659,17 +670,153 @@ class AppState {
 		this.renderProgress = null;
 		this.renderStartedAt = Date.now();
 		this.makeStep = 'rendering';
-		api
+		this.jobIdReady = api
 			.renderAsync(this.proposeResult.config_path)
 			.then((r) => {
 				this.jobId = r.job_id;
 				this.openProgressSocket(r.job_id);
+				return r.job_id;
 			})
 			.catch((e) => {
 				this.renderMode = 'failed';
 				this.makeStep = 'failed';
 				this.renderError = e instanceof api.ApiError ? e.describe() : String(e);
+				return null;
 			});
+	}
+
+	// ---------- Stop ----------
+	/** A Stop is on its way: the button says so and tweaks wait. */
+	stopping = $state(false);
+	/** Short message for the toast area ("Render stopped — …"). */
+	notice = $state<{ text: string; id: number } | null>(null);
+	/** The version on screen when the current render started (-1: none). */
+	private versionBeforeRender = -1;
+	/** The current render's job id, once the server has answered. */
+	private jobIdReady: Promise<string | null> | null = null;
+	/** The undo snapshot of the change the current render is for, if any. */
+	private renderUndo: object | null = null;
+
+	showNotice(text: string) {
+		this.notice = { text, id: Date.now() };
+	}
+
+	/**
+	 * Stop the render in flight and go back to where the user was: the
+	 * version on screen before (with the change that started this render
+	 * undone, when there is one), or Create for a first render. Resolves
+	 * true once stopped, false if there was nothing to stop or the render
+	 * finished before the Stop reached it (its result is then shown).
+	 * `quiet`: no toast — for "Stop and apply this instead".
+	 */
+	async stopRender(opts: { quiet?: boolean } = {}): Promise<boolean> {
+		if (!this.rendering || this.stopping) return false;
+		this.stopping = true;
+		try {
+			const jobId = this.jobId ?? (await this.jobIdReady);
+			if (!jobId || !this.rendering) return false;
+			let st: api.JobStatus = await api.cancelJob(jobId);
+			const t0 = Date.now();
+			while (st.state === 'queued' || st.state === 'running') {
+				if (Date.now() - t0 > 20000) throw new Error('it is still running');
+				await new Promise((r) => setTimeout(r, 150));
+				st = await api.renderStatus(jobId);
+			}
+			if (this.jobId !== jobId) return false; // superseded meanwhile
+			if (st.state !== 'cancelled') {
+				// Finished before the Stop landed: show what it made.
+				this.applyJobStatus(st);
+				return false;
+			}
+			await this.returnFromStop(opts.quiet);
+			return true;
+		} catch (e) {
+			const why = e instanceof api.ApiError ? e.describe() : e instanceof Error ? e.message : String(e);
+			this.showNotice(`Couldn't stop the render: ${why}`);
+			return false;
+		} finally {
+			this.stopping = false;
+		}
+	}
+
+	/** After a render was cancelled: back to the previous version, or Create. */
+	private async returnFromStop(quiet = false) {
+		const old = this.ws;
+		this.ws = null;
+		old?.close();
+		this.jobId = null;
+		this.renderProgress = null;
+		this.renderMode = 'idle';
+		this.stopBed();
+		this.autoplayReveal = false;
+		const u = this.undo;
+		let back: number | null = null;
+		if (u && u === this.renderUndo && u.versionIndex >= 0 && u.versionIndex < this.renderHistory.length) {
+			// The stopped render was for this change: undo it, so the
+			// settings match the version shown again.
+			back = u.versionIndex;
+			await this.undoLast();
+			// Couldn't restore the settings (the error says why): still show it.
+			if ((this.renderMode as RenderMode) !== 'done') await this.openVersion(back);
+		} else if (this.renderHistory.length > 0) {
+			const i = this.versionBeforeRender;
+			back = i >= 0 && i < this.renderHistory.length ? i : this.renderHistory.length - 1;
+			await this.openVersion(back);
+		} else {
+			this.makeStep = 'idle';
+		}
+		this.persist();
+		if (!quiet) {
+			const label = back === null ? null : this.renderHistory[back]?.label;
+			this.showNotice(label ? `Render stopped — back to ${label}` : 'Render stopped');
+		}
+	}
+
+	// ---------- Renders list ----------
+	jobs = $state<api.JobListEntry[]>([]);
+	jobsError = $state<string | null>(null);
+	loadingJobs = $state(false);
+
+	async loadJobs() {
+		this.loadingJobs = true;
+		this.jobsError = null;
+		try {
+			this.jobs = (await api.listJobs()).jobs;
+		} catch (e) {
+			this.jobsError = e instanceof api.ApiError ? e.describe() : String(e);
+		} finally {
+			this.loadingJobs = false;
+		}
+	}
+
+	/** Stop any listed job — the current render goes through `stopRender`. */
+	async stopJob(jobId: string) {
+		if (jobId === this.jobId) await this.stopRender();
+		else {
+			try {
+				await api.cancelJob(jobId);
+			} catch (e) {
+				this.jobsError = e instanceof api.ApiError ? e.describe() : String(e);
+			}
+		}
+		await this.loadJobs();
+	}
+
+	/** Show a finished job of this project in the Studio. False when it
+	 *  belongs to another project (the list links its file instead). */
+	async openJob(j: api.JobListEntry): Promise<boolean> {
+		if (j.state !== 'done' || this.rendering) return false;
+		const path = j.version_path ?? j.output_path;
+		if (!path) return false;
+		let i = this.renderHistory.findIndex((v) => v.output_path === path);
+		if (i < 0 && this.proposeResult && j.config_path === this.proposeResult.config_path) {
+			this.recordRenderHistory(j);
+			i = this.renderHistory.length - 1;
+		}
+		if (i < 0) return false;
+		await this.openVersion(i);
+		this.persist();
+		return true;
 	}
 
 	/** Apply one job status (from the socket or a poll). */
@@ -686,6 +833,12 @@ class AppState {
 		}
 		if (this.renderMode === 'done' || this.renderMode === 'failed') return;
 		if (this.jobId && data.job_id !== this.jobId) return; // an older job
+		if (data.state === 'cancelled') {
+			// `stopRender` handles its own Stop; this one came from elsewhere
+			// (the Renders list, another tab, an MCP client).
+			if (!this.stopping && this.rendering) void this.returnFromStop();
+			return;
+		}
 		this.renderMode = data.state;
 		if (data.state === 'running') {
 			this.renderProgress = data.progress ?? this.renderProgress;

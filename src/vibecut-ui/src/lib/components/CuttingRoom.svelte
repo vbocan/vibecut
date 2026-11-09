@@ -35,7 +35,9 @@
 	const headline = $derived(
 		failed
 			? 'That didn’t work'
-			: p
+			: s.stopping
+				? 'Stopping…'
+				: p
 				? p.label
 				: (PREP[s.makeStep] ?? (s.renderMode === 'queued' ? 'Getting ready' : 'Warming up'))
 	);
@@ -61,6 +63,10 @@
 	});
 
 	const errorText = $derived(s.makeError ?? s.renderError ?? 'Something went wrong.');
+
+	// One tap stops a wrong render. Before the render itself starts
+	// (reading clips, planning) there is nothing on the server to stop yet.
+	const canStop = $derived(s.rendering && !s.stopping);
 </script>
 
 <!-- Screen readers hear the stage changes and the outcome, not the
@@ -143,6 +149,22 @@
 					.toString()
 					.padStart(2, '0')}{#if eta}&nbsp;·&nbsp;{eta}{/if}
 			</p>
+
+			<button
+				class="btn danger stop"
+				type="button"
+				disabled={!canStop}
+				aria-busy={s.stopping}
+				title={s.rendering
+					? s.renderHistory.length > 0
+						? 'Stop this render and go back to the last version'
+						: 'Stop this render'
+					: 'You can stop it once the render starts'}
+				onclick={() => s.stopRender()}
+			>
+				<span class="stop-icon" aria-hidden="true"></span>
+				{s.stopping ? 'Stopping…' : 'Stop'}
+			</button>
 		{/if}
 	</div>
 </section>
@@ -434,6 +456,20 @@
 	.actions {
 		display: flex;
 		gap: 10px;
+	}
+
+	.stop {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		margin-top: 4px;
+	}
+
+	.stop-icon {
+		width: 10px;
+		height: 10px;
+		border-radius: 2px;
+		background: currentColor;
 	}
 
 	@keyframes pan {

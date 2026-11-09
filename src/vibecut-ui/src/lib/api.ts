@@ -251,10 +251,32 @@ export type JobStatus =
 	| { job_id: string; state: 'queued' }
 	| { job_id: string; state: 'running'; started_at: string; progress: RenderProgress | null }
 	| ({ job_id: string; state: 'done'; started_at: string; finished_at: string; elapsed_ms: number } & RenderResult)
-	| { job_id: string; state: 'failed'; started_at: string; finished_at: string; elapsed_ms: number; error: string };
+	| { job_id: string; state: 'failed'; started_at: string; finished_at: string; elapsed_ms: number; error: string }
+	/** Stopped on request; `started_at` is null when it never left the queue. */
+	| { job_id: string; state: 'cancelled'; started_at: string | null; finished_at: string; elapsed_ms: number };
 
 export function renderStatus(jobId: string): Promise<JobStatus> {
 	return getJson(`/render/${encodeURIComponent(jobId)}`);
+}
+
+// ---------- jobs ----------
+
+/** One row of the jobs list (`GET /api/jobs`). `cancel_requested`: a Stop
+ *  is on its way (a running job turns `cancelled` within about a second). */
+export type JobListEntry = JobStatus & {
+	config_path: string;
+	submitted_at: string;
+	cancel_requested: boolean;
+};
+
+/** Recent render jobs, newest first. */
+export function listJobs(): Promise<{ jobs: JobListEntry[] }> {
+	return getJson('/jobs');
+}
+
+/** Stop a render. The previous output file is left untouched. */
+export function cancelJob(jobId: string): Promise<JobListEntry> {
+	return sendJson(`/jobs/${encodeURIComponent(jobId)}/cancel`, {});
 }
 
 /** Opens the push-based progress feed. Caller owns the socket's lifecycle. */
