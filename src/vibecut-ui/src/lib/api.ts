@@ -278,15 +278,34 @@ export function renderStatus(jobId: string): Promise<JobStatus> {
 
 // ---------- jobs ----------
 
-/** One row of the jobs list (`GET /api/jobs`). `cancel_requested`: a Stop
- *  is on its way (a running job turns `cancelled` within about a second). */
-export type JobListEntry = JobStatus & {
+/** What a job does: a full render, or a platform version of one. */
+export type JobKind = 'render' | 'reformat';
+
+interface JobListCommon {
+	/** The project config a render renders; empty for reformats. */
 	config_path: string;
 	submitted_at: string;
+	/** A Stop is on its way (a running job turns `cancelled` within about a second). */
 	cancel_requested: boolean;
-};
+}
 
-/** Recent render jobs, newest first. */
+export type RenderJobEntry = JobStatus & JobListCommon & { kind: 'render' };
+
+/** A reformat job: the render it works from, its preset and fit, and the
+ *  version file it writes (known before it is done). */
+export type ReformatJobEntry = ReformatStatus &
+	JobListCommon & {
+		kind: 'reformat';
+		source_path: string;
+		preset: PlatformPreset;
+		fit: 'blur' | 'crop' | 'pad' | null;
+		output_path: string;
+	};
+
+/** One row of the jobs list (`GET /api/jobs`). */
+export type JobListEntry = RenderJobEntry | ReformatJobEntry;
+
+/** Recent jobs (renders and reformats), newest first. */
 export function listJobs(): Promise<{ jobs: JobListEntry[] }> {
 	return getJson('/jobs');
 }
@@ -366,20 +385,30 @@ export interface ReformatResult {
 	size_bytes: number;
 }
 
-/** Start a platform version of a finished render; poll `reformatStatus`. */
+/** Start a platform version of a finished render; poll `reformatStatus`.
+ *  `reused`: a job was already making this version, and this is that job. */
 export function reformat(
 	outputPath: string,
 	preset: PlatformPreset,
 	fit?: 'blur' | 'crop' | 'pad'
-): Promise<{ job_id: string; state: string; preset: PlatformPreset; output_path: string }> {
+): Promise<{
+	job_id: string;
+	kind: 'reformat';
+	state: string;
+	reused: boolean;
+	preset: PlatformPreset;
+	output_path: string;
+}> {
 	return sendJson('/reformat', { output_path: outputPath, preset, ...(fit ? { fit } : {}) });
 }
 
 export type ReformatStatus =
 	| { job_id: string; state: 'queued' }
 	| { job_id: string; state: 'running'; started_at: string; progress: RenderProgress | null }
-	| ({ job_id: string; state: 'done'; elapsed_ms: number } & ReformatResult)
-	| { job_id: string; state: 'failed'; error: string };
+	| ({ job_id: string; state: 'done'; started_at: string; finished_at: string; elapsed_ms: number } & ReformatResult)
+	| { job_id: string; state: 'failed'; started_at: string; finished_at: string; elapsed_ms: number; error: string }
+	/** Stopped (the Renders list's Stop); the last good version is untouched. */
+	| { job_id: string; state: 'cancelled'; started_at: string | null; finished_at: string; elapsed_ms: number };
 
 /** Reformats run as jobs in the same registry as renders. */
 export function reformatStatus(jobId: string): Promise<ReformatStatus> {

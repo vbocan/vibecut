@@ -862,11 +862,17 @@ pub fn parse_progress_secs(line: &str) -> Option<f64> {
 
 /// Run ffmpeg with `args`, calling `on_progress` with 0..1 of `total_secs`
 /// written as it goes.
+///
+/// Cancellable like the render's ffmpeg runs (see [`crate::cancel`]): once
+/// the cancel token installed on this thread is cancelled, ffmpeg is
+/// killed and this returns [`crate::cancel::Cancelled`] within a poll
+/// interval, even between two progress lines.
 pub fn run_ffmpeg_with_progress(
     args: &[String],
     total_secs: f64,
     on_progress: &mut dyn FnMut(f32),
 ) -> Result<()> {
+    crate::cancel::check()?;
     let mut child = Command::new("ffmpeg")
         .args(["-progress", "pipe:1", "-nostats"])
         .args(args)
@@ -881,17 +887,43 @@ pub fn run_ffmpeg_with_progress(
         let _ = stderr.read_to_string(&mut s);
         s
     });
-    if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
-            if let Some(secs) = parse_progress_secs(&line) {
+    // Progress lines are read on their own thread, so a Stop is noticed
+    // between them instead of only when ffmpeg next writes one.
+    let (tx, rx) = std::sync::mpsc::channel::<f64>();
+    let out_reader = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
+                if let Some(secs) = parse_progress_secs(&line) {
+                    if tx.send(secs).is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+    });
+    let token = crate::progress::cancel_token();
+    loop {
+        if token.as_ref().is_some_and(|t| t.is_cancelled()) {
+            break;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(secs) => {
                 if total_secs > 0.0 {
                     on_progress((secs / total_secs).clamp(0.0, 1.0) as f32);
                 }
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let status = child.wait().context("waiting for ffmpeg")?;
+    // Kills and reaps ffmpeg when the token was cancelled.
+    let status = crate::cancel::wait_child(&mut child);
+    drop(rx);
+    if let Some(h) = out_reader {
+        let _ = h.join();
+    }
     let stderr = err_reader.join().unwrap_or_default();
+    let status = status.context("waiting for ffmpeg")?;
     if !status.success() {
         let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
         let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n  ");
@@ -1014,6 +1046,11 @@ pub fn manifest_card_windows(source: &Path) -> Vec<[f64; 2]> {
 /// One ffmpeg pass over a finished render: reframe `input` to `opts.preset`
 /// with the same filter graph the render's per-output pass uses, and write
 /// it to `output`. Stream-copies when the source already is that shape.
+///
+/// Like a render's `[[outputs]]`, the version is written under its staging
+/// name ([`crate::staging`]) and only renamed to `output` once ffmpeg has
+/// finished, so a failed or stopped pass ([`crate::cancel`]) never leaves a
+/// truncated file there that would later look like a finished version.
 pub fn reformat_video(
     input: &Utf8Path,
     output: &Utf8Path,
@@ -1025,6 +1062,23 @@ pub fn reformat_video(
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    let staged = crate::staging::StagedOutputs::new([output]);
+    let outcome = write_reformat(input, staged.path(0), &src, plan, opts, on_progress)?;
+    // Last chance to stop: past this point the version replaces the old one.
+    crate::cancel::check()?;
+    staged.commit()?;
+    Ok(outcome)
+}
+
+/// [`reformat_video`]'s ffmpeg pass, straight into `output`.
+fn write_reformat(
+    input: &Utf8Path,
+    output: &Utf8Path,
+    src: &SourceVideo,
+    plan: ReformatPlan,
+    opts: &ReformatOptions,
+    on_progress: &mut dyn FnMut(f32),
+) -> Result<ReformatOutcome> {
     let (args, encoder) = if plan.copy {
         (copy_args(input, output), "copy")
     } else {
@@ -1576,5 +1630,109 @@ mod tests {
         assert_eq!(parse_progress_secs("out_time_ms=2000000"), Some(2.0));
         assert_eq!(parse_progress_secs("out_time_us=N/A"), None);
         assert_eq!(parse_progress_secs("frame=12"), None);
+    }
+}
+
+/// [`reformat_video`] against real ffmpeg: it writes through a staging
+/// name, and a Stop kills its pass and leaves the last good version alone.
+#[cfg(test)]
+mod reformat_job_tests {
+    use super::*;
+    use crate::cancel::{is_cancelled, CancelToken};
+    use crate::progress::with_sink_and_cancel;
+    use crate::staging::staging_path;
+
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// A small 16:9 "render" with sound, `secs` long.
+    fn render_clip(name: &str, secs: u32) -> (Utf8PathBuf, Utf8PathBuf) {
+        let d = std::env::temp_dir().join(format!("vibecut_reformat_job_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = Utf8PathBuf::from_path_buf(d).unwrap();
+        let clip = d.join("coast.mp4");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y", "-v", "error", "-nostdin",
+                "-f", "lavfi", "-i", &format!("testsrc2=size=640x360:rate=30:duration={secs}"),
+                "-f", "lavfi", "-i", &format!("sine=frequency=330:duration={secs}"),
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest",
+                clip.as_str(),
+            ])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "generating {clip}");
+        (d, clip)
+    }
+
+    fn opts(preset: OutputPreset) -> ReformatOptions {
+        ReformatOptions { preset, fit: None, card_windows: Vec::new() }
+    }
+
+    #[test]
+    fn a_finished_reformat_is_committed_from_its_staging_name() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        }
+        let (d, clip) = render_clip("commit", 1);
+        let target = d.join("coast.whatsapp.mp4");
+        let staged = staging_path(&target);
+        let mut saw_staged = false;
+        reformat_video(&clip, &target, &opts(OutputPreset::Whatsapp), &mut |_| {
+            saw_staged |= staged.exists() && !target.exists();
+        })
+        .expect("reformat");
+        assert!(saw_staged, "ffmpeg didn't write under the staging name");
+        assert!(!staged.exists(), "staging file left behind");
+        let made = probe_source(&target).unwrap();
+        assert_eq!((made.width, made.height), (720, 1280));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_stopped_reformat_kills_ffmpeg_and_keeps_the_last_good_version() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        }
+        let (d, clip) = render_clip("stop", 20);
+        let target = d.join("coast.reels.mp4");
+        std::fs::write(&target, b"the last good version").unwrap();
+        let token = CancelToken::new();
+        let stop = token.clone();
+        let started = std::time::Instant::now();
+        let r = with_sink_and_cancel(|_| {}, token, || {
+            reformat_video(&clip, &target, &opts(OutputPreset::Reels), &mut |f| {
+                // Stop as soon as ffmpeg is under way.
+                if f > 0.0 {
+                    stop.cancel();
+                }
+            })
+        });
+        let err = r.expect_err("a stopped reformat must not succeed");
+        assert!(is_cancelled(&err), "stopped with a non-cancel error: {err:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the Stop didn't end the pass early ({:?})",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"the last good version");
+        assert!(!staging_path(&target).exists(), "partial version left behind");
+        // Cancelled before it starts: ffmpeg never runs.
+        let token = CancelToken::new();
+        token.cancel();
+        let r = with_sink_and_cancel(|_| {}, token, || {
+            run_ffmpeg_with_progress(&["-version".to_string()], 1.0, &mut |_| {})
+        });
+        assert!(r.is_err_and(|e| is_cancelled(&e)));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

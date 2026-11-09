@@ -225,14 +225,25 @@ pub async fn list_jobs(jobs: &JobRegistry) -> serde_json::Value {
     serde_json::json!({ "jobs": list })
 }
 
-/// [`job_state_json`] plus what the jobs list needs: the config it
-/// renders, when it was submitted, and whether a Stop is pending.
+/// [`job_state_json`] plus what the jobs list needs: the job's `kind`
+/// (`render` or `reformat`), the config it renders, when it was submitted,
+/// and whether a Stop is pending. A reformat job also names the render it
+/// works from (`source_path`), its `preset` and `fit`, and the version it
+/// writes (`output_path`, known before it is done).
 pub fn job_info_json(info: &JobInfo) -> serde_json::Value {
     let mut v = job_state_json(&info.id, info.state.clone());
     if let serde_json::Value::Object(map) = &mut v {
+        map.insert("kind".into(), info.kind.as_str().into());
         map.insert("config_path".into(), info.config_path.clone().into());
         map.insert("submitted_at".into(), info.submitted_at.clone().into());
         map.insert("cancel_requested".into(), info.cancel_requested.into());
+        if let Some(r) = &info.reformat {
+            map.insert("source_path".into(), r.source_path.clone().into());
+            map.insert("preset".into(), r.preset.clone().into());
+            map.insert("fit".into(), r.fit.clone().into());
+            // A done job's result already has it (the same path).
+            map.entry("output_path").or_insert_with(|| r.output_path.clone().into());
+        }
     }
     v
 }
@@ -440,6 +451,45 @@ mod tests {
         assert_eq!(v["state"], "cancelled");
         assert_eq!(v["job_id"], "job_1");
         assert!(v["started_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_jobs_list_tells_renders_from_reformats() {
+        let jobs = JobRegistry::new();
+        let render = jobs.submit_for("/projects/a.toml").await;
+        let (reformat, _) = jobs
+            .submit_reformat(crate::jobs::ReformatJob {
+                source_path: "/projects/out/a.mp4".into(),
+                preset: "square".into(),
+                fit: None,
+                output_path: "/projects/out/a.square.mp4".into(),
+            })
+            .await;
+        let listed = list_jobs(&jobs).await;
+        let row = |id: &str| listed["jobs"].as_array().unwrap().iter().find(|j| j["job_id"] == id).unwrap().clone();
+        let r = row(&render);
+        assert_eq!(r["kind"], "render");
+        assert_eq!(r["config_path"], "/projects/a.toml");
+        assert!(r.get("preset").is_none() && r.get("source_path").is_none());
+        let f = row(&reformat);
+        assert_eq!(f["kind"], "reformat");
+        assert_eq!(f["preset"], "square");
+        assert!(f["fit"].is_null());
+        assert_eq!(f["source_path"], "/projects/out/a.mp4");
+        assert_eq!(f["output_path"], "/projects/out/a.square.mp4");
+        // Done: the result's own output_path is kept, not overwritten.
+        jobs.set(
+            &reformat,
+            JobState::Done {
+                started_at: "t0".into(),
+                finished_at: "t1".into(),
+                elapsed_ms: 5,
+                result_json: serde_json::json!({ "ok": true, "output_path": "/projects/out/a.square.mp4", "width": 1080 }),
+            },
+        )
+        .await;
+        let f = job_info_json(&jobs.info(&reformat).await.unwrap());
+        assert_eq!((f["state"].as_str(), f["kind"].as_str(), f["width"].as_u64()), (Some("done"), Some("reformat"), Some(1080)));
     }
 
     /// A job cancelled while it waits for the project lock never runs:

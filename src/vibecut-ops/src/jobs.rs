@@ -82,12 +82,48 @@ impl JobState {
     }
 }
 
+/// What a job does. Renders and platform reformats share one registry —
+/// one jobs list, one cancel route, one progress feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    /// A full render of a project config (`render::submit_async`).
+    #[default]
+    Render,
+    /// A platform version of a finished render (`reformat::submit_async`).
+    Reformat,
+}
+
+impl JobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobKind::Render => "render",
+            JobKind::Reformat => "reformat",
+        }
+    }
+}
+
+/// The request a reformat job runs: which render, which platform preset
+/// (and fit), and the version file it writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReformatJob {
+    pub source_path: String,
+    pub preset: String,
+    /// `None`: the preset's default fit.
+    pub fit: Option<String>,
+    pub output_path: String,
+}
+
 /// One job as the jobs list shows it.
 #[derive(Debug, Clone)]
 pub struct JobInfo {
     pub id: String,
-    /// The config the job renders (empty for jobs submitted without one).
+    pub kind: JobKind,
+    /// The config the job renders (empty for jobs submitted without one,
+    /// and for reformats).
     pub config_path: String,
+    /// What a reformat job makes; `None` for renders.
+    pub reformat: Option<ReformatJob>,
     pub submitted_at: String,
     pub state: JobState,
     /// A Stop was asked for; the job ends `Cancelled` (or `Done`, if the
@@ -98,17 +134,33 @@ pub struct JobInfo {
 /// One retained job.
 struct JobRecord {
     id: String,
+    kind: JobKind,
     config_path: String,
+    reformat: Option<ReformatJob>,
     submitted_at: String,
     state: JobState,
     cancel: CancelToken,
 }
 
 impl JobRecord {
+    fn new(id: String, kind: JobKind, config_path: String, reformat: Option<ReformatJob>) -> Self {
+        JobRecord {
+            id,
+            kind,
+            config_path,
+            reformat,
+            submitted_at: chrono::Utc::now().to_rfc3339(),
+            state: JobState::Queued,
+            cancel: CancelToken::new(),
+        }
+    }
+
     fn info(&self) -> JobInfo {
         JobInfo {
             id: self.id.clone(),
+            kind: self.kind,
             config_path: self.config_path.clone(),
+            reformat: self.reformat.clone(),
             submitted_at: self.submitted_at.clone(),
             state: self.state.clone(),
             cancel_requested: self.cancel.is_cancelled(),
@@ -159,14 +211,31 @@ impl JobRegistry {
     pub async fn submit_for(&self, config_path: &str) -> String {
         let id = fresh_job_id();
         let mut g = self.inner.lock().await;
-        g.entries.push(JobRecord {
-            id: id.clone(),
-            config_path: config_path.to_string(),
-            submitted_at: chrono::Utc::now().to_rfc3339(),
-            state: JobState::Queued,
-            cancel: CancelToken::new(),
-        });
+        g.entries.push(JobRecord::new(id.clone(), JobKind::Render, config_path.to_string(), None));
         id
+    }
+
+    /// Insert a `Queued` reformat job — unless one for the same render and
+    /// preset (and fit) is still queued or running, which is reused: a
+    /// second click on a platform joins the pass already making that
+    /// version instead of starting another ffmpeg. One being stopped
+    /// (cancel requested) is not reused. Returns `(id, reused)`.
+    pub async fn submit_reformat(&self, job: ReformatJob) -> (String, bool) {
+        let mut g = self.inner.lock().await;
+        let running = g.entries.iter().find(|r| {
+            r.kind == JobKind::Reformat
+                && !r.state.is_finished()
+                && !r.cancel.is_cancelled()
+                && r.reformat.as_ref().is_some_and(|j| {
+                    j.source_path == job.source_path && j.preset == job.preset && j.fit == job.fit
+                })
+        });
+        if let Some(r) = running {
+            return (r.id.clone(), true);
+        }
+        let id = fresh_job_id();
+        g.entries.push(JobRecord::new(id.clone(), JobKind::Reformat, String::new(), Some(job)));
+        (id, false)
     }
 
     /// The job's cancel token, to install around its render.
@@ -395,6 +464,67 @@ mod tests {
         let list = r.list().await;
         assert!(list.len() <= MAX_JOBS_RETAINED);
         assert!(list.iter().any(|j| j.id == running));
+    }
+
+    fn reel(fit: Option<&str>) -> ReformatJob {
+        ReformatJob {
+            source_path: "/projects/out/coast.mp4".into(),
+            preset: "reels".into(),
+            fit: fit.map(str::to_string),
+            output_path: "/projects/out/coast.reels.mp4".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn jobs_carry_their_kind() {
+        let r = JobRegistry::new();
+        let render = r.submit_for("/projects/a.toml").await;
+        let (reformat, reused) = r.submit_reformat(reel(None)).await;
+        assert!(!reused);
+        let list = r.list().await;
+        let get = |id: &str| list.iter().find(|j| j.id == id).unwrap().clone();
+        assert_eq!(get(&render).kind, JobKind::Render);
+        assert!(get(&render).reformat.is_none());
+        assert_eq!(get(&reformat).kind, JobKind::Reformat);
+        assert_eq!(get(&reformat).reformat, Some(reel(None)));
+        assert_eq!(JobKind::Reformat.as_str(), "reformat");
+    }
+
+    #[tokio::test]
+    async fn a_second_reformat_of_the_same_version_reuses_the_running_job() {
+        let r = JobRegistry::new();
+        let (a, _) = r.submit_reformat(reel(None)).await;
+        // Queued, then running: the same request joins it.
+        assert_eq!(r.submit_reformat(reel(None)).await, (a.clone(), true));
+        assert!(r.begin(&a, "t0").await);
+        assert_eq!(r.submit_reformat(reel(None)).await, (a.clone(), true));
+        // Another preset, or another fit of the same one, is its own job.
+        let square = ReformatJob {
+            preset: "square".into(),
+            output_path: "/projects/out/coast.square.mp4".into(),
+            ..reel(None)
+        };
+        let (b, reused) = r.submit_reformat(square).await;
+        assert!(!reused && b != a);
+        let (c, reused) = r.submit_reformat(reel(Some("crop"))).await;
+        assert!(!reused && c != a);
+        // A job being stopped isn't joined; nor is a finished one.
+        r.cancel(&a).await;
+        let (d, reused) = r.submit_reformat(reel(None)).await;
+        assert!(!reused && d != a);
+        let failed = JobState::Failed {
+            started_at: "t".into(),
+            finished_at: "t".into(),
+            elapsed_ms: 1,
+            error: "x".into(),
+        };
+        r.set(&d, failed).await;
+        let (e, reused) = r.submit_reformat(reel(None)).await;
+        assert!(!reused && e != d);
+        // Renders are never folded into one another.
+        let x = r.submit_for("/projects/a.toml").await;
+        let y = r.submit_for("/projects/a.toml").await;
+        assert_ne!(x, y);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
-	import { outputFileUrl, type JobListEntry } from '$lib/api';
+	import { outputFileUrl, type JobListEntry, type PlatformPreset } from '$lib/api';
 	import ConfigWizard from './ConfigWizard.svelte';
 	import { radiogroup } from '$lib/radiogroup';
 
@@ -19,8 +19,9 @@
 	// render. Only this save's own errors count.
 	const bothDirty = $derived(s.structuredConfigDirty && s.configDirty);
 
-	// ---- Renders list: recent jobs, refreshed whenever it's shown and
-	// whenever a render starts or ends while it is.
+	// ---- Renders list: recent jobs (renders and platform versions),
+	// refreshed whenever it's shown and whenever a render starts or ends
+	// while it is.
 	let rendersOpen = $state(false);
 	$effect(() => {
 		void s.renderMode;
@@ -34,6 +35,38 @@
 		failed: 'Failed',
 		cancelled: 'Stopped'
 	};
+
+	const KIND_LABEL: Record<JobListEntry['kind'], string> = { render: 'Render', reformat: 'Reformat' };
+
+	const PRESET_LABEL: Record<PlatformPreset, string> = {
+		youtube: 'YouTube',
+		reels: 'Reels',
+		tiktok: 'TikTok',
+		shorts: 'Shorts',
+		square: 'Square',
+		whatsapp: 'WhatsApp',
+		master: 'Master'
+	};
+
+	function stateLabel(j: JobListEntry): string {
+		if (j.state === 'running' && j.kind === 'reformat') return 'Making';
+		return JOB_LABEL[j.state];
+	}
+
+	/** The finished file: a render's kept version, a reformat's version. */
+	function jobFile(j: JobListEntry): string | undefined {
+		if (j.state !== 'done') return undefined;
+		return j.kind === 'render' ? (j.version_path ?? j.output_path) : j.output_path;
+	}
+
+	/** "proposal_coastline_…" for a render, "Reels version of coast.mp4" for a reformat. */
+	function jobTitle(j: JobListEntry): string {
+		if (j.kind === 'reformat') {
+			const from = j.source_path.split('/').pop() ?? j.source_path;
+			return `${PRESET_LABEL[j.preset] ?? j.preset}${j.fit ? ` (${j.fit})` : ''} version of ${from}`;
+		}
+		return projectName(j.config_path);
+	}
 
 	function isFinished(j: JobListEntry): boolean {
 		return j.state === 'done' || j.state === 'failed' || j.state === 'cancelled';
@@ -56,7 +89,8 @@
 	}
 
 	function belongsHere(j: JobListEntry): boolean {
-		const file = j.state === 'done' ? (j.version_path ?? j.output_path) : undefined;
+		if (j.kind !== 'render') return false;
+		const file = jobFile(j);
 		return (
 			!!file &&
 			(j.config_path === s.proposeResult?.config_path || s.renderHistory.some((v) => v.output_path === file))
@@ -150,11 +184,12 @@
 			{#if s.jobsError}<p class="error">{s.jobsError}</p>{/if}
 			<ul>
 				{#each s.jobs as j (j.job_id)}
-					{@const file = j.state === 'done' ? (j.version_path ?? j.output_path) : undefined}
+					{@const file = jobFile(j)}
 					<li>
-						<span class="job-state {j.state}">{JOB_LABEL[j.state]}{j.cancel_requested && !isFinished(j) ? ' · stopping' : ''}</span>
+						<span class="job-state {j.state}">{stateLabel(j)}{j.cancel_requested && !isFinished(j) ? ' · stopping' : ''}</span>
+						<span class="kind {j.kind}">{KIND_LABEL[j.kind] ?? j.kind}</span>
 						<span class="when mono">{clockTime(j.submitted_at)}{took(j)}</span>
-						<span class="what" title={j.config_path}>{projectName(j.config_path)}</span>
+						<span class="what" title={j.kind === 'reformat' ? j.output_path : j.config_path}>{jobTitle(j)}</span>
 						{#if j.state === 'queued' || j.state === 'running'}
 							<button class="btn ghost small" type="button" disabled={j.cancel_requested} onclick={() => s.stopJob(j.job_id)}
 								>Stop</button
@@ -348,6 +383,18 @@
 
 	.renders .job-state.failed {
 		color: var(--bad);
+	}
+
+	.renders .kind {
+		font-size: var(--fs-xs);
+		padding: 1px 6px;
+		border-radius: 999px;
+		border: 1px solid var(--line-strong);
+		color: var(--text-dim);
+	}
+
+	.renders .kind.reformat {
+		color: var(--cyan);
 	}
 
 	.renders .what {

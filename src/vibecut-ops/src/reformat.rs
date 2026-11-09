@@ -10,9 +10,14 @@
 //! version (`<stem>.square.mp4`), it works from the render next to it
 //! (`vibecut::output_format::reformat_source`).
 //!
-//! [`submit_async`] runs it as a job in the shared [`JobRegistry`] —
-//! poll it like a render (`render_status`, the WebSocket feed); the
-//! result JSON is [`reformat_sync`]'s.
+//! [`submit_async`] runs it as a job in the shared [`JobRegistry`], with
+//! kind `reformat` in the jobs list — poll it like a render
+//! (`render_status`, the WebSocket feed), stop it like one (its cancel
+//! token kills the ffmpeg pass, and the last good version stays). A second
+//! request for a version already being made joins that job. The result
+//! JSON is [`reformat_sync`]'s. The version is written under a staging
+//! name and renamed into place when complete (`vibecut::staging`), the
+//! same as a render's `[[outputs]]`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +29,7 @@ pub use vibecut::output_format::version_path;
 use vibecut::progress::{Progress, Stage};
 
 use crate::error::OpsError;
-use crate::jobs::{JobRegistry, JobState};
+use crate::jobs::{JobRegistry, JobState, ReformatJob};
 use crate::paths::resolve_projects;
 
 /// Containers a reformat reads.
@@ -91,14 +96,6 @@ fn is_fresh(source: &Path, target: &Path) -> bool {
     }
 }
 
-/// Where ffmpeg writes before the version is complete, so a failed or
-/// interrupted pass never leaves a truncated `<stem>.<preset>.mp4` that
-/// would later look fresh.
-fn partial_path(target: &Path) -> PathBuf {
-    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    target.with_file_name(format!(".{name}.partial.mp4"))
-}
-
 /// One lock per target, so two requests for the same version share one
 /// pass (the second finds it fresh).
 fn target_lock(target: &Path) -> Arc<tokio::sync::Mutex<()>> {
@@ -108,12 +105,15 @@ fn target_lock(target: &Path) -> Arc<tokio::sync::Mutex<()>> {
     map.entry(target.to_path_buf()).or_default().clone()
 }
 
-fn utf8(p: &Path) -> Result<Utf8PathBuf, String> {
-    Utf8PathBuf::from_path_buf(p.to_path_buf()).map_err(|p| format!("non-UTF-8 path: {}", p.display()))
+fn utf8(p: &Path) -> anyhow::Result<Utf8PathBuf> {
+    Utf8PathBuf::from_path_buf(p.to_path_buf()).map_err(|p| anyhow::anyhow!("non-UTF-8 path: {}", p.display()))
 }
 
-/// Make (or reuse) the version. Blocking: probes and runs ffmpeg.
-fn run_blocking(t: &ReformatTarget, on_progress: &mut dyn FnMut(f32)) -> Result<serde_json::Value, String> {
+/// Make (or reuse) the version. Blocking: probes and runs ffmpeg. The pass
+/// writes under a staging name and commits at the end
+/// (`reformat_video`), and stops with `vibecut::cancel::Cancelled` when the
+/// cancel token installed on this thread is cancelled.
+fn run_blocking(t: &ReformatTarget, on_progress: &mut dyn FnMut(f32)) -> anyhow::Result<serde_json::Value> {
     let source = utf8(&t.source)?;
     let target = utf8(&t.target)?;
     let opts = ReformatOptions {
@@ -123,26 +123,17 @@ fn run_blocking(t: &ReformatTarget, on_progress: &mut dyn FnMut(f32)) -> Result<
         // whole and inside its safe area.
         card_windows: manifest_card_windows(&t.source),
     };
-    let src = vibecut::output_format::probe_source(&source).map_err(|e| format!("{e:#}"))?;
+    vibecut::cancel::check()?;
+    let src = vibecut::output_format::probe_source(&source)?;
     let plan = vibecut::output_format::plan_reformat(&src, &opts);
     let (cached, encoder) = if t.source == t.target || is_fresh(&t.source, &t.target) {
         on_progress(1.0);
         (true, None)
     } else {
-        let tmp = utf8(&partial_path(&t.target))?;
-        let outcome = vibecut::output_format::reformat_video(&source, &tmp, &opts, on_progress);
-        match outcome {
-            Ok(o) => {
-                std::fs::rename(&tmp, &target).map_err(|e| format!("moving {tmp} to {target}: {e}"))?;
-                (false, Some(o.encoder))
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(format!("{e:#}"));
-            }
-        }
+        let o = vibecut::output_format::reformat_video(&source, &target, &opts, on_progress)?;
+        (false, Some(o.encoder))
     };
-    let made = vibecut::output_format::probe_source(Utf8Path::new(&target)).map_err(|e| format!("{e:#}"))?;
+    let made = vibecut::output_format::probe_source(Utf8Path::new(&target))?;
     Ok(serde_json::json!({
         "ok": true,
         "source_path": t.source.to_string_lossy(),
@@ -172,7 +163,7 @@ pub async fn reformat_sync(
     tokio::task::spawn_blocking(move || run_blocking(&t, &mut |_| {}))
         .await
         .map_err(|e| OpsError::internal(format!("reformat task panicked: {e}")))?
-        .map_err(OpsError::internal)
+        .map_err(|e| OpsError::internal(format!("{e:#}")))
 }
 
 /// Progress report for a reformat job: one stage, the whole bar.
@@ -187,59 +178,114 @@ fn progress_report(t: &ReformatTarget, fraction: f32) -> Progress {
     }
 }
 
-/// Submit a reformat job; returns its id and the checked request (the
-/// version's path is known up front). Poll like a render.
+/// A submitted reformat job.
+#[derive(Debug, Clone)]
+pub struct SubmittedReformat {
+    pub job_id: String,
+    /// The checked request; the version's path is known up front.
+    pub target: ReformatTarget,
+    /// The same version was already being made: this is that job.
+    pub reused: bool,
+}
+
+/// The registry's record of a request: what the jobs list shows, and the
+/// key a second request for the same version is matched on.
+fn job_record(t: &ReformatTarget) -> ReformatJob {
+    ReformatJob {
+        source_path: t.source.to_string_lossy().into_owned(),
+        preset: t.preset.name().to_string(),
+        fit: t.fit.map(|f| f.name().to_string()),
+        output_path: t.target.to_string_lossy().into_owned(),
+    }
+}
+
+/// How a reformat job ended.
+fn final_state(
+    outcome: Result<anyhow::Result<serde_json::Value>, tokio::task::JoinError>,
+    token: &vibecut::cancel::CancelToken,
+    started_at: String,
+    finished_at: String,
+    elapsed_ms: u64,
+) -> JobState {
+    match outcome {
+        Ok(Ok(result_json)) => JobState::Done { started_at, finished_at, elapsed_ms, result_json },
+        // Killing ffmpeg can surface as some other failure first; a job
+        // whose token was cancelled counts as stopped either way.
+        Ok(Err(e)) if token.is_cancelled() || vibecut::cancel::is_cancelled(&e) => {
+            JobState::Cancelled { started_at: Some(started_at), finished_at, elapsed_ms }
+        }
+        Ok(Err(e)) => JobState::Failed { started_at, finished_at, elapsed_ms, error: format!("{e:#}") },
+        Err(e) => JobState::Failed {
+            started_at,
+            finished_at,
+            elapsed_ms,
+            error: format!("reformat task panicked: {e}"),
+        },
+    }
+}
+
+/// Submit a reformat job (kind `reformat` in the jobs list). Poll like a
+/// render; stop it with the jobs cancel route. A request for a version
+/// that a queued or running job is already making returns that job
+/// (`reused`) instead of starting a second ffmpeg.
 pub async fn submit_async(
     jobs: &JobRegistry,
     output_path: &str,
     preset: &str,
     fit: Option<&str>,
-) -> Result<(String, ReformatTarget), OpsError> {
+) -> Result<SubmittedReformat, OpsError> {
     let t = prepare(output_path, preset, fit)?;
-    let job_id = jobs.submit().await;
+    let (job_id, reused) = jobs.submit_reformat(job_record(&t)).await;
+    if reused {
+        return Ok(SubmittedReformat { job_id, target: t, reused });
+    }
+    let cancel = jobs
+        .cancel_token(&job_id)
+        .await
+        .ok_or_else(|| OpsError::internal("job vanished right after submit"))?;
     let jobs_handle = jobs.clone();
     let id = job_id.clone();
     let task_target = t.clone();
     tokio::spawn(async move {
         let t = task_target;
+        // Stays queued while a request for the same file (a reformat the
+        // registry didn't join, e.g. one being stopped) finishes.
         let lock = target_lock(&t.target);
         let _guard = lock.lock().await;
         let started_at = chrono::Utc::now().to_rfc3339();
-        jobs_handle
-            .set(
-                &id,
-                JobState::Running { started_at: started_at.clone(), progress: Some(progress_report(&t, 0.0)) },
-            )
-            .await;
+        // Stopped while it waited: it never starts.
+        if !jobs_handle.begin(&id, &started_at).await {
+            return;
+        }
         let t0 = std::time::Instant::now();
         let progress_jobs = jobs_handle.clone();
         let progress_id = id.clone();
+        let token = cancel.clone();
         let inner = tokio::task::spawn_blocking(move || {
-            let mut last = -1.0_f32;
-            run_blocking(&t, &mut |f| {
-                // ffmpeg reports about twice a second; skip repeats.
-                if f - last >= 0.01 || f >= 1.0 {
-                    last = f;
-                    progress_jobs.set_progress_blocking(&progress_id, progress_report(&t, f));
-                }
-            })
+            progress_jobs.set_progress_blocking(&progress_id, progress_report(&t, 0.0));
+            // The job's token rides along, so a Stop kills the ffmpeg pass.
+            vibecut::progress::with_sink_and_cancel(
+                |_| {},
+                token,
+                || {
+                    let mut last = -1.0_f32;
+                    run_blocking(&t, &mut |f| {
+                        // ffmpeg reports about twice a second; skip repeats.
+                        if f - last >= 0.01 || f >= 1.0 {
+                            last = f;
+                            progress_jobs.set_progress_blocking(&progress_id, progress_report(&t, f));
+                        }
+                    })
+                },
+            )
         })
         .await;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
         let finished_at = chrono::Utc::now().to_rfc3339();
-        let state = match inner {
-            Ok(Ok(result_json)) => JobState::Done { started_at, finished_at, elapsed_ms, result_json },
-            Ok(Err(error)) => JobState::Failed { started_at, finished_at, elapsed_ms, error },
-            Err(e) => JobState::Failed {
-                started_at,
-                finished_at,
-                elapsed_ms,
-                error: format!("reformat task panicked: {e}"),
-            },
-        };
+        let state = final_state(inner, &cancel, started_at, finished_at, elapsed_ms);
         jobs_handle.set(&id, state).await;
     });
-    Ok((job_id, t))
+    Ok(SubmittedReformat { job_id, target: t, reused })
 }
 
 #[cfg(test)]
@@ -313,7 +359,95 @@ mod tests {
         std::fs::write(&dst, b"").unwrap();
         std::fs::File::options().write(true).open(&dst).unwrap().set_modified(later).unwrap();
         assert!(!is_fresh(&src, &dst));
-        assert_eq!(partial_path(&dst), d.join(".reel.reels.mp4.partial.mp4"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// A 16:9 "render" `secs` long.
+    fn render_clip(d: &Path, secs: u32) -> PathBuf {
+        let clip = d.join("coast.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-nostdin", "-f", "lavfi", "-i"])
+            .arg(format!("testsrc2=size=640x360:rate=30:duration={secs}"))
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!("sine=frequency=330:duration={secs}"))
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest"])
+            .arg(&clip)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "generating {}", clip.display());
+        clip
+    }
+
+    async fn wait_finished(jobs: &JobRegistry, id: &str) -> JobState {
+        for _ in 0..600 {
+            let st = jobs.get(id).await.unwrap();
+            if st.is_finished() {
+                return st;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("job {id} never finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reformat_jobs_are_listed_joined_and_stoppable() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        }
+        let d = tmp("job");
+        let clip = render_clip(&d, 20);
+        let target = d.join("coast.reels.mp4");
+        std::fs::write(&target, b"the last good version").unwrap();
+        // Make the old version look stale, so the job re-makes it.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&clip).unwrap().set_modified(later).unwrap();
+        let jobs = JobRegistry::new();
+        let src = clip.to_string_lossy().into_owned();
+        let a = submit_async(&jobs, &src, "reels", None).await.unwrap();
+        assert!(!a.reused);
+        assert_eq!(a.target.target, target);
+        // A second click while it runs joins the same job.
+        let b = submit_async(&jobs, &src, "reels", None).await.unwrap();
+        assert!(b.reused && b.job_id == a.job_id);
+        let listed = jobs.info(&a.job_id).await.unwrap();
+        assert_eq!(listed.kind, crate::jobs::JobKind::Reformat);
+        let rec = listed.reformat.unwrap();
+        assert_eq!((rec.preset.as_str(), rec.output_path.as_str()), ("reels", target.to_str().unwrap()));
+        // Wait until ffmpeg is under way, then stop it.
+        for _ in 0..400 {
+            if let Some(JobState::Running { progress: Some(p), .. }) = jobs.get(&a.job_id).await {
+                if p.overall > 0.0 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        jobs.cancel(&a.job_id).await.unwrap();
+        let st = wait_finished(&jobs, &a.job_id).await;
+        assert!(matches!(st, JobState::Cancelled { started_at: Some(_), .. }), "{st:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"the last good version");
+        assert!(!vibecut::staging::staging_path(Utf8Path::from_path(&target).unwrap()).exists());
+        // A finished reformat job carries the version it made.
+        let c = submit_async(&jobs, &src, "whatsapp", None).await.unwrap();
+        assert!(!c.reused);
+        let st = wait_finished(&jobs, &c.job_id).await;
+        match st {
+            JobState::Done { result_json, .. } => {
+                assert_eq!((result_json["width"].as_u64(), result_json["height"].as_u64()), (Some(720), Some(1280)));
+                assert_eq!(result_json["cached"], false);
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }

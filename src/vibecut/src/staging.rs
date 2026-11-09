@@ -163,6 +163,15 @@ mod stopped_render_tests {
     }
 
     fn project(name: &str, n_outputs: usize, folder: Option<&str>) -> Project {
+        let plain = vec!["resolution = \"320x180\""; n_outputs];
+        project_with(name, &plain, folder)
+    }
+
+    /// [`project`] with one `[[outputs]]` entry per item of
+    /// `keys_per_output`, each adding its own keys (a resolution, a
+    /// platform preset, a fit).
+    fn project_with(name: &str, keys_per_output: &[&str], folder: Option<&str>) -> Project {
+        let n_outputs = keys_per_output.len();
         let dir = tmp(name);
         let footage = dir.join("footage");
         std::fs::create_dir_all(&footage).unwrap();
@@ -198,9 +207,9 @@ mod stopped_render_tests {
             work = fwd(&dir.join("work")),
             folder = folder.map(str::to_string).unwrap_or_else(|| fwd(&footage)),
         );
-        for o in &outputs {
+        for (o, keys) in outputs.iter().zip(keys_per_output) {
             toml.push_str(&format!(
-                "\n[[outputs]]\npath = \"{}\"\nresolution = \"320x180\"\nencoder = \"libx264\"\ncrf = 30\n",
+                "\n[[outputs]]\npath = \"{}\"\n{keys}\nencoder = \"libx264\"\ncrf = 30\n",
                 fwd(o)
             ));
         }
@@ -285,6 +294,29 @@ mod stopped_render_tests {
         // Two outputs: each is transcoded from the body, the path that
         // writes through `staged.path(i)`.
         let p = project("multi", 2, None);
+        stop_after_writing(&p);
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    #[test]
+    fn a_stopped_render_keeps_its_reframed_platform_outputs() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        }
+        // A lone 9:16 platform output isn't the body's shape, so it gets
+        // its own reframe pass into `staged.path(0)` instead of the mux
+        // writing there; next to a master it is output 1.
+        let reel = "preset = \"reels\"\nresolution = \"180x320\"\nfit = \"blur\"";
+        let p = project_with("reels_only", &[reel], None);
+        stop_after_writing(&p);
+        render(&p, CancelToken::new(), |_| {}).expect("an unstopped render succeeds");
+        let made = crate::output_format::probe_source(&p.outputs[0]).unwrap();
+        assert_eq!((made.width, made.height), (180, 320), "the reel wasn't reframed");
+        assert!(partials_left(&p).is_empty());
+        let _ = std::fs::remove_dir_all(&p.dir);
+
+        let p = project_with("master_and_reels", &["resolution = \"320x180\"", reel], None);
         stop_after_writing(&p);
         let _ = std::fs::remove_dir_all(&p.dir);
     }

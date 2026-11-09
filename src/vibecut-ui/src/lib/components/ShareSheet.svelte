@@ -100,6 +100,8 @@
 		if (existing && existing.state !== 'failed') return;
 		versions[key] = { state: 'working', progress: 0 };
 		try {
+			// A version already being made (another tab, a reopened sheet)
+			// comes back as that same job (`reused`): this just follows it.
 			const job = await reformat(source, preset);
 			for (;;) {
 				const st = await reformatStatus(job.job_id);
@@ -109,6 +111,11 @@
 				}
 				if (st.state === 'failed') {
 					versions[key] = { state: 'failed', error: st.error };
+					return;
+				}
+				if (st.state === 'cancelled') {
+					// Stopped from the Renders list; the last good version stays.
+					versions[key] = { state: 'failed', error: 'it was stopped' };
 					return;
 				}
 				if (st.state === 'running' && st.progress) {

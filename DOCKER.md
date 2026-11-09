@@ -226,7 +226,7 @@ not the container's baked-in static build.
 | `render(config_path)` | Run the vibecut pipeline in-process. Blocking; takes 1–10 min. |
 | `render_async(config_path)` | Same as `render` but returns a `job_id` immediately. Pair with `render_status`. |
 | `render_status(job_id)` | Poll a background render job: queued / running / done / failed / cancelled. |
-| `cancel_render(job_id)` | Stop a background render: a queued job never starts; a running one has its ffmpeg processes killed and reports `cancelled` within about a second. The previous output is left untouched. (Web: `POST /api/jobs/{job_id}/cancel` with a JSON body, `{}`; `GET /api/jobs` lists recent jobs.) |
+| `cancel_render(job_id)` | Stop a background render: a queued job never starts; a running one has its ffmpeg processes killed and reports `cancelled` within about a second. The previous output is left untouched. (Web: `POST /api/jobs/{job_id}/cancel` with a JSON body, `{}`; `GET /api/jobs` lists recent jobs, each with its `kind`: `render`, or `reformat` for a Share-sheet platform version, which stops the same way.) |
 | `apply_feedback(config_path, action)` | Mutate a TOML in response to user feedback (six action variants: scale_duration, calmer, punchier, different_music, reroll, drop_segment). |
 | `inspect_output(output_path)` | Curated 12-frame overview of a rendered mp4 as inline JPEG content. |
 | `inspect_at(output_path, timestamps)` | Frames at specific output-time positions. |

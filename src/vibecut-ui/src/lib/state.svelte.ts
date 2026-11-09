@@ -1028,10 +1028,11 @@ class AppState {
 		await this.loadJobs();
 	}
 
-	/** Show a finished job of this project in the Studio. False when it
-	 *  belongs to another project (the list links its file instead). */
+	/** Show a finished render of this project in the Studio. False when it
+	 *  belongs to another project, or is a platform version (the list links
+	 *  its file instead). */
 	async openJob(j: api.JobListEntry): Promise<boolean> {
-		if (j.state !== 'done' || this.rendering) return false;
+		if (j.kind !== 'render' || j.state !== 'done' || this.rendering) return false;
 		const path = j.version_path ?? j.output_path;
 		if (!path) return false;
 		let i = this.renderHistory.findIndex((v) => v.output_path === path);

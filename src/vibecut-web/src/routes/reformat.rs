@@ -3,10 +3,12 @@
 //! fast ffmpeg pass, written next to it as `<stem>.<preset>.mp4` and
 //! served by `GET /api/output` like any render.
 //!
-//! Default: a job. The response carries `job_id` and the version's
-//! `output_path` up front; poll `GET /api/render/{job_id}` (or the WS
-//! feed) for progress and the result. `"wait": true` blocks instead and
-//! returns the result directly.
+//! Default: a job (kind `reformat` in `GET /api/jobs`). The response
+//! carries `job_id` and the version's `output_path` up front; poll
+//! `GET /api/render/{job_id}` (or the WS feed) for progress and the
+//! result, stop it with `POST /api/jobs/{job_id}/cancel`. Asking again for
+//! a version a job is still making returns that job (`"reused": true`).
+//! `"wait": true` blocks instead and returns the result directly.
 
 use axum::extract::State;
 use axum::Json;
@@ -46,14 +48,21 @@ pub async fn reformat(
             vibecut_ops::reformat::reformat_sync(&body.output_path, &body.preset, body.fit.as_deref()).await?;
         return Ok(Json(result));
     }
-    let (job_id, target) =
+    let job =
         vibecut_ops::reformat::submit_async(&state.jobs, &body.output_path, &body.preset, body.fit.as_deref())
             .await?;
+    // A joined job may be running already; report where it is.
+    let job_state = match state.jobs.get(&job.job_id).await {
+        Some(st) => vibecut_ops::render::job_state_json(&job.job_id, st)["state"].clone(),
+        None => "queued".into(),
+    };
     Ok(Json(serde_json::json!({
-        "job_id": job_id,
-        "state": "queued",
-        "preset": target.preset.name(),
-        "output_path": target.target.to_string_lossy(),
+        "job_id": job.job_id,
+        "kind": "reformat",
+        "state": job_state,
+        "reused": job.reused,
+        "preset": job.target.preset.name(),
+        "output_path": job.target.target.to_string_lossy(),
     })))
 }
 

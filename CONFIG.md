@@ -238,7 +238,13 @@ Share sheet (`POST /api/reformat`) and the MCP `reformat` tool do the same.
 Given a version instead (`out/edit.square.mp4`), it works from the render
 next to it (`out/edit.mp4`), so a vertical version of the square one is
 still one reframe of the master; if the render is gone, the result keeps
-the version's whole name (`out/edit.square.reels.mp4`).
+the version's whole name (`out/edit.square.reels.mp4`). Like the render's
+outputs, the version is written as `out/edit.reels.partial.mp4` and renamed
+into place only when the pass has finished. In the web UI each version is
+a job of kind `reformat` in the same queue as renders (`GET /api/jobs`,
+the Renders list), stopped the same way (`POST /api/jobs/{id}/cancel`,
+which keeps the last good version); asking again for a version that is
+still being made joins that job instead of starting a second pass.
 
 ---
 
