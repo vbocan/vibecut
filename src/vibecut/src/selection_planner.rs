@@ -1001,6 +1001,12 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub timeline: Option<crate::output_timeline::OutputTimeline>,
+    /// The song's bars, phrases and sections as they play under the video,
+    /// and what music-led pacing made of them (see `pacing`). Absent
+    /// without a soundtrack, or when its beat grid couldn't be fitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub music: Option<crate::pacing::MusicRecord>,
     pub generator: String,
 }
 

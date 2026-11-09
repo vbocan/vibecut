@@ -26,6 +26,8 @@ pub mod gopro_metadata;
 pub mod media_probe;
 pub mod ml_engine;
 pub mod multi_angle;
+pub mod music_structure;
+pub mod pacing;
 pub mod output_timeline;
 pub mod output_format;
 pub mod progress;

@@ -260,7 +260,10 @@ file = "music/track.wav"
 # files = ["intro.mp3", "main.mp3", "outro.mp3"]
 
 beat_align            = true             # cut on the beat: whole-beat clips, every cut on a beat (default: true)
-energy_drives_pacing  = true             # let soundtrack energy modulate pacing (default: true)
+energy_drives_pacing  = true             # clip lengths follow the song: short in loud parts, long in quiet ones (default: true)
+pacing_strength       = 0.6              # how far the song bends clip lengths, 0..1 (default: 0.6)
+musical_ending        = true             # end on a phrase / the song's final hit, fade to a bar line (default: true)
+hero_on_drop          = true             # best moment starts on the downbeat of the song's drop (default: true)
 fade_out              = "1500ms"         # tail fade-out at end of output (default: 1500ms)
 
 # --- Ducking: dip the music to expose source audio ---
@@ -289,7 +292,10 @@ clip it lands in is cut short so the burst starts right on it. Every burst
 cut is a different moment. When the footage runs short of them the burst
 gets fewer cuts — two beats long when one-beat cuts can't reach
 `beat_burst_min_beats` — and when even that falls short it is skipped
-rather than repeat a shot.
+rather than repeat a shot. When the cut is paced to the music (below) the
+burst instead fills a loud section of the song — from its first beat, never
+past its end — leaves the best moment and the final clip alone, and ends on
+one of the plan's cuts, so everything after it stays where the plan put it.
 
 ### Choosing the song
 
@@ -363,6 +369,87 @@ once through its natural intro, then its loudest section repeats, each copy
 crossfaded into the next over ~2 s. That crossfade is rounded to a whole
 number of beats, so the beats of both copies coincide through it (no
 flamming kicks) and the grid runs on unbroken.
+
+### Music-led pacing: bars, phrases and a real ending
+
+With `beat_align = true` Vibecut reads the song's form from the beat grid
+and edits to it. `vibecut beats <file>` prints what it found:
+
+```text
+bars:        first downbeat 0.625s (beat 0), 2.500s per bar, downbeat confidence 0.48
+phrases:     4-bar, at 0.62 10.62 20.62 30.62 40.62 …
+section  1:    0.62s –    5.62s  high  intensity 0.76 (-19.9 dB)
+section  2:    5.62s –   10.62s  quiet intensity 0.27 (-22.9 dB)
+section  3:   10.62s –   15.62s  high  intensity 0.76 (-19.9 dB)  ← drop
+ending:      final hit 79.375s, sound ends 79.99s
+```
+
+- **Bars.** 4/4 is assumed. The bar's "1" is the beat phase whose beats
+  carry the most accent — onset strength, low-band (kick / bass) energy and
+  the step up into the beat; the confidence (0–1) says how clearly it
+  stands out. Without clear evidence the beat the music starts on is a "1".
+- **Phrases** are 4-bar groups (every other one an 8-bar boundary), placed
+  where the level steps up most consistently.
+- **Sections** start where the level over the next two bars departs from
+  the previous two, snapped to a phrase start; each is quiet / mid / high
+  against the song's own range. **The drop** is the high section with the
+  most level, rise and length (of equally big ones, the first).
+- **The final hit** is the last strong onset before the song's tail fades
+  out (the sound ends where it drops 40 dB below the music).
+
+What the edit does with it, each part behind its own key:
+
+- **`energy_drives_pacing`** — clip lengths follow the song where it plays
+  under them: loud, busy music cuts faster, quiet music holds longer, always
+  within `[selection]` `min_clip`–`max_clip` and what each clip's footage
+  holds. `pacing_strength` sets the swing: at 1 the loudest music cuts
+  ~2.8× faster than average and the quietest holds ~2.8× longer; 0 gives
+  even lengths. A loud song also gets more, shorter clips than a quiet one.
+  Every cut is still on a beat; a cut to a new source or scene prefers a
+  bar line and above all a phrase start, and long holds avoid running
+  through a phrase start. The plan is made for the whole video at once, so
+  the last quiet stretch gets its hold too. With a narrow clip range the
+  swing is narrow too (1.5–4 s is 3–6 beats at 96 BPM): widen
+  `min_clip` / `max_clip` for one-beat cuts and multi-bar holds.
+- **`hero_on_drop`** — the highest-scoring moment starts on the downbeat
+  that opens the song's drop as it plays in the video, and with
+  `order = "energy_arc"` the arc peaks there (it is arranged around it).
+  When the drop doesn't play in the video, or the clips can't reach it, the
+  moment takes the biggest section that does — of equally big ones, the
+  one nearest 45 % of the video; a song without sections gets it on a
+  phrase start. Other orders never reorder: the best moment keeps its
+  place and gets the biggest section its slot can reach.
+- **`musical_ending`** — when the song's own ending fits the target length
+  (up to 12 % or two bars short, 5 % or a bar long), the song plays once
+  through, un-looped, the last cut lands on its final hit and the last
+  clip (or the outro card) holds through the ring-out. Otherwise the edit
+  ends on the phrase start nearest the target — up to a bar or 8 % early,
+  half that late — or else on the nearest bar line, and the music's
+  `fade_out`, rounded to whole beats, completes exactly there: at the end
+  of a bar. An outro card (card mode) starts on that cut and runs a whole
+  number of bars (the nearest to its own length), so the fade completes on
+  a bar line after it.
+
+All three are on by default; set any to `false` for the old behaviour of
+that part (the song's form is still analysed and recorded). The run log
+shows the plan:
+
+```text
+bars: 2.500s, 4-bar phrases, downbeat confidence 0.48; 16 sections (high → quiet → …); drop at 10.62s
+music-led plan: 11 clips, 3–6 beats each (strength 0.60); last cut on the phrase start at 30.62s, video ends 30.62s
+music-led pacing: 11 clips, beats@song intensity: 3@0.75 5@0.27 4@0.33 4@0.79 3@0.76 5@0.28 …
+  best moment (clip 4, score 0.325) starts on the drop at 10.62s
+```
+
+and the manifest records it as `music`: the bar lines (`downbeats`) and
+`phrases` in output seconds, the `sections` as they play (with `level`,
+`intensity` and the `drop`), where the best moment went (`hero`, with `on`
+= `drop` / `section` / `phrase`), how it ended (`ending`: `kind` =
+`song_end` / `phrase_end` / `bar_end` / `beat`, the last cut, the fade and
+the final hit) and each clip's length in beats against the song's
+intensity under it (`pacing.clips`). The Studio's timeline draws bar lines
+heavier than beats, phrase starts heavier still, and the sections as
+bands — loud parts lit, the drop labelled.
 
 ### Beat-sync report
 

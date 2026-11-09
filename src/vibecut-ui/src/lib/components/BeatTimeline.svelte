@@ -5,6 +5,7 @@
 	import { clock } from '$lib/vibes';
 	import { radiogroup } from '$lib/radiogroup';
 	import { keepFocus } from '$lib/focus';
+	import { describeSongForm, gridLines, heroSpotText, sectionFill } from '$lib/songform';
 
 	let {
 		currentTime = 0,
@@ -33,8 +34,15 @@
 			? (timeline.outro?.cut_secs ?? null)
 			: (cuts.find((c) => c.kind === 'body_to_outro')?.output_secs ?? null)
 	);
-	// The single strongest moment (not the burst) gets a pin.
+	// The song's bars, phrases and sections, when the render paced to them.
+	const music = $derived(s.manifest?.music ?? null);
+	const dropSection = $derived(music?.sections.find((x) => x.drop) ?? null);
+	const songForm = $derived(describeSongForm(music));
+	// The single strongest moment (not the burst) gets a pin: the one the
+	// music plan placed, else the highest score.
 	const hero = $derived.by(() => {
+		const placed = music?.hero ? layout.find((g) => g.index === music.hero?.segment) : undefined;
+		if (placed) return placed;
 		let best: (typeof layout)[number] | null = null;
 		for (const g of layout) {
 			if (g.segment.source_id.startsWith('burst:') || g.segment.score === null) continue;
@@ -124,14 +132,28 @@
 		g.setTransform(dpr, 0, 0, dpr, 0, 0);
 		g.clearRect(0, 0, width, h);
 
-		// Beats: thin ticks, every 4th a bar line.
-		const beats = s.beatTimes;
-		beats.forEach((t, i) => {
-			const x = (t / duration) * width;
-			const bar = i % 4 === 0;
-			g.fillStyle = bar ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)';
-			g.fillRect(Math.round(x), bar ? 0 : 10, 1, bar ? h : h - 20);
-		});
+		// Sections behind everything: loud parts lit, quiet ones cool.
+		for (const sec of duration > 0 ? (music?.sections ?? []) : []) {
+			const x0 = (sec.start_secs / duration) * width;
+			const x1 = (Math.min(sec.end_secs, duration) / duration) * width;
+			g.fillStyle = sectionFill(sec);
+			g.fillRect(Math.round(x0), 0, Math.max(1, Math.round(x1) - Math.round(x0) - 1), h);
+		}
+
+		// Beats as thin ticks, bar lines full height, phrase starts heavier.
+		for (const line of duration > 0 ? gridLines(s.beatTimes, music) : []) {
+			const x = Math.round((line.t / duration) * width);
+			if (line.kind === 'phrase') {
+				g.fillStyle = 'rgba(255,255,255,0.5)';
+				g.fillRect(x, 0, 2, h);
+			} else if (line.kind === 'bar') {
+				g.fillStyle = 'rgba(255,255,255,0.24)';
+				g.fillRect(x, 0, 1, h);
+			} else {
+				g.fillStyle = 'rgba(255,255,255,0.08)';
+				g.fillRect(x, 10, 1, h - 20);
+			}
+		}
 
 		// Waveform, mirrored, with the brand gradient.
 		if (peaks) {
@@ -191,6 +213,10 @@
 		<span class="eyebrow">Timeline</span>
 		<span class="legend">
 			<span><i class="k beat"></i>beats</span>
+			{#if music}
+				<span><i class="k bar"></i>bars · phrases</span>
+				<span><i class="k loud"></i>loud part</span>
+			{/if}
 			<span><i class="k on-beat"></i>cut on the beat</span>
 			{#if !s.exactTimeline}<span class="approx">approximate positions</span>{/if}
 		</span>
@@ -214,6 +240,7 @@
 			aria-valuemax={Math.round(duration)}
 			aria-valuenow={Math.round(currentTime)}
 			aria-valuetext={clock(currentTime)}
+			aria-describedby={songForm ? 'song-form' : undefined}
 			onclick={seekFromEvent}
 			onkeydown={(e) => {
 				const step = e.shiftKey ? 5 : 1;
@@ -226,6 +253,10 @@
 			}}
 		>
 			<canvas bind:this={canvas} style="width: 100%; height: 64px" aria-hidden="true"></canvas>
+			{#if songForm}<span id="song-form" class="sr-only">{songForm}</span>{/if}
+			{#if dropSection && dropSection.start_secs < duration}
+				<span class="drop-tag" style="left: {pctOf(dropSection.start_secs)}%" aria-hidden="true">drop</span>
+			{/if}
 			<!-- The "locked sweep": when a new version loads, a scan line runs
 			     left to right and each cut snaps into place as it passes. -->
 			{#key s.outputPath}
@@ -258,7 +289,7 @@
 			{/if}
 			{#if hero}
 				<span class="hero-pin" style="left: {pctOf((hero.startSecs + hero.endSecs) / 2)}%" aria-hidden="true"
-					>★ Biggest moment</span
+					>★ Biggest moment{music?.hero && music.hero.on !== 'phrase' ? ` ${heroSpotText(music.hero.on)}` : ''}</span
 				>
 			{/if}
 			{#each layout as g (g.index)}
@@ -327,6 +358,18 @@
 		width: 2px;
 		height: 10px;
 		background: rgba(255, 255, 255, 0.45);
+	}
+
+	.k.bar {
+		width: 2px;
+		height: 12px;
+		background: rgba(255, 255, 255, 0.8);
+	}
+
+	.k.loud {
+		width: 12px;
+		border-radius: 2px;
+		background: rgba(255, 61, 129, 0.45);
 	}
 
 	.k.on-beat {
@@ -502,6 +545,23 @@
 		.legend {
 			visibility: hidden;
 		}
+	}
+
+	/* Top left of the drop's band, clear of the cut markers above and the
+	   moment pin below. */
+	.drop-tag {
+		position: absolute;
+		top: 6px;
+		margin-left: 6px;
+		padding: 0 5px;
+		border-radius: 4px;
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: #160a12;
+		background: var(--magenta);
+		pointer-events: none;
 	}
 
 	.hero-pin {

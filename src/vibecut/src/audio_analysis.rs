@@ -133,6 +133,10 @@ pub struct AnalyzedAudio {
     /// `None` when no tempo was found or the grid fit fell back to plain
     /// fixed-period placement.
     pub beat_grid: Option<BeatGridFit>,
+    /// Bars, phrases, sections, the drop and the final hit, read from the
+    /// beat grid (see `music_structure`). `None` with too few beats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structure: Option<crate::music_structure::MusicStructure>,
 }
 
 /// Diagnostics for the fitted beat grid (see the module docs, step 4).
@@ -378,6 +382,7 @@ pub fn analyze_pcm(pcm: &[f32], sample_rate: u32) -> AnalyzedAudio {
             energy_curve: Vec::new(),
             energy_rate: ENERGY_TARGET_RATE_HZ,
             beat_grid: None,
+            structure: None,
         };
     }
 
@@ -448,6 +453,15 @@ pub fn analyze_pcm(pcm: &[f32], sample_rate: u32) -> AnalyzedAudio {
         }
     }
 
+    // (6) Bars, phrases, sections and the final hit, on the beat grid.
+    let structure = if beat_grid.is_some() {
+        let low = crate::music_structure::low_band_frame_energy(pcm, sample_rate, FRAME_SIZE, HOP_SIZE, 150.0);
+        let feats = crate::music_structure::beat_features(&beats, &onset, &energy, &low, onset_rate);
+        crate::music_structure::analyze(&beats, &feats, &onset, &energy, onset_rate)
+    } else {
+        None
+    };
+
     AnalyzedAudio {
         duration_secs,
         sample_rate,
@@ -457,6 +471,7 @@ pub fn analyze_pcm(pcm: &[f32], sample_rate: u32) -> AnalyzedAudio {
         energy_curve,
         energy_rate: ENERGY_TARGET_RATE_HZ,
         beat_grid,
+        structure,
     }
 }
 

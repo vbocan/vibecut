@@ -362,6 +362,35 @@ fn beats_cmd(file: &Utf8Path, max_print: usize) -> Result<()> {
         energy_peak,
         energy_mean
     );
+    if let Some(m) = &analyzed.structure {
+        let at = |k: usize| analyzed.beats.get(k).copied().unwrap_or(f32::NAN);
+        let bar = 60.0 / analyzed.tempo_bpm.max(1.0) * m.beats_per_bar as f32;
+        println!(
+            "  bars:        first downbeat {:.3}s (beat {}), {:.3}s per bar, downbeat confidence {:.2}",
+            at(m.downbeat_phase),
+            m.downbeat_phase,
+            bar,
+            m.downbeat_confidence
+        );
+        let phrases: Vec<String> = m.phrases.iter().map(|&k| format!("{:.2}", at(k))).collect();
+        println!("  phrases:     {}-bar, at {}", m.phrase_bars, phrases.join(" "));
+        for (i, s) in m.sections.iter().enumerate() {
+            println!(
+                "  section {:>2}: {:>7.2}s – {:>7.2}s  {:<5} intensity {:.2} ({:+.1} dB){}",
+                i + 1,
+                s.start_secs,
+                s.end_secs,
+                format!("{:?}", s.level).to_lowercase(),
+                s.intensity,
+                s.loudness_db,
+                if m.drop == Some(i) { "  ← drop" } else { "" }
+            );
+        }
+        match m.final_hit_secs {
+            Some(h) => println!("  ending:      final hit {h:.3}s, sound ends {:.2}s", m.sound_end_secs),
+            None => println!("  ending:      no clear final hit; sound ends {:.2}s", m.sound_end_secs),
+        }
+    }
     println!("  analyzed in {:.2}s", elapsed.as_secs_f32());
     Ok(())
 }
