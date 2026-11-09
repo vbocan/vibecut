@@ -86,7 +86,9 @@ library always give the same song; a new seed may give another.
   `/projects/music`) or a `VIBECUT_MUSIC_DIRS` folder, after resolving `..`
   and symlinks; a relative path is read from `/projects`. Anything else is
   refused with 400 whether or not it exists; a missing file inside those
-  folders is a 404.
+  folders is a 404. The `different_music` feedback action (`POST
+  /api/feedback`, the MCP `apply_feedback` tool, the Studio's "New song")
+  follows the same rule before it writes the song into the config.
 - `soundtrack = "none"` proposes without music (the clips keep their sound).
 - `GET /api/music/pick?vibe=…&target_duration=…&seed=…` returns the pick a
   proposal with those settings would make — the web UI shows it as

@@ -410,6 +410,12 @@ fn apply_punchier(cfg: &mut Config) -> Vec<ChangeNote> {
 }
 
 fn apply_different_music(cfg: &mut Config, new_path: &str) -> Result<Vec<ChangeNote>> {
+    // The same rule as the music routes and propose's `soundtrack`: an
+    // audio file in the music library or the projects folder (after
+    // resolving `..` and symlinks; a relative path is taken from the
+    // projects folder), never an arbitrary file on the server.
+    let checked = crate::music::check_soundtrack_file(new_path)?;
+    let new_path = checked.to_str().ok_or_else(|| anyhow!("non-UTF-8 soundtrack path"))?;
     let new_pathbuf = Utf8PathBuf::from(new_path);
     let mut notes = Vec::new();
 
@@ -758,8 +764,13 @@ pub async fn apply_feedback_to_file(
     let mut cfg = Config::load(&cfg_camino)
         .map_err(|e| OpsError::internal(format!("could not load config: {e:#}")))?;
 
-    let notes = apply(&mut cfg, action)
-        .map_err(|e| OpsError::invalid(format!("feedback action failed: {e:#}")))?;
+    // An action that refused its input with an `OpsError` (a soundtrack
+    // outside the library is invalid, a missing one not found) keeps that
+    // kind; anything else is an invalid action.
+    let notes = apply(&mut cfg, action).map_err(|e| match e.downcast::<OpsError>() {
+        Ok(ops) => ops,
+        Err(e) => OpsError::invalid(format!("feedback action failed: {e:#}")),
+    })?;
 
     // Re-serialise and validate before persisting — the caller gets a
     // clean error rather than discovering corruption only when
@@ -1053,12 +1064,34 @@ stabilize = false
         assert!((cfg.transition.speed_ramp_probability - 1.0).abs() < 1e-4);
     }
 
+    /// A music library for these tests (`music::use_roots`, as the web
+    /// crate's tests do), holding the songs the music tests pick.
+    fn test_library() -> &'static std::path::Path {
+        static LIB: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        LIB.get_or_init(|| {
+            let root = std::env::temp_dir().join(format!("vibecut_feedback_music_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let music = root.join("music");
+            std::fs::create_dir_all(&music).unwrap();
+            for song in ["new_track.mp3", "intro.wav", "x.mp3"] {
+                std::fs::write(music.join(song), b"not really audio").unwrap();
+            }
+            std::fs::write(root.join("secret.mp3"), b"outside the library").unwrap();
+            crate::music::use_roots(crate::music::LibraryRoots { own: music, extra: vec![], cache_dir: None });
+            root
+        })
+    }
+
+    fn library_song(name: &str) -> String {
+        test_library().join("music").join(name).to_string_lossy().into_owned()
+    }
+
     #[test]
     fn different_music_swaps_existing_soundtrack() {
         let mut cfg = base_config();
         // base_config()'s fixture has a [soundtrack] section.
         assert!(cfg.soundtrack.is_some());
-        let new_path = "/projects/music/new_track.mp3";
+        let new_path = &library_song("new_track.mp3");
         let notes = apply(
             &mut cfg,
             &FeedbackAction::DifferentMusic {
@@ -1078,7 +1111,7 @@ stabilize = false
     fn different_music_synthesises_when_no_soundtrack() {
         let mut cfg = base_config();
         cfg.soundtrack = None;
-        let new_path = "/projects/music/intro.wav";
+        let new_path = &library_song("intro.wav");
         apply(
             &mut cfg,
             &FeedbackAction::DifferentMusic {
@@ -1090,6 +1123,58 @@ stabilize = false
         assert_eq!(snd.files[0].as_str(), new_path);
         // Default-driven fields should be sensible.
         assert!(snd.beat_align);
+    }
+
+    /// "different music" follows the music routes' rule: only an audio
+    /// file in the library or the projects folder goes into the config.
+    #[test]
+    fn different_music_refuses_files_outside_the_library() {
+        let lib = test_library();
+        let outside = lib.join("secret.mp3").to_string_lossy().into_owned();
+        let climb = lib.join("music/../secret.mp3").to_string_lossy().into_owned();
+        let not_audio = lib.join("music/new_track.txt").to_string_lossy().into_owned();
+        for (path, invalid) in [
+            ("/etc/passwd", true),
+            ("/etc/nonexistent.mp3", true),
+            (outside.as_str(), true),
+            (climb.as_str(), true),
+            (not_audio.as_str(), true),
+            // Inside a root, but not there.
+            ("/projects/music/missing.mp3", false),
+        ] {
+            let mut cfg = base_config();
+            let before = cfg.soundtrack.as_ref().unwrap().files.clone();
+            let err = apply(&mut cfg, &FeedbackAction::DifferentMusic { path: path.into() })
+                .expect_err(path)
+                .downcast::<OpsError>()
+                .unwrap_or_else(|e| panic!("{path}: not an OpsError: {e:#}"));
+            if invalid {
+                assert!(matches!(err, OpsError::InvalidInput { .. }), "{path}: {err}");
+            } else {
+                assert!(matches!(err, OpsError::NotFound { .. }), "{path}: {err}");
+            }
+            assert_eq!(cfg.soundtrack.unwrap().files, before, "{path} changed the config");
+        }
+    }
+
+    /// Through the file op too: the refusal keeps its kind and the config
+    /// on disk is left alone; a library song is written.
+    #[tokio::test]
+    async fn apply_feedback_to_file_checks_the_song() {
+        let dir = test_library().join("cfg");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.toml");
+        let original = toml::to_string_pretty(&base_config()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let p = path.to_string_lossy().into_owned();
+        let bad = FeedbackAction::DifferentMusic { path: "/etc/passwd".into() };
+        let err = apply_feedback_to_file(&p, &bad).await.expect_err("refused");
+        assert!(matches!(err, OpsError::InvalidInput { .. }), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let song = library_song("x.mp3");
+        let ok = apply_feedback_to_file(&p, &FeedbackAction::DifferentMusic { path: song.clone() }).await.unwrap();
+        assert_eq!(ok.changes[0].after, song);
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&song));
     }
 
     #[test]
@@ -1123,7 +1208,7 @@ stabilize = false
             FeedbackAction::Calmer,
             FeedbackAction::Punchier,
             FeedbackAction::DifferentMusic {
-                path: "/projects/music/x.mp3".into(),
+                path: library_song("x.mp3"),
             },
             FeedbackAction::Reroll,
             FeedbackAction::MoreOf {
