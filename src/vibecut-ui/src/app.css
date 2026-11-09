@@ -1,21 +1,83 @@
-/* Design tokens for the app: a dark, video-editing-tool palette, with
-   Manrope for UI text and IBM Plex Mono for data/timecodes. */
+/* Vibecut design system — "projector light".
+   Deep ink stage, an aurora of ember → magenta → violet light, film
+   grain, glass panels. Bricolage Grotesque for UI and display,
+   Instrument Serif for cinematic accents, IBM Plex Mono for timecodes.
+   The original token names (--ink, --panel, --line, --text-*, --accent,
+   --good/--warn/--bad, --mono, --ui) are kept so older components (the
+   config wizard) inherit the new look unchanged. */
 
 :root {
-	--ink: #14171c;
-	--panel: #1b1f27;
-	--panel-alt: #222833;
-	--line: #2b313d;
-	--text: #e7e9ee;
-	--text-dim: #8c93a3;
-	--text-faint: #5b6272;
+	color-scheme: dark;
+
+	/* Surfaces */
+	--ink: #07080c;
+	--ink-2: #0b0d13;
+	--panel: rgba(20, 23, 32, 0.72);
+	--panel-solid: #12151d;
+	--panel-alt: #1a1e29;
+	--panel-hi: #232837;
+	--line: rgba(255, 255, 255, 0.08);
+	--line-strong: rgba(255, 255, 255, 0.16);
+
+	/* Text (all ≥ 4.5:1 on --ink) */
+	--text: #f4f5f9;
+	--text-dim: #b0b6c4;
+	--text-faint: #8a91a3;
+
+	/* Brand light */
 	--accent: #ff7a45;
-	--accent-dim: #7a4326;
-	--good: #5cc98a;
-	--warn: #e3b756;
-	--bad: #e2645c;
+	--accent-dim: #7a3418;
+	--magenta: #ff3d81;
+	--violet: #7b5cff;
+	--cyan: #38d6ff;
+	--lime: #b8f35a;
+	--grad-brand: linear-gradient(115deg, #ff7a45 0%, #ff3d81 52%, #7b5cff 100%);
+	--grad-brand-soft: linear-gradient(115deg, rgba(255, 122, 69, 0.22), rgba(255, 61, 129, 0.18) 52%, rgba(123, 92, 255, 0.22));
+	/* Primary actions: warm ember→solar so dark text stays ≥ 7:1 across the
+	   whole button (the aurora's violet end drops to ~4:1). The aurora stays
+	   for ambient light, the wordmark and progress. */
+	--grad-cta: linear-gradient(115deg, #ff7a45 0%, #ff9a4a 55%, #ffb547 100%);
+	--on-cta: #1a0a04;
+
+	/* Status */
+	--good: #4ade80;
+	--warn: #fbbf24;
+	--bad: #f87171;
+
+	/* Type */
+	--ui: 'Bricolage Grotesque Variable', 'Bricolage Grotesque', -apple-system, 'Segoe UI', system-ui, sans-serif;
+	--display: 'Bricolage Grotesque Variable', 'Bricolage Grotesque', -apple-system, 'Segoe UI', system-ui, sans-serif;
+	--serif: 'Instrument Serif', 'Iowan Old Style', Georgia, serif;
 	--mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Consolas, monospace;
-	--ui: 'Manrope', -apple-system, 'Segoe UI', sans-serif;
+	--fs-xs: 12px;
+	--fs-sm: 13.5px;
+	--fs-md: 15px;
+	--fs-lg: 18px;
+	--fs-xl: 24px;
+	--fs-2xl: clamp(28px, 3.4vw, 40px);
+	--fs-hero: clamp(40px, 6.4vw, 84px);
+
+	/* Shape & depth */
+	--r-sm: 8px;
+	--r-md: 14px;
+	--r-lg: 22px;
+	--r-xl: 30px;
+	--shadow-1: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 10px 30px -12px rgba(0, 0, 0, 0.7);
+	--shadow-2: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 30px 80px -24px rgba(0, 0, 0, 0.85);
+	--glow: 0 0 0 1px rgba(255, 122, 69, 0.45), 0 18px 50px -14px rgba(255, 61, 129, 0.6);
+	--blur: blur(18px) saturate(140%);
+
+	/* Motion */
+	--ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+	--ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+	--ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+	--dur-1: 160ms;
+	--dur-2: 320ms;
+	--dur-3: 640ms;
+	/* One beat of the chosen song; components that pulse read it. */
+	--beat: 0.5s;
+
+	--gutter: clamp(16px, 3vw, 40px);
 }
 
 * {
@@ -32,12 +94,51 @@ body {
 	background: var(--ink);
 	color: var(--text);
 	font-family: var(--ui);
-	font-size: 14px;
+	font-size: var(--fs-md);
 	line-height: 1.5;
+	font-optical-sizing: auto;
+	-webkit-font-smoothing: antialiased;
+	overflow-x: hidden;
+}
+
+/* Aurora + grain + vignette, behind everything. */
+body::before,
+body::after {
+	content: '';
+	position: fixed;
+	inset: 0;
+	pointer-events: none;
+	z-index: -1;
+}
+
+body::before {
+	background:
+		radial-gradient(60vw 50vh at 12% -8%, rgba(255, 122, 69, 0.2), transparent 60%),
+		radial-gradient(55vw 55vh at 92% 4%, rgba(123, 92, 255, 0.22), transparent 62%),
+		radial-gradient(70vw 60vh at 50% 118%, rgba(255, 61, 129, 0.14), transparent 60%),
+		radial-gradient(120vw 90vh at 50% 50%, transparent 55%, rgba(0, 0, 0, 0.65) 100%);
+	animation: aurora 28s var(--ease-in-out) infinite alternate;
+}
+
+body::after {
+	opacity: 0.07;
+	mix-blend-mode: overlay;
+	background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .9 0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+@keyframes aurora {
+	0% {
+		transform: translate3d(0, 0, 0) scale(1);
+		filter: hue-rotate(0deg);
+	}
+	100% {
+		transform: translate3d(-2%, 1.5%, 0) scale(1.06);
+		filter: hue-rotate(-14deg);
+	}
 }
 
 ::selection {
-	background: var(--accent-dim);
+	background: rgba(255, 61, 129, 0.45);
 	color: #fff;
 }
 
@@ -47,18 +148,159 @@ textarea,
 select {
 	font-family: inherit;
 	color: inherit;
+	font-size: inherit;
+}
+
+button {
+	-webkit-tap-highlight-color: transparent;
 }
 
 button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible,
-a:focus-visible {
-	outline: 2px solid var(--accent);
-	outline-offset: 2px;
+a:focus-visible,
+[tabindex]:focus-visible {
+	outline: 2px solid var(--cyan);
+	outline-offset: 3px;
 }
 
 code,
 pre {
 	font-family: var(--mono);
+}
+
+/* ---------- Shared primitives ---------- */
+
+.glass {
+	background: var(--panel);
+	border: 1px solid var(--line);
+	border-radius: var(--r-lg);
+	box-shadow: var(--shadow-1);
+	backdrop-filter: var(--blur);
+	-webkit-backdrop-filter: var(--blur);
+}
+
+.eyebrow {
+	font-size: var(--fs-xs);
+	font-weight: 700;
+	letter-spacing: 0.14em;
+	text-transform: uppercase;
+	color: var(--text-faint);
+}
+
+.serif {
+	font-family: var(--serif);
+	font-weight: 400;
+	letter-spacing: -0.01em;
+}
+
+.mono {
+	font-family: var(--mono);
+}
+
+.grad-text {
+	background: var(--grad-brand);
+	-webkit-background-clip: text;
+	background-clip: text;
+	color: transparent;
+}
+
+.sr-only {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+.btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	border: 1px solid var(--line-strong);
+	background: rgba(255, 255, 255, 0.04);
+	color: var(--text);
+	padding: 9px 16px;
+	border-radius: 999px;
+	font-weight: 600;
+	font-size: var(--fs-sm);
+	cursor: pointer;
+	white-space: nowrap;
+	transition:
+		background var(--dur-1) var(--ease-out),
+		border-color var(--dur-1) var(--ease-out),
+		transform var(--dur-1) var(--ease-out);
+}
+
+.btn:hover:not(:disabled) {
+	background: rgba(255, 255, 255, 0.09);
+	border-color: rgba(255, 255, 255, 0.28);
+}
+
+.btn:active:not(:disabled) {
+	transform: scale(0.97);
+}
+
+.btn:disabled {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+
+.btn.primary {
+	border: none;
+	background: var(--grad-cta);
+	color: var(--on-cta);
+	box-shadow: 0 10px 30px -10px rgba(255, 122, 69, 0.75);
+}
+
+.btn.primary:hover:not(:disabled) {
+	background: var(--grad-cta);
+	filter: brightness(1.08) saturate(1.1);
+}
+
+.btn.ghost {
+	border-color: transparent;
+	background: transparent;
+	color: var(--text-dim);
+}
+
+.btn.ghost:hover:not(:disabled) {
+	color: var(--text);
+	background: rgba(255, 255, 255, 0.06);
+}
+
+.btn.danger:hover:not(:disabled) {
+	border-color: var(--bad);
+	color: var(--bad);
+}
+
+.pill {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 10px;
+	border-radius: 999px;
+	font-size: var(--fs-xs);
+	font-weight: 600;
+	border: 1px solid var(--line);
+	background: rgba(255, 255, 255, 0.04);
+	color: var(--text-dim);
+	white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+		scroll-behavior: auto !important;
+	}
 }

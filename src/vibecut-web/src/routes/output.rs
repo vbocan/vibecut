@@ -7,11 +7,11 @@
 //! — serving raw bytes with HTTP semantics (content-type) is a
 //! REST-transport concern, not a shared operation.
 
-use axum::body::Body;
-use axum::extract::Query;
-use axum::http::{header, StatusCode};
+use axum::extract::{Query, Request};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 use vibecut_ops::error::OpsError;
 use vibecut_ops::paths::{resolve_projects, PROJECTS_ROOT};
 
@@ -22,7 +22,10 @@ pub struct OutputFileQuery {
     pub path: String,
 }
 
-pub async fn serve_output(Query(q): Query<OutputFileQuery>) -> Result<Response, ApiError> {
+pub async fn serve_output(
+    Query(q): Query<OutputFileQuery>,
+    req: Request,
+) -> Result<Response, ApiError> {
     if !is_safe_projects_path(&q.path) {
         return Err(OpsError::invalid(format!(
             "path escapes the /projects mount: {:?}",
@@ -30,31 +33,66 @@ pub async fn serve_output(Query(q): Query<OutputFileQuery>) -> Result<Response, 
         ))
         .into());
     }
+    serve_file(resolve_projects(&q.path), req).await
+}
 
-    let resolved = resolve_projects(&q.path);
-    if !resolved.exists() {
-        return Err(
-            OpsError::not_found_with("output file", resolved.to_string_lossy().into_owned())
-                .into(),
-        );
+/// Stream `path` with full HTTP file semantics via tower-http's
+/// `ServeFile`: `Range` requests (so `<video>`/`<audio>` can seek
+/// without downloading the whole file) and conditional requests.
+/// Callers check the path is allowed first.
+///
+/// The content type comes from a fixed list of media and data types,
+/// never from guessing: anything else (an `.html` or `.svg` someone
+/// dropped under /projects) is sent as an attachment, so it can't run
+/// as a page on this origin.
+pub async fn serve_file(path: std::path::PathBuf, req: Request) -> Result<Response, ApiError> {
+    use axum::http::{header, HeaderValue};
+    if !path.is_file() {
+        return Err(OpsError::not_found_with("file", path.to_string_lossy().into_owned()).into());
     }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let known = content_type_for(&ext);
+    match ServeFile::new(&path).oneshot(req).await {
+        Ok(res) => {
+            let mut res = res.into_response();
+            let h = res.headers_mut();
+            h.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(known.unwrap_or("application/octet-stream")),
+            );
+            h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            if known.is_none() {
+                h.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+            }
+            Ok(res)
+        }
+        Err(e) => Err(OpsError::internal(format!("could not read {}: {e}", path.display())).into()),
+    }
+}
 
-    let bytes = tokio::fs::read(&resolved).await.map_err(|e| {
-        ApiError::from(OpsError::internal(format!(
-            "could not read {}: {e}",
-            resolved.display()
-        )))
-    })?;
-
-    let content_type = match resolved.extension().and_then(|e| e.to_str()) {
-        Some("mp4") => "video/mp4",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("json") => "application/json",
-        Some("toml") => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
-    };
-
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], Body::from(bytes)).into_response())
+/// Media and data types `serve_file` will label; everything else
+/// downloads as an opaque file.
+fn content_type_for(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "m4a" => "audio/mp4",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "aac" => "audio/aac",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "json" => "application/json",
+        "toml" => "text/plain; charset=utf-8",
+        _ => return None,
+    })
 }
 
 /// Pure, filesystem-free traversal guard: reject any `..` path
@@ -84,6 +122,11 @@ fn is_safe_projects_path(user_path: &str) -> bool {
     {
         return false;
     }
+    // Also treat '\' as a separator, so a Windows-style "..\.." is
+    // rejected on Linux too, where it would otherwise be one component.
+    if user_path.split(['/', '\\']).any(|seg| seg == "..") {
+        return false;
+    }
 
     let normalized = user_path.replace('\\', "/");
     // Rooted = POSIX-absolute ("/...") or a Windows drive prefix
@@ -99,6 +142,15 @@ fn is_safe_projects_path(user_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_media_and_data_types_are_labelled() {
+        assert_eq!(content_type_for("mp4"), Some("video/mp4"));
+        assert_eq!(content_type_for("m4a"), Some("audio/mp4"));
+        assert_eq!(content_type_for("html"), None);
+        assert_eq!(content_type_for("svg"), None);
+        assert_eq!(content_type_for("xml"), None);
+    }
 
     #[test]
     fn rejects_parent_dir_traversal() {

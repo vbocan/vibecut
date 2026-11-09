@@ -6,6 +6,7 @@ pub mod config;
 pub mod discover;
 pub mod feedback;
 pub mod frames;
+pub mod music;
 pub mod output;
 pub mod propose;
 pub mod render;
@@ -25,6 +26,7 @@ pub fn api_router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/sources", get(discover::discover_sources))
+        .route("/footage", get(discover::list_footage))
         .route("/vibes", get(vibes::list_vibes))
         .route("/propose", post(propose::propose_vibe))
         .route(
@@ -43,10 +45,15 @@ pub fn api_router() -> Router<AppState> {
         .route("/frames/output", get(frames::inspect_output))
         .route("/frames/at", get(frames::inspect_at))
         .route("/output", get(output::serve_output))
+        .route("/music", get(music::list_music))
+        .route("/music/file", get(music::serve_music_file))
         .route("/sessions", get(sessions::list_sessions))
         .route("/ws/render/{job_id}", get(crate::ws::render_progress_ws))
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true, "service": "vibecut-web" }))
+    // `ai`: whether the free-text brief (POST /brief) can work, so the UI
+    // can hide or explain the "Ask AI" box instead of failing on submit.
+    let ai = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.trim().is_empty());
+    Json(serde_json::json!({ "ok": true, "service": "vibecut-web", "ai": ai }))
 }

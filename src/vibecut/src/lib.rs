@@ -22,6 +22,7 @@ pub mod gopro_metadata;
 pub mod media_probe;
 pub mod ml_engine;
 pub mod multi_angle;
+pub mod progress;
 pub mod project_config;
 pub mod selection_planner;
 pub mod selection_scoring;

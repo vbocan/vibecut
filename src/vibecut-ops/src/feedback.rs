@@ -257,14 +257,19 @@ fn apply_calmer(cfg: &mut Config) -> Vec<ChangeNote> {
         ));
     }
 
+    // Longer crossfades read calmer, but each one eats into both clips it
+    // joins. Repeated "calmer" taps must not grow it past what the shortest
+    // clip can afford, or renders start failing.
     let before = cfg.transition.duration;
-    let after = before + Duration::from_millis(200);
-    cfg.transition.duration = after;
-    notes.push(note(
-        "transition.duration",
-        &fmt_duration(before),
-        &fmt_duration(after),
-    ));
+    let after = (before + Duration::from_millis(200)).min(calmer_crossfade_cap(cfg));
+    if after > before {
+        cfg.transition.duration = after;
+        notes.push(note(
+            "transition.duration",
+            &fmt_duration(before),
+            &fmt_duration(after),
+        ));
+    }
 
     let before = cfg.selection.variety;
     let after = (before - 0.1).max(0.0);
@@ -553,6 +558,14 @@ fn note(field: &str, before: &str, after: &str) -> ChangeNote {
 /// Pretty-print a `Duration` the way humantime does. We don't pull in
 /// humantime here just for this — the manual format matches what the
 /// vibecut TOML uses (e.g. "3m" / "750ms").
+/// The longest crossfade "calmer" will set: 1.2 s, and never more than
+/// 35% of the shortest clip the selection allows.
+fn calmer_crossfade_cap(cfg: &Config) -> Duration {
+    const ABS_CAP: Duration = Duration::from_millis(1200);
+    let rel = cfg.selection.min_clip.mul_f64(0.35);
+    ABS_CAP.min(rel).max(Duration::from_millis(100))
+}
+
 fn fmt_duration(d: Duration) -> String {
     let total_ms = d.as_millis();
     if total_ms == 0 {
@@ -1103,6 +1116,19 @@ stabilize = false
         assert!(r.is_err());
         let _ = std::fs::remove_file(&manifest_path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn calmer_crossfade_stops_growing_at_the_cap() {
+        let mut cfg = base_config();
+        // min_clip = 2s → cap is min(1.2s, 0.7s) = 700ms.
+        for _ in 0..20 {
+            apply(&mut cfg, &FeedbackAction::Calmer).unwrap();
+        }
+        assert_eq!(cfg.transition.duration, Duration::from_millis(700));
+        // Once capped, another tap reports no crossfade change.
+        let notes = apply(&mut cfg, &FeedbackAction::Calmer).unwrap_or_default();
+        assert!(notes.iter().all(|n| n.field != "transition.duration"));
     }
 
     #[test]

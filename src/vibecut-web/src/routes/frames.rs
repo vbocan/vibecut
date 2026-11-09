@@ -29,14 +29,42 @@ pub async fn inspect_output(
 #[derive(Debug, Deserialize)]
 pub struct AtQuery {
     pub output_path: String,
-    /// Repeated query key: `?output_path=...&t=1.0&t=4.2&t=9.0`.
+    /// Comma-separated seconds: `?output_path=...&t=1.0,4.2,9.0`. (The
+    /// earlier repeated-key form, a `Vec`, can't be parsed by axum's
+    /// query extractor, so this endpoint rejected every request.)
     #[serde(default)]
-    pub t: Vec<f32>,
+    pub t: String,
 }
 
 pub async fn inspect_at(Query(q): Query<AtQuery>) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = vibecut_ops::frames::inspect_at(&q.output_path, &q.t).await?;
+    let times = parse_times(&q.t).map_err(|bad| {
+        ApiError::from(vibecut_ops::error::OpsError::invalid(format!(
+            "t must be comma-separated seconds; could not read {bad:?}"
+        )))
+    })?;
+    let result = vibecut_ops::frames::inspect_at(&q.output_path, &times).await?;
     Ok(Json(frames_to_json(result)))
+}
+
+/// "1.5, 4,9.25" → [1.5, 4.0, 9.25]; the offending piece on error.
+fn parse_times(s: &str) -> Result<Vec<f32>, String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<f32>().map_err(|_| p.to_string()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_times;
+
+    #[test]
+    fn parses_comma_separated_seconds() {
+        assert_eq!(parse_times("1.5, 4,9.25").unwrap(), vec![1.5, 4.0, 9.25]);
+        assert_eq!(parse_times("").unwrap(), Vec::<f32>::new());
+        assert_eq!(parse_times("2,x").unwrap_err(), "x");
+    }
 }
 
 fn frames_to_json(result: FrameExtractionResult) -> serde_json::Value {

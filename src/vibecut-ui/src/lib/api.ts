@@ -53,6 +53,13 @@ async function sendJson<T>(
 	return res.json() as Promise<T>;
 }
 
+// ---------- health ----------
+
+/** `ai`: whether the server can answer free-text briefs. */
+export function health(): Promise<{ ok: boolean; service: string; ai?: boolean }> {
+	return getJson('/health');
+}
+
 // ---------- discover ----------
 
 export interface ChapterSummary {
@@ -78,6 +85,20 @@ export interface DiscoverResult {
 	total_secs: number;
 	summary: string;
 	hint?: string;
+}
+
+export interface FootageFolder {
+	/** Relative to /footage — what discover/propose take. */
+	folder: string;
+	name: string;
+	n_videos: number;
+	total_bytes: number;
+	newest: string | null;
+	sample_video: string | null;
+}
+
+export function listFootage(): Promise<{ folders: FootageFolder[] }> {
+	return getJson('/footage');
 }
 
 export function discoverSources(folder: string): Promise<DiscoverResult> {
@@ -177,6 +198,12 @@ export interface ManifestSummary {
 	actual_duration_secs: number | null;
 	target_duration_secs: number | null;
 	n_sources: number;
+	beat_sync?: {
+		tempo_bpm: number | null;
+		n_cuts: number | null;
+		within_tolerance: number | null;
+		mean_abs_error_ms: number | null;
+	} | null;
 }
 
 export interface RenderResult {
@@ -187,6 +214,10 @@ export interface RenderResult {
 	output_exists?: boolean;
 	manifest_path?: string;
 	manifest_summary?: ManifestSummary;
+	/** This render's own copy (async renders): later renders overwrite
+	 *  `output_path`, never these. */
+	version_path?: string;
+	version_manifest_path?: string;
 }
 
 export function renderSync(configPath: string): Promise<RenderResult> {
@@ -197,9 +228,28 @@ export function renderAsync(configPath: string): Promise<{ job_id: string; state
 	return sendJson('/render/async', { config_path: configPath });
 }
 
+/** Latest pipeline stage report for a running render (see
+ *  `vibecut::progress`). `overall` never goes backwards. */
+export interface RenderProgress {
+	stage:
+		| 'probing'
+		| 'music'
+		| 'analysing'
+		| 'picking'
+		| 'clips'
+		| 'joining'
+		| 'mixing'
+		| 'encoding'
+		| 'checking';
+	label: string;
+	stage_fraction: number;
+	overall: number;
+	detail: string | null;
+}
+
 export type JobStatus =
 	| { job_id: string; state: 'queued' }
-	| { job_id: string; state: 'running'; started_at: string }
+	| { job_id: string; state: 'running'; started_at: string; progress: RenderProgress | null }
 	| ({ job_id: string; state: 'done'; started_at: string; finished_at: string; elapsed_ms: number } & RenderResult)
 	| { job_id: string; state: 'failed'; started_at: string; finished_at: string; elapsed_ms: number; error: string };
 
@@ -243,6 +293,41 @@ export function inspectOutput(outputPath: string, maxFrames = 12): Promise<Frame
 /** URL a `<video>`/`<a>` can point at directly to stream the file. */
 export function outputFileUrl(path: string): string {
 	return `${BASE}/output?path=${encodeURIComponent(path)}`;
+}
+
+/** Frames from any server-side video at given times — used with a
+ *  source chapter path for footage thumbnails. */
+export function inspectAt(videoPath: string, times: number[]): Promise<FrameSummary> {
+	const t = times.map((x) => x.toFixed(2)).join(',');
+	return getJson(`/frames/at?output_path=${encodeURIComponent(videoPath)}&t=${t}`);
+}
+
+// ---------- music library ----------
+
+export interface Track {
+	path: string;
+	title: string;
+	collection: 'yours' | 'library';
+	duration_secs: number;
+	bpm: number;
+	beat_interval_secs: number;
+	first_beat_secs: number | null;
+	grid_tight: boolean | null;
+	pulse_strength: number;
+	/** 48-bin loudness sketch, 0..1. */
+	energy: number[];
+	energy_mean: number;
+	mood: 'chill' | 'warm' | 'upbeat' | 'driving';
+	loud_region: [number, number];
+}
+
+export function listMusic(): Promise<{ tracks: Track[]; dirs: { path: string; collection: string }[] }> {
+	return getJson('/music');
+}
+
+/** Stream URL for previewing a library track (supports seeking). */
+export function musicFileUrl(path: string): string {
+	return `${BASE}/music/file?path=${encodeURIComponent(path)}`;
 }
 
 // ---------- brief ----------

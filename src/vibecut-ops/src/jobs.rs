@@ -39,9 +39,13 @@ pub fn fresh_job_id() -> String {
 pub enum JobState {
     /// Submitted but not yet started by the worker. Should be brief.
     Queued,
-    /// Worker is running. Optional progress hint may land here in
-    /// future phases (e.g. "stage 4 of 7"); v1 just reports `running`.
-    Running { started_at: String },
+    /// Worker is running. `progress` is the pipeline's latest stage
+    /// report (stage, friendly label, fractions, detail such as
+    /// "clip 7 of 24"); `None` until the first report arrives.
+    Running {
+        started_at: String,
+        progress: Option<vibecut::progress::Progress>,
+    },
     /// Render completed. `result_json` is the SAME body the
     /// synchronous `render` tool returns (parsed JSON).
     Done {
@@ -122,6 +126,18 @@ impl JobRegistry {
                     true
                 }
             });
+        }
+    }
+
+    /// Record a progress report for a running job. Called from the
+    /// render's blocking thread (not an async context), hence
+    /// `blocking_lock`. Ignored unless the job is currently `Running`.
+    pub fn set_progress_blocking(&self, id: &str, p: vibecut::progress::Progress) {
+        let mut g = self.inner.blocking_lock();
+        if let Some((_, JobState::Running { progress, .. })) =
+            g.entries.iter_mut().find(|(k, _)| k == id)
+        {
+            *progress = Some(p);
         }
     }
 

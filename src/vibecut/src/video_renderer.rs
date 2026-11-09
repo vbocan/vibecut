@@ -1928,10 +1928,17 @@ pub fn render_text_card(
         cmd.push(arg("-i"));
         cmd.push(im.path.to_string());
     }
+    // Frame-exact: the lavfi colour source rounds a fractional duration up
+    // (2.867 s at 30 fps came out as 87 frames, not 86), which shifted every
+    // beat-locked cut after the card by a frame. Cap video and audio at
+    // exactly the card's frame count.
+    let frames = output_frame_count(spec.duration_secs as f64, spec.fps);
     cmd.extend([
         arg("-filter_complex"), filter,
         arg("-map"), arg("[v]"),
         arg("-map"), arg("1:a"),
+        arg("-frames:v"), frames.to_string(),
+        arg("-t"), format!("{:.6}", frames as f64 / spec.fps.max(1) as f64),
         arg("-pix_fmt"), arg("yuv420p"),
     ]);
     cmd.extend(hw.encode_args(spec.crf));

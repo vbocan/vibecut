@@ -2,6 +2,12 @@
 
 use axum::extract::Query;
 use axum::Json;
+
+/// `GET /api/footage` — folders under `/footage` that hold videos.
+pub async fn list_footage() -> Result<Json<serde_json::Value>, crate::error::ApiError> {
+    let folders = vibecut_ops::footage::list_folders().await?;
+    Ok(Json(serde_json::json!({ "folders": folders })))
+}
 use serde::Deserialize;
 
 use crate::error::ApiError;
