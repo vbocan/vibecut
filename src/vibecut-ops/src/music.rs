@@ -198,22 +198,132 @@ pub fn own_music_dir() -> PathBuf {
     }
 }
 
-/// Music directories, user's own first.
+/// Music directories, user's own first, then the library folders, then
+/// the folders the user picked on a drive ([`add_folder`]).
 pub fn music_dirs() -> Vec<(PathBuf, &'static str)> {
-    if let Some(r) = roots_override() {
+    let mut dirs = if let Some(r) = roots_override() {
         let mut dirs = vec![(r.own, "yours")];
         dirs.extend(r.extra.into_iter().map(|d| (d, "library")));
-        return dirs;
-    }
-    let mut dirs = vec![(own_music_dir(), "yours")];
-    if let Ok(extra) = std::env::var("VIBECUT_MUSIC_DIRS") {
-        // OS path-list syntax (';' on Windows, ':' elsewhere), absolute
-        // entries only, so a fragment never becomes a cwd-relative root.
-        for d in std::env::split_paths(&extra).filter(|d| d.is_absolute()) {
-            dirs.push((d, "library"));
+        dirs
+    } else {
+        let mut dirs = vec![(own_music_dir(), "yours")];
+        if let Ok(extra) = std::env::var("VIBECUT_MUSIC_DIRS") {
+            // OS path-list syntax (';' on Windows, ':' elsewhere), absolute
+            // entries only, so a fragment never becomes a cwd-relative root.
+            for d in std::env::split_paths(&extra).filter(|d| d.is_absolute()) {
+                dirs.push((d, "library"));
+            }
+        }
+        dirs
+    };
+    for d in picked_folders() {
+        if !dirs.iter().any(|(have, _)| *have == d) {
+            dirs.push((d, "yours"));
         }
     }
     dirs
+}
+
+/// Where the picked music folders are kept: beside the user's own music
+/// folder (`/projects/.vibecut-music-folders.json`).
+fn picked_file() -> PathBuf {
+    let own = own_music_dir();
+    own.parent().unwrap_or(&own).join(".vibecut-music-folders.json")
+}
+
+/// Serialises read-modify-write of the picked folders file.
+static PICKED_LOCK: Mutex<()> = Mutex::new(());
+
+/// Music folders the user picked on a drive ("Browse your drives…" on the
+/// song step), as container paths. Unreadable or odd entries are skipped.
+pub fn picked_folders() -> Vec<PathBuf> {
+    picked_in(&picked_file())
+}
+
+fn picked_in(file: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| (p.starts_with('/') || Path::new(p).is_absolute()) && !Path::new(p).components().any(|c| matches!(c, Component::ParentDir)))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn save_picked(file: &Path, folders: &[PathBuf]) -> Result<(), OpsError> {
+    let list: Vec<String> = folders.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let text = serde_json::to_string_pretty(&list).map_err(|e| OpsError::internal(format!("{e}")))?;
+    let tmp = file.with_extension("json.tmp");
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, &file))
+        .map_err(|e| OpsError::internal(format!("could not save the music folders to {}: {e}", file.display())))
+}
+
+/// What [`add_folder`] did.
+#[derive(Debug, Clone, Serialize)]
+pub struct AddedFolder {
+    /// The folder as the server reads it.
+    pub container_path: String,
+    /// The folder as the user knows it (`D:\Music\Road trip`).
+    pub path: String,
+    /// It was already in the library (itself or a folder above it).
+    pub already: bool,
+}
+
+/// Add a folder on a drive (a display path like `D:\Music` or a container
+/// path, see [`crate::browse`]) to the music library. Its songs are
+/// listed with the user's own, can be previewed, and renders may read
+/// them (`paths::extra_read_roots` includes every music folder). A whole
+/// drive, hidden folders and anything outside the browse roots are
+/// refused.
+pub async fn add_folder(path: &str) -> Result<AddedFolder, OpsError> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let (dir, display) = crate::browse::resolve_folder(&path)?;
+        let _guard = PICKED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let have: Vec<PathBuf> = music_dirs().into_iter().map(|(d, _)| d).collect();
+        add_in(&picked_file(), &have, dir, display)
+    })
+    .await
+    .map_err(|e| OpsError::internal(format!("music folder task panicked: {e}")))?
+}
+
+/// [`add_folder`] once the folder is resolved and checked: `file` keeps
+/// the picked folders, `have` is every music folder already read.
+fn add_in(file: &Path, have: &[PathBuf], dir: PathBuf, display: String) -> Result<AddedFolder, OpsError> {
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    let already = have.iter().filter_map(|d| d.canonicalize().ok()).any(|d| canon.starts_with(d));
+    if !already {
+        let mut picked = picked_in(file);
+        // A folder inside the new one is now covered by it.
+        picked.retain(|p| !p.canonicalize().is_ok_and(|c| c.starts_with(&canon)));
+        picked.push(dir.clone());
+        save_picked(file, &picked)?;
+    }
+    Ok(AddedFolder { container_path: dir.to_string_lossy().into_owned(), path: display, already })
+}
+
+/// Take a picked folder out of the library (its songs stay on the drive).
+/// `path` is the container path [`music_dirs`] lists, or its display path.
+/// Returns whether it was there.
+pub fn remove_folder(path: &str) -> Result<bool, OpsError> {
+    let mapped = crate::browse::display_to_container(&crate::browse::roots(), path);
+    let target = mapped.unwrap_or_else(|| PathBuf::from(path.trim()));
+    let _guard = PICKED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    remove_in(&picked_file(), &target)
+}
+
+fn remove_in(file: &Path, target: &Path) -> Result<bool, OpsError> {
+    let mut picked = picked_in(file);
+    let before = picked.len();
+    picked.retain(|p| p != target);
+    if picked.len() == before {
+        return Ok(false);
+    }
+    save_picked(file, &picked)?;
+    Ok(true)
 }
 
 /// True when `path` is an audio file inside one of [`music_dirs`]
@@ -227,6 +337,11 @@ pub fn is_library_file(path: &Path) -> bool {
             .iter()
             .filter_map(|(d, _)| d.canonicalize().ok())
             .any(|d| canon.starts_with(d))
+}
+
+/// An audio file name the library reads (by extension).
+pub fn is_audio_name(name: &str) -> bool {
+    !name.starts_with('.') && is_audio(Path::new(name))
 }
 
 fn is_audio(p: &Path) -> bool {
@@ -1054,5 +1169,50 @@ mod tests {
             assert!(matches!(check_soundtrack_file(p), Err(OpsError::InvalidInput { .. })), "{p}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Picked folders are kept in their file, skip what the library
+    /// already reads, absorb folders inside them, and can be removed.
+    #[test]
+    fn picked_music_folders_are_kept_and_removed() {
+        let base = std::env::temp_dir().join(format!("vibecut_picked_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let own = base.join("music");
+        let road = base.join("drive/Music/Road trip");
+        let music = base.join("drive/Music");
+        for d in [&own, &road, &own.join("sub")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let file = base.join(".vibecut-music-folders.json");
+        let have = vec![own.clone()];
+
+        let a = add_in(&file, &have, road.clone(), r"D:\Music\Road trip".into()).unwrap();
+        assert!(!a.already);
+        assert_eq!(a.path, r"D:\Music\Road trip");
+        assert_eq!(picked_in(&file), vec![road.clone()]);
+        // Adding it again, or a folder inside the own one, changes nothing.
+        assert!(add_in(&file, &[own.clone(), road.clone()], road.clone(), "x".into()).unwrap().already);
+        assert!(add_in(&file, &have, own.join("sub"), "x".into()).unwrap().already);
+        assert_eq!(picked_in(&file), vec![road.clone()]);
+        // The folder above takes its place.
+        add_in(&file, &have, music.clone(), "x".into()).unwrap();
+        assert_eq!(picked_in(&file), vec![music.clone()]);
+
+        assert!(!remove_in(&file, &road).unwrap());
+        assert!(remove_in(&file, &music).unwrap());
+        assert!(picked_in(&file).is_empty());
+
+        // A hand-edited file: relative and `..` entries are ignored.
+        std::fs::write(&file, r#"["relative/dir", "/a/../etc", "/ok/music"]"#).unwrap();
+        assert_eq!(picked_in(&file), vec![PathBuf::from("/ok/music")]);
+        std::fs::write(&file, "not json").unwrap();
+        assert!(picked_in(&file).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn audio_names_are_counted_by_extension() {
+        assert!(is_audio_name("Road.MP3") && is_audio_name("a.flac") && is_audio_name("b.opus"));
+        assert!(!is_audio_name(".hidden.mp3") && !is_audio_name("clip.mp4") && !is_audio_name("notes.txt"));
     }
 }

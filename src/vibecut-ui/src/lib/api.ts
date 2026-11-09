@@ -573,11 +573,39 @@ export interface MusicLibrary {
 	warnings: string[];
 	/** Where to put downloaded songs, as the server sees it. */
 	import_dir: string;
-	dirs: { path: string; collection: string; exists: boolean }[];
+	/** The same folder as the user knows it (`D:\Vibecut\projects\music`)
+	 *  when the server knows the host folder, else `import_dir`. */
+	import_dir_display?: string;
+	dirs: MusicDir[];
+}
+
+/** A folder the library reads. */
+export interface MusicDir {
+	/** As the server sees it. */
+	path: string;
+	/** As the user knows it (`D:\Music`). */
+	display?: string;
+	collection: string;
+	exists: boolean;
+	/** Picked on a drive: it can be taken out of the library again. */
+	picked?: boolean;
 }
 
 export function listMusic(): Promise<MusicLibrary> {
 	return getJson('/music');
+}
+
+/** `POST /music/folders`: add a folder on a drive (its display path) to
+ *  the library; answers with the library as it is now. */
+export function addMusicFolder(
+	path: string
+): Promise<MusicLibrary & { added: { path: string; container_path: string; already: boolean } }> {
+	return sendJson('/music/folders', { path });
+}
+
+/** `POST /music/folders/remove`: take a picked folder out of the library. */
+export function removeMusicFolder(path: string): Promise<MusicLibrary> {
+	return sendJson('/music/folders/remove', { path });
 }
 
 /** The server's song choice for a vibe, with the reason. */

@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addRecent, folderName, footageValue, MAX_RECENTS, moveHighlight, parseRecents, videoCount } from './browse.ts';
+import { addRecent, folderName, footageValue, MAX_RECENTS, moveHighlight, parseRecents, songCount, videoCount } from './browse.ts';
 
 const recent = (folder, over = {}) => ({ folder, path: folder, name: folderName(folder), sample_video: null, ...over });
 
@@ -79,4 +79,12 @@ test('videoCount', () => {
 	assert.equal(videoCount(12), '12 videos');
 	assert.equal(videoCount(12, false), '12+ videos');
 	assert.equal(videoCount(0, false), '…');
+});
+
+test('songCount: songs for the music folder picker', () => {
+	assert.equal(songCount(0), '');
+	assert.equal(songCount(0, false), '…');
+	assert.equal(songCount(1), '1 song');
+	assert.equal(songCount(12, false), '12+ songs');
+	assert.equal(videoCount(2), '2 videos');
 });

@@ -266,15 +266,55 @@ class AppState {
 	/** Chosen song; null = let Vibecut pick one that suits the vibe. */
 	selectedTrackPath = $state<string | null>(null);
 
+	/** Where to put downloaded songs, as the user knows the folder. */
+	musicImportDirDisplay = $state<string | null>(null);
+
+	private setLibrary(lib: api.MusicLibrary) {
+		this.tracks = lib.tracks;
+		this.musicWarnings = lib.warnings ?? [];
+		this.musicImportDir = lib.import_dir ?? null;
+		this.musicImportDirDisplay = lib.import_dir_display ?? lib.import_dir ?? null;
+		this.musicDirs = lib.dirs ?? [];
+	}
+
+	/** Add a folder on a drive to the library (its songs are analysed, so
+	 *  this can take a while for a big folder). Returns what was added. */
+	async addMusicFolder(path: string): Promise<{ path: string; already: boolean }> {
+		this.loadingMusic = true;
+		this.musicError = null;
+		try {
+			const lib = await api.addMusicFolder(path);
+			this.setLibrary(lib);
+			return { path: lib.added?.path ?? path, already: !!lib.added?.already };
+		} finally {
+			this.loadingMusic = false;
+			this.musicLoaded = true;
+			void this.refreshAutoPick(true);
+		}
+	}
+
+	/** Take a picked folder out of the library; nothing on the drive changes. */
+	async removeMusicFolder(path: string) {
+		this.loadingMusic = true;
+		try {
+			const lib = await api.removeMusicFolder(path);
+			this.setLibrary(lib);
+			// A song from that folder can't be the chosen one any more.
+			if (this.selectedTrackPath && !this.tracks.some((t) => t.path === this.selectedTrackPath)) {
+				this.selectedTrackPath = null;
+				this.persist();
+			}
+		} finally {
+			this.loadingMusic = false;
+			void this.refreshAutoPick(true);
+		}
+	}
+
 	async loadMusic() {
 		this.loadingMusic = true;
 		this.musicError = null;
 		try {
-			const lib = await api.listMusic();
-			this.tracks = lib.tracks;
-			this.musicWarnings = lib.warnings ?? [];
-			this.musicImportDir = lib.import_dir ?? null;
-			this.musicDirs = lib.dirs ?? [];
+			this.setLibrary(await api.listMusic());
 		} catch (e) {
 			this.musicError = e instanceof api.ApiError ? e.describe() : String(e);
 		} finally {

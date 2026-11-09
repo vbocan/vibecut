@@ -250,8 +250,24 @@ asks for that); this hasn't been verified on every setup. If a card you
 just inserted is missing, restart the container (`docker compose restart
 vibecut`).
 
+**Music from any drive.** The song step's **Pick a music folder…** opens
+the same dialog, counting songs instead of videos. The folder you pick
+joins the music library where it is (nothing is copied): its songs are
+listed with yours, can be previewed, and renders read them from the
+drive. Vibecut remembers the folders in
+`/projects/.vibecut-music-folders.json`; **Add music → Also reading →
+Remove** takes one out again. A whole drive can't be picked. **Add music**
+also lists sites with free songs you may use in videos (Pixabay Music,
+YouTube Audio Library, Free Music Archive, Incompetech, Mixkit, Uppbeat),
+each with what its licence asks, and shows the music folder's host path
+when `VIBECUT_HOST_PROJECTS` is set (`compose.yml` sets it from an
+absolute `VIBECUT_PROJECTS`).
+
 **Routes.** `GET /api/browse/roots` and `GET /api/browse?path=…`; see
 [CONFIG.md](CONFIG.md#footage-from-any-drive). MCP: `browse_folders`.
+Music folders: `POST /api/music/folders` `{"path": "D:\\Music"}` and
+`POST /api/music/folders/remove` `{"path": …}`; `GET /api/music` marks
+them `"picked": true`.
 
 ## Test the server in isolation
 

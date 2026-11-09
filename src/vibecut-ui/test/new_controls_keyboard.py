@@ -212,7 +212,7 @@ def main() -> int:
         press(page, "Enter", settle=50)
         page.wait_for_selector(".act .empty", timeout=30000)
         page.wait_for_timeout(300)
-        page.locator(".act .empty button").focus()
+        page.locator(".act .empty").get_by_role("button", name="Look again").focus()
         empty[0] = False
         a = press(page, "Enter", settle=50)
         # (A fast answer may already have moved it on to the list.)

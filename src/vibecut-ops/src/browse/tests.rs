@@ -219,6 +219,9 @@ fn listing_counts_videos_hides_system_folders_and_shows_display_paths() {
     for f in ["GX010001.MP4", "GX020001.MP4", "GL010001.LRV", "GX010001.THM", "GL010002.MP4", "phone.mov", "notes.txt"] {
         touch(&trip.join(f));
     }
+    for f in ["Road.mp3", "Night drive.FLAC", ".hidden.mp3"] {
+        touch(&c.join("Users/me/GoPro/Coast").join(f));
+    }
     std::fs::create_dir_all(trip.join("day2")).unwrap();
     touch(&c.join("Users/me/GoPro/Coast/Card A/DCIM/GX010009.MP4"));
     for hidden in ["$RECYCLE.BIN", "System Volume Information", "wsl", "wslg", "node_modules", ".git", "lost+found"] {
@@ -252,6 +255,7 @@ fn listing_counts_videos_hides_system_folders_and_shows_display_paths() {
     assert_eq!(alps.sample_video.as_deref(), Some(trip.join("GX010001.MP4").to_str().unwrap()));
     let coast = &l.folders[1];
     assert_eq!((coast.n_videos, coast.has_subfolders, coast.sample_video.as_deref()), (0, true, None));
+    assert_eq!((alps.n_songs, coast.n_songs), (0, 2), "songs by extension; hidden files don't count");
 
     // Inside the trip: its own videos.
     let l = browse_in(&roots, &trip.to_string_lossy(), TIME_BUDGET).unwrap();

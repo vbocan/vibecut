@@ -189,6 +189,36 @@ mod tests {
         assert!(std::fs::read_dir(root.join(".vibecut-cache")).unwrap().count() >= 1);
     }
 
+    /// A music folder must be a folder under a browse root (never `/etc`,
+    /// a traversal or nothing at all); removing one that isn't picked is a
+    /// 404; and a cross-site form post can't add one.
+    #[tokio::test]
+    async fn music_folders_refuse_what_isnt_a_folder_on_a_drive() {
+        let app = router(AppState::default());
+        for path in ["/etc", "", "/footage/../etc", "C:\\Windows\\..\\..\\etc", "/projects"] {
+            let res = post_json(app.clone(), "/api/music/folders", serde_json::json!({ "path": path })).await;
+            assert!(
+                matches!(res.status(), StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND),
+                "{path:?}: {}",
+                res.status()
+            );
+        }
+        let res = post_json(app.clone(), "/api/music/folders/remove", serde_json::json!({ "path": "/host/z/Nope" })).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/music/folders")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(r#"{"path":"/footage"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
     #[tokio::test]
     async fn music_pick_validates_the_vibe_and_names_a_library_track() {
         let root = test_music_library();

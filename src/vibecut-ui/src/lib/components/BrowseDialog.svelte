@@ -2,18 +2,27 @@
 	import { tick, untrack } from 'svelte';
 	import * as api from '$lib/api';
 	import type { BrowseListing, BrowseRootInfo } from '$lib/api';
-	import { moveHighlight, videoCount } from '$lib/browse';
+	import { moveHighlight, songCount, videoCount } from '$lib/browse';
 
-	// Pick a footage folder anywhere on the computer's drives, one level at
-	// a time. Keyboard: arrows move, Enter (or →) opens a folder, Backspace
-	// (or ←) goes up, Escape closes; the focus goes back to the opener.
+	// Pick a footage (or music) folder anywhere on the computer's drives,
+	// one level at a time. Keyboard: arrows move, Enter (or →) opens a
+	// folder, Backspace (or ←) goes up, Escape closes; the focus goes back
+	// to the opener.
 	let {
 		open = $bindable(false),
+		mode = 'footage',
 		onpick
 	}: {
 		open?: boolean;
+		/** `music`: counts songs instead of videos, no thumbnails. */
+		mode?: 'footage' | 'music';
 		onpick: (choice: { container_path: string; path: string; name: string; sample_video: string | null }) => void;
 	} = $props();
+
+	// Unique per instance: Create has one for footage and one for music.
+	const uid = $props.id();
+	const music = $derived(mode === 'music');
+	const count = (n: number, complete = true) => (music ? songCount(n, complete) : videoCount(n, complete));
 
 	let dialog: HTMLDialogElement | undefined = $state();
 	let listEl: HTMLElement | undefined = $state();
@@ -48,8 +57,8 @@
 					path: f.path,
 					detail: f.has_subfolders ? 'Has folders' : '',
 					kind: 'folder' as const,
-					sample: f.sample_video,
-					videos: videoCount(f.n_videos, f.complete)
+					sample: music ? null : f.sample_video,
+					videos: music ? songCount(f.n_songs, f.complete) : videoCount(f.n_videos, f.complete)
 				}))
 			: roots
 					.filter((r) => r.available)
@@ -64,7 +73,8 @@
 					}))
 	);
 
-	const optId = (i: number) => `browse-opt-${i}`;
+	const optId = (i: number) => `${uid}-opt-${i}`;
+	const hereCount = $derived(listing ? (music ? listing.n_songs : listing.n_videos) : 0);
 	const here = $derived(listing ? listing.path : 'Drives');
 	const status = $derived(
 		loading
@@ -72,7 +82,7 @@
 			: error
 				? error
 				: listing
-					? `${listing.path}: ${items.length} folder${items.length === 1 ? '' : 's'}${listing.n_videos ? `, ${videoCount(listing.n_videos)} here` : ''}${listing.truncated ? ' (some left out)' : ''}`
+					? `${listing.path}: ${items.length} folder${items.length === 1 ? '' : 's'}${hereCount ? `, ${count(hereCount)} here` : ''}${listing.truncated ? ' (some left out)' : ''}`
 					: `${items.length} place${items.length === 1 ? '' : 's'} to look`
 	);
 	const choice = $derived(
@@ -134,7 +144,7 @@
 			if (my !== seq) return;
 			listing = l;
 			active = Math.max(0, items.findIndex((x) => x.key === focusKey));
-			void loadThumbs(l);
+			if (!music) void loadThumbs(l);
 		} catch (e) {
 			if (my !== seq) return;
 			if (e instanceof DOMException && e.name === 'AbortError') return;
@@ -234,11 +244,11 @@
 	}
 </script>
 
-<dialog bind:this={dialog} class="sheet" aria-labelledby="browse-h" onclose={onClose}>
+<dialog bind:this={dialog} class="sheet" aria-labelledby="{uid}-h" onclose={onClose}>
 	<header class="head">
 		<div>
-			<p class="eyebrow">Your footage, anywhere</p>
-			<h2 id="browse-h">Browse your drives</h2>
+			<p class="eyebrow">{music ? 'Your music, anywhere' : 'Your footage, anywhere'}</p>
+			<h2 id="{uid}-h">{music ? 'Pick a music folder' : 'Browse your drives'}</h2>
 		</div>
 		<button class="close" type="button" aria-label="Close" onclick={() => (open = false)}>✕</button>
 	</header>
@@ -273,7 +283,7 @@
 		role="listbox"
 		tabindex="0"
 		aria-label={listing ? `Folders in ${listing.path}` : 'Drives'}
-		aria-describedby="browse-keys"
+		aria-describedby="{uid}-keys"
 		aria-busy={loading}
 		aria-activedescendant={items.length ? optId(active) : undefined}
 		onkeydown={onKey}
@@ -324,7 +334,7 @@
 
 	<p class="sr-only" role="status">{status}</p>
 	{#if error}<p class="error">{error}</p>{/if}
-	<p id="browse-keys" class="keys">
+	<p id="{uid}-keys" class="keys">
 		<kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> open · <kbd>Backspace</kbd> up · <kbd>Esc</kbd> close
 	</p>
 
@@ -333,10 +343,10 @@
 			{#if listing}
 				{#if !listing.can_use}
 					Open a folder on this drive
-				{:else if listing.n_videos}
-					<strong>{videoCount(listing.n_videos)}</strong> in this folder
+				{:else if hereCount}
+					<strong>{count(hereCount)}</strong> in this folder{music ? ', and in its folders' : ''}
 				{:else}
-					Videos in its folders count too
+					{music ? 'Songs in its folders count too' : 'Videos in its folders count too'}
 				{/if}
 			{:else}
 				Pick a drive

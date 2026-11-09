@@ -156,3 +156,62 @@ export function trackForPath(
 		loud_region: [0, 0]
 	};
 }
+
+/** A site to download songs from, and what its licence asks of the user. */
+export interface MusicSource {
+	name: string;
+	url: string;
+	/** What the free licence lets you do, in a few words. */
+	terms: string;
+	/** `ok`: no credit; `credit`: credit the artist; `caution`: read the terms. */
+	tone: LicenceTone;
+	badge: string;
+}
+
+/** Where to get songs Vibecut may use in your videos. Vibecut can't ship
+ *  these (the sites forbid passing the files on), so the user downloads
+ *  them and puts them in a music folder. Terms as of November 2026. */
+export const MUSIC_SOURCES: readonly MusicSource[] = [
+	{
+		name: 'Pixabay Music',
+		url: 'https://pixabay.com/music/',
+		terms: 'Free, no credit needed. A few tracks are registered with YouTube Content ID (shield icon): keep their certificate in case of a claim.',
+		tone: 'ok',
+		badge: 'No credit'
+	},
+	{
+		name: 'YouTube Audio Library',
+		url: 'https://www.youtube.com/audiolibrary',
+		terms: 'Free in YouTube Studio; some tracks ask for a credit (it says which). Made for YouTube videos.',
+		tone: 'credit',
+		badge: 'Some need credit'
+	},
+	{
+		name: 'Free Music Archive',
+		url: 'https://freemusicarchive.org/',
+		terms: 'Pick tracks marked CC0 (no conditions) or CC BY (credit the artist). Skip NC tracks if your video earns money.',
+		tone: 'credit',
+		badge: 'CC0 / CC BY'
+	},
+	{
+		name: 'Incompetech (Kevin MacLeod)',
+		url: 'https://incompetech.com/music/royalty-free/music.html',
+		terms: 'CC BY 4.0: free, monetised videos allowed, credit required.',
+		tone: 'credit',
+		badge: 'Credit'
+	},
+	{
+		name: 'Mixkit',
+		url: 'https://mixkit.co/free-stock-music/',
+		terms: 'Free under the Mixkit licence, no credit needed.',
+		tone: 'ok',
+		badge: 'No credit'
+	},
+	{
+		name: 'Uppbeat',
+		url: 'https://uppbeat.io/',
+		terms: 'Free account: a few downloads a month, credit required. Read its licence before posting.',
+		tone: 'caution',
+		badge: 'Account, credit'
+	}
+];

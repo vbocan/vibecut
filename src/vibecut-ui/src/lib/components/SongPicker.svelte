@@ -6,6 +6,7 @@
 	import { radiogroup } from '$lib/radiogroup';
 	import EnergyBars from './EnergyBars.svelte';
 	import MusicImport from './MusicImport.svelte';
+	import MusicFolderButton from './MusicFolderButton.svelte';
 	import PendingChangeOffer from './PendingChangeOffer.svelte';
 	import { collectionLabel, licenceBadge } from '$lib/music';
 
@@ -95,6 +96,23 @@
 	// it was pressed on, so the focus moves to the song that is picked and
 	// the outcome is read from this component's own status line.
 	let lookNote = $state('');
+	async function folderAdded(message: string) {
+		lookNote = message;
+		if (s.tracks.length > 0) {
+			await tick();
+			list?.querySelector<HTMLElement>('[role="radio"][aria-checked="true"], [role="radio"]')?.focus();
+		}
+	}
+	/** The "Add music" panel, opened from the empty state too. */
+	let importOpen = $state(false);
+	let root: HTMLElement | undefined = $state();
+	async function showSources() {
+		importOpen = true;
+		await tick();
+		const first = root?.querySelector<HTMLElement>('.find a');
+		first?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+		first?.focus();
+	}
 	async function lookAgain() {
 		if (s.loadingMusic) return;
 		lookNote = 'Looking for songs…';
@@ -113,7 +131,7 @@
 	});
 </script>
 
-<section class="act" class:compact aria-labelledby={compact ? undefined : 'song-h'} aria-label={compact ? 'Song' : undefined}>
+<section bind:this={root} class="act" class:compact aria-labelledby={compact ? undefined : 'song-h'} aria-label={compact ? 'Song' : undefined}>
 	{#if !compact}
 		<div class="act-head">
 			<span class="num" aria-hidden="true">3</span>
@@ -132,13 +150,18 @@
 		<div class="empty glass">
 			<strong>Your music library is empty.</strong>
 			<span
-				>Put MP3, WAV or M4A files in the <code>projects/music</code> folder — Vibecut works out their
-				tempo, beats and energy automatically. Without a song, videos keep their own sound.</span
+				>Pick a folder of songs on any drive, or download free ones and save them in
+				<code>{s.musicImportDirDisplay ?? 'projects/music'}</code> — Vibecut works out their tempo, beats and
+				energy automatically. Without a song, videos keep their own sound.</span
 			>
-			<!-- aria-disabled keeps the focus on the button while it looks. -->
-			<button class="btn" type="button" aria-disabled={s.loadingMusic} onclick={lookAgain}
-				>{s.loadingMusic ? 'Looking…' : 'Look again'}</button
-			>
+			<div class="empty-actions">
+				<MusicFolderButton variant="primary" onresult={folderAdded} />
+				<button class="btn ghost" type="button" onclick={showSources}>Where to get free music</button>
+				<!-- aria-disabled keeps the focus on the button while it looks. -->
+				<button class="btn ghost" type="button" aria-disabled={s.loadingMusic} onclick={lookAgain}
+					>{s.loadingMusic ? 'Looking…' : 'Look again'}</button
+				>
+			</div>
 		</div>
 	{:else}
 		<div class="moods" role="radiogroup" aria-label="Filter by mood" use:radiogroup>
@@ -251,7 +274,7 @@
 	<p class="sr-only" role="status">{lookNote}</p>
 	<!-- One import view for every state of the list, so the panel the user
 	     opened (and the focus in it) stays put while the library reloads. -->
-	<MusicImport />
+	<MusicImport bind:open={importOpen} />
 </section>
 
 <style>
@@ -545,6 +568,13 @@
 		gap: 8px;
 		padding: 18px 20px;
 		color: var(--text-dim);
+	}
+
+	.empty-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
 	}
 
 	.empty strong {

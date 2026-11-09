@@ -432,6 +432,8 @@ pub struct BrowseEntry {
     pub container_path: String,
     /// Videos directly inside (not below).
     pub n_videos: u32,
+    /// Songs (audio files) directly inside, for picking a music folder.
+    pub n_songs: u32,
     pub has_subfolders: bool,
     /// One of those videos, for a thumbnail (container path).
     pub sample_video: Option<String>,
@@ -459,10 +461,31 @@ pub struct BrowseListing {
     pub can_use: bool,
     /// Videos directly inside.
     pub n_videos: u32,
+    /// Songs directly inside.
+    pub n_songs: u32,
     pub sample_video: Option<String>,
     pub folders: Vec<BrowseEntry>,
     /// Some subfolders were left out (huge folder).
     pub truncated: bool,
+}
+
+/// The container folder a display or container path names, with every
+/// check [`resolve_in`] makes, and its display path. For picking a music
+/// folder; a whole drive (or a folder holding drives) is refused, since
+/// the library reads every song below the folder.
+pub fn resolve_folder(input: &str) -> Result<(PathBuf, String), OpsError> {
+    let roots = roots();
+    let Resolved { root, rel } = resolve_in(&roots, input)?;
+    let r = &roots[root];
+    let dir = r.container_of(&rel);
+    if let Err(e) = check_footage_folder_in(&roots, &dir) {
+        let what = match e {
+            OpsError::InvalidInput { message, .. } => message,
+            other => return Err(other),
+        };
+        return Err(OpsError::invalid_with_hint(what, "pick the folder that holds your songs"));
+    }
+    Ok((dir, r.display_of(&rel)))
 }
 
 /// The configured roots.
@@ -497,6 +520,7 @@ pub async fn browse(path: &str) -> Result<BrowseListing, OpsError> {
 #[derive(Default)]
 struct Scan {
     n_videos: u32,
+    n_songs: u32,
     sample: Option<String>,
     dirs: Vec<String>,
     capped: bool,
@@ -529,6 +553,8 @@ fn scan(dir: &Path, max: usize) -> Scan {
             if s.sample.as_deref().map_or(true, |cur| name < cur) {
                 s.sample = Some(name.to_string());
             }
+        } else if ft.is_file() && crate::music::is_audio_name(name) {
+            s.n_songs += 1;
         }
     }
     s
@@ -553,11 +579,11 @@ fn browse_in(roots: &[BrowseRoot], input: &str, budget: Duration) -> Result<Brow
             let mut child = rel.clone();
             child.push(name.clone());
             let container = r.container_of(&child);
-            let (n_videos, has_subfolders, sample, complete) = if started.elapsed() < budget {
+            let (n_videos, n_songs, has_subfolders, sample, complete) = if started.elapsed() < budget {
                 let s = scan(&container, MAX_CHILD_ENTRIES);
-                (s.n_videos, !s.dirs.is_empty(), s.sample, !s.capped)
+                (s.n_videos, s.n_songs, !s.dirs.is_empty(), s.sample, !s.capped)
             } else {
-                (0, false, None, false)
+                (0, 0, false, None, false)
             };
             BrowseEntry {
                 path: r.display_of(&child),
@@ -565,6 +591,7 @@ fn browse_in(roots: &[BrowseRoot], input: &str, budget: Duration) -> Result<Brow
                 container_path: container.to_string_lossy().into_owned(),
                 name,
                 n_videos,
+                n_songs,
                 has_subfolders,
                 complete,
             }
@@ -584,6 +611,7 @@ fn browse_in(roots: &[BrowseRoot], input: &str, budget: Duration) -> Result<Brow
         crumbs,
         can_use: !(rel.is_empty() && r.kind == RootKind::Drive),
         n_videos: here.n_videos,
+        n_songs: here.n_songs,
         sample_video: here.sample.map(|f| dir.join(f).to_string_lossy().into_owned()),
         folders,
         truncated,

@@ -91,6 +91,15 @@ export function moveHighlight(key: string, current: number, n: number, page = 8)
 
 /** "12 videos", "1 video", "" for none. A lower bound gets a "+". */
 export function videoCount(n: number, complete = true): string {
+	return count(n, complete, 'video');
+}
+
+/** "12 songs", "1 song", "" for none. A lower bound gets a "+". */
+export function songCount(n: number, complete = true): string {
+	return count(n, complete, 'song');
+}
+
+function count(n: number, complete: boolean, noun: string): string {
 	if (n <= 0) return complete ? '' : '…';
-	return `${n}${complete ? '' : '+'} video${n === 1 ? '' : 's'}`;
+	return `${n}${complete ? '' : '+'} ${noun}${n === 1 ? '' : 's'}`;
 }
