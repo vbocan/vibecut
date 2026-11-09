@@ -2,6 +2,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { prettyBytes } from '$lib/vibes';
 	import { sourceColor } from '$lib/colors';
+	import { shortClipName } from '$lib/clipname';
 	import { radiogroup, selectedByArrow } from '$lib/radiogroup';
 	import BrowseDialog from './BrowseDialog.svelte';
 
@@ -169,7 +170,7 @@
 							</div>
 							<span class="clip-meta">
 								<span class="dot"></span>
-								<span class="mono">{src.source_id}</span>
+								<span class="mono id" title={src.source_id}>{shortClipName(src.source_id, src.has_audio ? 15 : 11)}</span>
 								<span class="dur">{Math.round(src.total_duration_secs)}s</span>
 								{#if !src.has_audio}<span class="muted" title="No sound in this clip">muted</span>{/if}
 							</span>
@@ -455,11 +456,21 @@
 		display: flex;
 		align-items: center;
 		gap: 6px;
+		min-width: 0;
 		font-size: var(--fs-xs);
 		color: var(--text-dim);
 	}
 
+	/* Long camera names (DJI, phones) stay inside their column. */
+	.id {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
 	.dot {
+		flex-shrink: 0;
 		width: 8px;
 		height: 8px;
 		border-radius: 50%;
@@ -468,9 +479,11 @@
 
 	.dur {
 		margin-left: auto;
+		flex-shrink: 0;
 	}
 
 	.muted {
+		flex-shrink: 0;
 		color: var(--warn);
 	}
 
