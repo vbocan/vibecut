@@ -67,7 +67,11 @@ models_dir      = "models"             # optional; where ONNX model files live (
 `models_dir` points at a folder that may contain `silero_vad.onnx` (and
 future face / scene-detection nets). The pipeline auto-loads any model
 present and gracefully skips ML features when files are missing — no
-explicit on/off switch.
+explicit on/off switch. A relative `models_dir` is relative to the
+working directory. A model missing there is looked up next in each folder
+of `$VIBECUT_MODELS_DIR` (separated like `PATH`), then in `/app/models`,
+where the Docker image ships `silero_vad.onnx`; the render log says which
+copy it loaded.
 
 ---
 
@@ -253,7 +257,7 @@ bg_color = "#000000"                     # ignored in overlay mode (default: #00
 [[intro.layers]]
 kind         = "text"                    # required: "text" | "image"
 content      = "Costa Rica · 2026"       # also accepted as `text = "..."`
-font         = "arialbd.ttf"             # absolute path or Windows Fonts/<name> (optional)
+font         = "arialbd.ttf"             # file name, family or path; see Fonts below (default: Inter / DejaVu Sans)
 size         = 96                        # default: 96
 size_end     = 110                       # optional; if set & ≠ size, fontsize ramps linearly across visibility window ("growing text")
 color        = "#FFFFFF"                 # default: #FFFFFF
@@ -305,6 +309,50 @@ inside the window.
 from `size`, the font size linearly interpolates from `size` to
 `size_end` across the layer's visibility window. Common pattern for
 emphasis: title grows 80 → 110 px while it fades in.
+
+### Fonts
+
+A text layer's `font` is looked up in this order; the first hit wins:
+
+1. a path to an existing file, absolute or relative to the working
+   directory;
+2. a file of that name in `$VIBECUT_FONTS_DIR` (one or more folders,
+   separated like `PATH`, searched recursively);
+3. a file of that name in the system font folders (`C:/Windows/Fonts`
+   and the per-user fonts folder on Windows; `/usr/share/fonts`,
+   `/usr/local/share/fonts`, `~/.local/share/fonts` on Linux;
+   `/Library/Fonts`, `/System/Library/Fonts` on macOS);
+4. fontconfig's `fc-match`, where it is installed (Linux, the Docker
+   image).
+
+File names match case-insensitively and the extension is optional and
+interchangeable: `"Inter-Bold.ttf"`, `"Inter-Bold"` and
+`"inter-bold.otf"` all find `Inter-Bold.otf`. Through fontconfig you can
+also name a family, optionally with a style: `"Bebas Neue"`,
+`"Inter:bold"`, `"Inter Display:style=Black"`. Windows file names such as
+`arial.ttf` / `arialbd.ttf` / `times.ttf` / `cour.ttf` map to their
+families there, which fontconfig serves with the metric-compatible
+Liberation fonts when the originals aren't installed.
+
+With no `font`, a layer uses the first installed of `Inter-Regular`,
+`DejaVuSans` and `arial`, then fontconfig's `sans-serif`. A font that
+can't be found falls back to fontconfig's closest match, or to that
+default, and the render log names the font that stood in. If nothing at
+all is found, a warning says so and ffmpeg picks, which fails on ffmpeg
+builds without fontconfig.
+
+The Docker image ships these families (see [DOCKER.md](DOCKER.md#fonts-and-models)):
+
+| Family | File names | |
+|---|---|---|
+| Inter | `Inter-Thin` … `Inter-Regular` … `Inter-Black`, plus `…Italic` | The default face. |
+| Inter Display | `InterDisplay-Thin` … `InterDisplay-Black`, plus `…Italic` | Inter tuned for large sizes. |
+| Bebas Neue | `BebasNeue-Thin`, `-Light`, `-Book`, `-Regular`, `-Bold` | Condensed all-caps display face. |
+| DejaVu Sans / Serif / Sans Mono | `DejaVuSans`, `DejaVuSans-Bold`, `DejaVuSerif`, `DejaVuSerif-Bold`, `DejaVuSansMono`, `DejaVuSansMono-Bold` | |
+| Liberation Sans / Serif / Mono | `LiberationSans-Regular`, `-Bold`, `-Italic`, `-BoldItalic` (same for Serif, Mono) | Stand in for Arial, Times New Roman, Courier New. |
+
+Your own fonts go in `<projects>/fonts` (the image's `$VIBECUT_FONTS_DIR`)
+and are named by file name.
 
 **`mode = "overlay"`** draws the layers on top of the first selected
 segment (intro) or last segment (outro) — no separate clip is generated.
@@ -507,16 +555,21 @@ There's no separate `[ml]` section anymore — the pipeline always tries to
 load any model files it finds and gracefully skips ML behaviour when
 they're missing.
 
-- **Model location**: `[project].models_dir` (default `"models"`).
+- **Model location**: `[project].models_dir` (default `"models"`), then
+  `$VIBECUT_MODELS_DIR`, then `/app/models` (the Docker image's bundled
+  Silero VAD v6.2).
 - **Tuning knobs**: live with the feature they affect (e.g.
   `[soundtrack].vad_speech_weight` controls speech-driven duck-window
   selection).
 - **Runtime**: ONNX Runtime probes CUDA EP first and falls back to CPU
   automatically. No configuration needed.
 
-To enable speech-driven ducking, drop `silero_vad.onnx` into your
-`models_dir`. To disable any ML feature, remove the corresponding model
-file (or move it elsewhere).
+To enable speech-driven ducking outside Docker, drop `silero_vad.onnx`
+(from [snakers4/silero-vad](https://github.com/snakers4/silero-vad),
+`src/silero_vad/data/`, v5 or later) into your `models_dir`. To disable
+any ML feature, remove the corresponding model file (or move it
+elsewhere); for the model the Docker image bundles, set
+`[soundtrack].vad_speech_weight = 0` instead.
 
 ---
 

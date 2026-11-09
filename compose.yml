@@ -48,13 +48,20 @@ services:
         source: vibecut-cache
         target: /cache
     environment:
-      RUST_LOG: ${RUST_LOG:-vibecut_mcp=info,vibecut_web=info,vibecut_ops=info,rmcp=info}
+      RUST_LOG: ${RUST_LOG:-vibecut_mcp=info,vibecut_web=info,vibecut_ops=info,vibecut=info,rmcp=info}
       VIBECUT_LOG: ${VIBECUT_LOG:-info}
       # Optional — only needed for the web UI's free-text brief
       # ("Ask AI") feature. Unset by default; that feature returns a
       # clear error rather than the server failing to start.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       VIBECUT_LLM_MODEL: ${VIBECUT_LLM_MODEL:-claude-sonnet-5}
+      # Container paths of your own title-card fonts and ONNX models,
+      # searched before the fonts and the Silero VAD model baked into the
+      # image. The defaults are folders on the projects mount: create
+      # <projects>/fonts or <projects>/models only to add or override
+      # something (see DOCKER.md, "Fonts and models").
+      VIBECUT_FONTS_DIR: ${VIBECUT_FONTS_DIR:-/projects/fonts}
+      VIBECUT_MODELS_DIR: ${VIBECUT_MODELS_DIR:-/projects/models}
 
 volumes:
   vibecut-cache:

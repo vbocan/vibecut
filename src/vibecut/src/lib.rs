@@ -17,6 +17,7 @@ pub mod beat_lock;
 pub mod beat_sync;
 pub mod benchmark;
 pub mod disk_cache;
+pub mod fonts;
 pub mod rng;
 pub mod gopro_metadata;
 pub mod media_probe;

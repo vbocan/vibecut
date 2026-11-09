@@ -128,7 +128,9 @@ pub struct Project {
     /// Directory holding ONNX model files (`silero_vad.onnx`, future face /
     /// scene-detection nets). The pipeline auto-loads any model present;
     /// when missing it warns and gracefully falls back to non-ML behaviour.
-    /// Default `"models"` relative to the working directory.
+    /// Default `"models"` relative to the working directory. A model not
+    /// found here is looked up in `$VIBECUT_MODELS_DIR`, then `/app/models`
+    /// (see `ml_engine::ModelDirs`).
     #[serde(default = "default_models_dir")]
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub models_dir: Utf8PathBuf,

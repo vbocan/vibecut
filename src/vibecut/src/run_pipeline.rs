@@ -1746,16 +1746,11 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
             // ONNX runtime fails to initialise. CUDA EP is probed first; if
             // unavailable, automatic CPU fallback.
             let mut ml_engine: Option<crate::ml_engine::MlEngine> = None;
-            let vad_path = cfg.project.models_dir.join("silero_vad.onnx");
-            if !vad_path.as_std_path().exists() {
-                tracing::info!(
-                    path = %vad_path,
-                    "silero_vad.onnx not found; speech-driven ducking disabled. \
-                     Download from https://github.com/snakers4/silero-vad and place \
-                     it in `{models_dir}` to enable.",
-                    models_dir = cfg.project.models_dir
-                );
-            } else {
+            // [project].models_dir → $VIBECUT_MODELS_DIR → /app/models.
+            let vad_model = crate::ml_engine::find_silero_vad(
+                &crate::ml_engine::ModelDirs::from_env(&cfg.project.models_dir),
+            );
+            if let Some(vad_path) = vad_model {
                 match crate::ml_engine::MlEngine::new() {
                     Ok(mut eng) => {
                         println!("  ML engine: {} EP", eng.ep_name());
@@ -2419,20 +2414,11 @@ fn parse_iso_seconds(s: &str) -> Option<f64> {
     Some(days_since_epoch as f64 * 86400.0 + hh as f64 * 3600.0 + mm as f64 * 60.0 + ss)
 }
 
+/// A text layer's `font` → drawtext `fontfile`, through the lookup chain in
+/// [`crate::fonts`] (path, `$VIBECUT_FONTS_DIR`, system fonts, fontconfig,
+/// then a sans-serif default).
 fn resolve_font(name: Option<&str>) -> Option<camino::Utf8PathBuf> {
-    let name = name?;
-    let p = camino::Utf8PathBuf::from(name);
-    if p.is_absolute() {
-        return Some(p);
-    }
-    #[cfg(windows)]
-    {
-        let win_font = camino::Utf8PathBuf::from(format!("C:/Windows/Fonts/{name}"));
-        if win_font.as_std_path().exists() {
-            return Some(win_font);
-        }
-    }
-    None
+    crate::fonts::resolve_font(name)
 }
 
 
