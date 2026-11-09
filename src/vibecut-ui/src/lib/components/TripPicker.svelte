@@ -3,9 +3,12 @@
 	import { prettyBytes } from '$lib/vibes';
 	import { sourceColor } from '$lib/colors';
 	import { radiogroup, selectedByArrow } from '$lib/radiogroup';
+	import BrowseDialog from './BrowseDialog.svelte';
 
 	let manual = $state('');
 	let showManual = $state(false);
+	let browsing = $state(false);
+	const recents = $derived(s.recentTrips);
 
 	/** `defer`: arrowed onto, so the scan waits until the arrows stop. */
 	function pick(folder: string, defer = false) {
@@ -43,10 +46,14 @@
 	<div class="act-head">
 		<span class="num" aria-hidden="true">1</span>
 		<h2 id="trip-h">Pick your footage</h2>
+		<button class="btn small browse" type="button" aria-haspopup="dialog" onclick={() => (browsing = true)}>
+			Browse your drives…
+		</button>
 		<button class="btn ghost small" type="button" aria-expanded={showManual} onclick={() => (showManual = !showManual)}>
 			{showManual ? 'Hide' : 'Type a folder'}
 		</button>
 	</div>
+	<BrowseDialog bind:open={browsing} onpick={(c) => s.pickBrowsed(c)} />
 
 	{#if showManual}
 		<form
@@ -56,7 +63,7 @@
 				if (manual.trim()) pick(manual.trim());
 			}}
 		>
-			<label class="sr-only" for="manual-folder">Folder under /footage</label>
+			<label class="sr-only" for="manual-folder">Folder under /footage, or a full path such as D:\GoPro\Alps</label>
 			<input id="manual-folder" placeholder="Folder under /footage, e.g. trips/alps" bind:value={manual} />
 			<button class="btn" type="submit" disabled={!manual.trim()}>Open</button>
 		</form>
@@ -68,11 +75,14 @@
 		</div>
 	{:else if s.footageError}
 		<p class="error">Couldn't list your footage — {s.footageError}</p>
-	{:else if s.footage.length === 0}
+	{:else if s.footage.length === 0 && recents.length === 0}
 		<div class="empty glass">
 			<strong>No footage yet.</strong>
 			<span>Copy your GoPro or DJI clips into a folder inside the <code>footage</code> mount, then
-				<button class="link" type="button" onclick={() => s.loadFootage()}>refresh</button>.</span
+				<button class="link" type="button" onclick={() => s.loadFootage()}>refresh</button> — or
+				<button class="link" type="button" aria-haspopup="dialog" onclick={() => (browsing = true)}
+					>browse your drives</button
+				> for them.</span
 			>
 		</div>
 	{:else}
@@ -101,6 +111,32 @@
 						>
 					</span>
 					{#if s.folder === f.folder}<span class="check" aria-hidden="true">✓</span>{/if}
+				</button>
+			{/each}
+			{#each recents as r, i (r.folder)}
+				{@const poster = s.folderPosters[r.folder]}
+				<button
+					type="button"
+					role="radio"
+					aria-checked={s.folder === r.folder}
+					aria-describedby="recent-{i}"
+					class="trip"
+					class:selected={s.folder === r.folder}
+					style="--i: {s.footage.length + i}"
+					onclick={(e) => pick(r.folder, selectedByArrow(e))}
+				>
+					<span class="poster" class:loaded={!!poster}>
+						{#if poster}<img src={poster} alt="" />{/if}
+					</span>
+					<span class="shade"></span>
+					<span class="tag" aria-hidden="true">Recent</span>
+					<span class="meta">
+						<span class="name">{r.name}</span>
+						<span class="facts mono path" id="recent-{i}" title={r.path}
+							><span class="sr-only">Recently browsed: </span>{r.path}</span
+						>
+					</span>
+					{#if s.folder === r.folder}<span class="check" aria-hidden="true">✓</span>{/if}
 				</button>
 			{/each}
 		</div>
@@ -187,6 +223,31 @@
 	.manual {
 		display: flex;
 		gap: 8px;
+	}
+
+	.browse {
+		border-color: var(--line-strong);
+	}
+
+	.tag {
+		position: absolute;
+		top: 12px;
+		left: 12px;
+		padding: 3px 9px;
+		border-radius: 999px;
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		background: rgba(7, 8, 12, 0.7);
+		border: 1px solid var(--line-strong);
+		color: var(--cyan);
+	}
+
+	.path {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.manual input {

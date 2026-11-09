@@ -1867,6 +1867,7 @@ async fn apply_in(projects_root: &Path, args: ApplyArgs<'_>, tracks: Vec<TrackIn
     if !folder.exists() {
         return Err(OpsError::not_found_with("footage folder", folder.to_string_lossy().into_owned()));
     }
+    crate::browse::check_footage_folder(&folder)?;
     let vibe = vibe_of(&recipe)?;
     let style = summarize(&recipe)?;
     let trip = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "edit".into());

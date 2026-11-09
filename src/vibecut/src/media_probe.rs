@@ -337,6 +337,17 @@ pub fn discover(folder: &Utf8Path, include: &[String]) -> Result<Vec<Utf8PathBuf
     Ok(out)
 }
 
+/// True for a file name [`discover`] picks up with no include patterns:
+/// the default video extensions (`.mp4` / `.mov`, any case), camera
+/// proxies and thumbnails ([`is_gopro_sidecar`]) excepted. For listing
+/// folders without walking them through [`discover`].
+pub fn is_default_video_name(file_name: &str) -> bool {
+    let Some((_, ext)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    extensions_from_patterns(&[]).iter().any(|e| e.eq_ignore_ascii_case(ext)) && !is_gopro_sidecar(file_name)
+}
+
 fn extensions_from_patterns(patterns: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for p in patterns {
@@ -715,6 +726,16 @@ mod tests {
     fn extensions_default_when_empty() {
         let exts = extensions_from_patterns(&[]);
         assert!(exts.iter().any(|e| e.eq_ignore_ascii_case("mp4")));
+    }
+
+    #[test]
+    fn default_video_names_match_discover_rules() {
+        for yes in ["GX010001.MP4", "clip.mov", "a.b.Mp4", "GOPR0042.MP4", "DJI_0001.MOV"] {
+            assert!(is_default_video_name(yes), "{yes}");
+        }
+        for no in ["GL010001.MP4", "GL010001.LRV", "GX010001.THM", "x.LRF", "notes.txt", "mp4", "song.mp3"] {
+            assert!(!is_default_video_name(no), "{no}");
+        }
     }
 
     #[test]

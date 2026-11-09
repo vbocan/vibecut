@@ -295,7 +295,7 @@ def main() -> int:
         press(page, "Enter")
         check(focus_tag(page) == "main", f"skip link: focus moves to main ({focus_tag(page)!r})")
         a = press(page, "Tab")
-        check(a is not None and a["name"] == "Type a folder", f"skip link: the next Tab reaches main's first control ({a and a['name']!r})")
+        check(a is not None and a["name"] == "Browse your drives…", f"skip link: the next Tab reaches main's first control ({a and a['name']!r})")
         check(main_tabindex(page) is None, "skip link: main is focusable only while it has the focus")
         page.click("#vibe-h")
         check(focus_tag(page) != "main", f"click on the 'Choose a vibe' heading doesn't focus main ({focus_tag(page)!r})")

@@ -22,7 +22,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use vibecut_ops::error::OpsError;
-use vibecut_ops::{discover, feedback, frames, jobs, logger, propose, recipe, render};
+use vibecut_ops::{browse, discover, feedback, frames, jobs, logger, propose, recipe, render};
 
 #[derive(Clone)]
 pub struct VibecutMcpServer {
@@ -47,11 +47,22 @@ impl Default for VibecutMcpServer {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DiscoverArgs {
-    /// Folder name relative to the container's `/footage` mount, or an
-    /// absolute container path. Pass `""` (or omit) to scan the whole
+    /// Folder name relative to the container's `/footage` mount, an
+    /// absolute container path, or a path `browse_folders` returned
+    /// (a folder on a host drive). Pass `""` (or omit) to scan the whole
     /// `/footage` mount.
     #[serde(default)]
     pub folder: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct BrowseArgs {
+    /// A folder to list: a root's path as `browse_folders` returns it
+    /// (`D:\`, `/footage`), anything below one (`D:\GoPro\Alps`), or
+    /// the container path. Omit (or `""`) to list the roots: `/footage`
+    /// and the host's drives when they are mounted.
+    #[serde(default)]
+    pub path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -356,6 +367,27 @@ impl VibecutMcpServer {
             Ok(r) => Ok(serde_json::to_string_pretty(&r).unwrap_or_else(|_| "{}".into())),
             Err(e) => ops_error_to_string_result(e),
         }
+    }
+
+    /// Walk the host's drives to find a footage folder, one level at a
+    /// time. Read-only.
+    #[tool(description = "List folders the footage can come from, one level at a time: without `path`, the roots (/footage and, when mounted, the host's drives as C:\\, D:\\ …); with `path`, that folder's subfolders, each with its path, the number of videos directly inside and whether it has subfolders. Pass a folder's `path` (or `container_path`) to discover_sources / propose_vibe. Hidden and system folders are left out; a whole drive can't be used as a footage folder.")]
+    async fn browse_folders(&self, Parameters(args): Parameters<BrowseArgs>) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result = if args.path.trim().is_empty() {
+            match browse::list_roots().await {
+                Ok(roots) => Ok(serde_json::to_string_pretty(&serde_json::json!({ "roots": roots })).unwrap_or_else(|_| "{}".into())),
+                Err(e) => ops_error_to_string_result(e),
+            }
+        } else {
+            match browse::browse(&args.path).await {
+                Ok(l) => Ok(serde_json::to_string_pretty(&l).unwrap_or_else(|_| "{}".into())),
+                Err(e) => ops_error_to_string_result(e),
+            }
+        };
+        self.log_string_call("browse_folders", args_json, &result, started);
+        result
     }
 
     /// List the curated vibes the server can propose. Use this when the

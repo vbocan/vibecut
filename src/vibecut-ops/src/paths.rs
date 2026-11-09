@@ -9,12 +9,20 @@ pub const FOOTAGE_ROOT: &str = "/footage";
 pub const PROJECTS_ROOT: &str = "/projects";
 
 /// Resolve a user-supplied footage path against `/footage`. Empty or
-/// `"."` means "the whole mount".
+/// `"."` means "the whole mount". A browse root's display path (`D:\GoPro`,
+/// see [`crate::browse`]) names the folder under its container path; an
+/// absolute path that exists is taken as it is.
 pub fn resolve_footage(p: &str) -> PathBuf {
     if p.is_empty() || p == "." {
         return PathBuf::from(FOOTAGE_ROOT);
     }
     let path = PathBuf::from(p);
+    if path.is_absolute() && path.exists() {
+        return path;
+    }
+    if let Some(mapped) = crate::browse::display_to_container(&crate::browse::roots(), p) {
+        return mapped;
+    }
     if path.is_absolute() {
         path
     } else {

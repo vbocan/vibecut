@@ -13,6 +13,8 @@ import { decideChange, decideFinish } from './changes';
 import { matchFrames, thumbRequests } from './storyboard';
 import { extractStyleCode } from './stylecode';
 import { applyWatchEvent, reelNotification, reelTitle } from './watch';
+import { addRecent, folderName, footageValue, parseRecents, RECENTS_KEY } from './browse';
+import type { RecentFolder } from './browse';
 import { offeredYear, recapProposal, recapRemakeArgs, recapTiles, scaledRecapLength, thumbKey } from './recap';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
@@ -89,6 +91,14 @@ const STORAGE_KEY = 'vibecut.session.v1';
 /** Pro settings → Fast previews (on unless switched off). */
 const FAST_PREVIEWS_KEY = 'vibecut.fastPreviews';
 
+function readRecents(): RecentFolder[] {
+	try {
+		return parseRecents(localStorage.getItem(RECENTS_KEY));
+	} catch {
+		return [];
+	}
+}
+
 function readFastPreviews(): boolean {
 	try {
 		return localStorage.getItem(FAST_PREVIEWS_KEY) !== 'off';
@@ -144,9 +154,47 @@ class AppState {
 		}
 	}
 
+	// ---------- Folders picked from the drives ----------
+	/** The last few folders chosen with "Browse your drives…", newest first. */
+	recentFolders = $state<RecentFolder[]>(readRecents());
+
+	/** Recents the trip list shows: those not already a footage card. */
+	get recentTrips(): RecentFolder[] {
+		return this.recentFolders.filter((r) => !this.footage.some((f) => f.folder === r.folder));
+	}
+
+	/** The name the selected footage goes by. */
+	get folderLabel(): string {
+		return (
+			this.footage.find((f) => f.folder === this.folder)?.name ??
+			this.recentFolders.find((r) => r.folder === this.folder)?.name ??
+			folderName(this.folder)
+		);
+	}
+
+	/** Use a folder picked in the browse dialog, exactly like a trip card. */
+	pickBrowsed(choice: { container_path: string; path: string; name: string; sample_video: string | null }) {
+		const folder = footageValue(choice.container_path);
+		this.recentFolders = addRecent(this.recentFolders, {
+			folder,
+			path: choice.path,
+			name: folder === '' ? 'All footage' : choice.name,
+			sample_video: choice.sample_video
+		});
+		try {
+			localStorage.setItem(RECENTS_KEY, JSON.stringify(this.recentFolders));
+		} catch {
+			/* private mode: the recents just won't survive a reload */
+		}
+		this.selectFolder(folder);
+		this.persist();
+		void this.loadFolderPosters();
+	}
+
 	private async loadFolderPosters() {
+		const withPoster: { folder: string; sample_video: string | null }[] = [...this.footage, ...this.recentFolders];
 		await runLimited(
-			this.footage.filter((f) => f.sample_video && !this.folderPosters[f.folder]),
+			withPoster.filter((f) => f.sample_video && !this.folderPosters[f.folder]),
 			3,
 			async (f) => {
 				try {

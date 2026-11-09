@@ -14,6 +14,7 @@
 //! the transport-specific packaging (MCP `Content`, `ErrorData`,
 //! `ToolRouter`) was left behind in that crate.
 
+pub mod browse;
 pub mod config_io;
 pub mod discover;
 pub mod error;

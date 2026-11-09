@@ -43,6 +43,23 @@ services:
       - type: bind
         source: ${VIBECUT_PROJECTS:-./projects}
         target: /projects
+      # The host's drives, read-only, for "Browse your drives…" on the
+      # Create screen (GET /api/browse): footage can then come from any
+      # folder on C:, D:, E: … without copying it into /footage. The
+      # default is Docker Desktop's (Windows/WSL2) view of every host drive,
+      # which shows up as /host/c, /host/d, …; rslave lets drives the host
+      # mounts later propagate in. On Linux set VIBECUT_HOST_DRIVES=/ (or
+      # /media, /mnt, /home); on macOS /Users or /Volumes. To turn browsing
+      # off set VIBECUT_BROWSE_ROOTS=off. Nothing is ever written there, and
+      # the web UI must stay bound to 127.0.0.1 (above): it can now list
+      # every folder on these drives. See DOCKER.md, "Browsing your drives".
+      - type: bind
+        source: ${VIBECUT_HOST_DRIVES:-/run/desktop/mnt/host}
+        target: /host
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: true
       # Persisted analysis cache. Named volume so it survives recreates.
       - type: volume
         source: vibecut-cache
@@ -83,6 +100,16 @@ services:
       # relative, the export keeps the container paths (relink there).
       VIBECUT_HOST_FOOTAGE: ${VIBECUT_FOOTAGE:-}
       VIBECUT_HOST_PROJECTS: ${VIBECUT_PROJECTS:-}
+      # What "Browse your drives…" offers besides /footage: unset or
+      # `auto` = every drive under /host (or the whole /host as "Computer"
+      # when it has no drive letters); `off` = /footage only; or a
+      # ;-separated list of label=/container/path[=shown path]. DOCKER.md.
+      VIBECUT_BROWSE_ROOTS: ${VIBECUT_BROWSE_ROOTS:-}
+      # Dotted host names the web API answers to besides localhost (IP
+      # addresses and dotless names always work), comma-separated, e.g.
+      # nas.local: it refuses other names so a web page can't reach it
+      # through DNS rebinding.
+      VIBECUT_ALLOWED_HOSTS: ${VIBECUT_ALLOWED_HOSTS:-}
 
 volumes:
   vibecut-cache:

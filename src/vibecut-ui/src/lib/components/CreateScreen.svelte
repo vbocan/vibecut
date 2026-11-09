@@ -26,7 +26,7 @@
 	const track = $derived(s.effectiveTrack);
 	const vibeName = $derived(style ? style.style.vibe_name : vibe?.name);
 	const songTitle = $derived(style ? style.music_match.title : track?.title);
-	const trip = $derived(s.footage.find((f) => f.folder === s.folder)?.name ?? s.folder);
+	const trip = $derived(s.folderLabel);
 
 	const missing = $derived(
 		!s.folder ? 'Pick your footage' : s.discovering ? 'Reading your clips…' : !s.effectiveVibe && !style ? 'Choose a vibe' : ''

@@ -1702,9 +1702,12 @@ pub fn manifest_for(path: &Path) -> Option<PathBuf> {
 }
 
 /// Host folders for the container mounts, from `VIBECUT_HOST_FOOTAGE` and
-/// `VIBECUT_HOST_PROJECTS`.
+/// `VIBECUT_HOST_PROJECTS`, then the browse roots' (`/host/d` → `D:`).
 pub fn path_map_from_env() -> Vec<(String, String)> {
-    path_map(std::env::var("VIBECUT_HOST_FOOTAGE").ok().as_deref(), std::env::var("VIBECUT_HOST_PROJECTS").ok().as_deref())
+    let mut map =
+        path_map(std::env::var("VIBECUT_HOST_FOOTAGE").ok().as_deref(), std::env::var("VIBECUT_HOST_PROJECTS").ok().as_deref());
+    map.extend(crate::browse::host_path_map());
+    map
 }
 
 /// [`path_map_from_env`] given the two values. Only absolute host paths

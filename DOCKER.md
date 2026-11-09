@@ -44,10 +44,15 @@ docker run -d --rm --name vibecut \
     -p 127.0.0.1:8090:8090 \
     -e ANTHROPIC_API_KEY \
     -v "E:/footage:/footage:ro" \
+    -v /run/desktop/mnt/host:/host:ro,rslave \
     -v "C:/Users/vboca/vibecut-projects:/projects" \
     -v vibecut-cache:/cache \
     vibecut:latest
 ```
+
+(`/run/desktop/mnt/host:/host` is Docker Desktop's view of every host
+drive, for **Browse your drives…**; see below. Leave it out to keep the
+server to `/footage`.)
 
 The MCP server listens on `http://localhost:8080/`; the web UI on
 `http://localhost:8090/` (see **Web UI** below). `-e ANTHROPIC_API_KEY`
@@ -189,6 +194,65 @@ and `GET /api/watch/events`, a server-sent event stream: `snapshot` (the
 `GET /api/watch` body, first and after any gap), then `status`, `entry`,
 `removed` and `reel_ready`.
 
+## Browsing your drives
+
+The Create screen's **Browse your drives…** finds footage anywhere on the
+computer — a trip folder on `D:`, a card reader's `E:` — without copying it
+into `/footage`. The host's file system is bind-mounted **read-only** at
+`/host`; Vibecut lists it one folder at a time and reads the videos in the
+folder you pick. Renders, configs and logs still go to `/projects` only.
+
+| Host | Mount | What the browser shows |
+|---|---|---|
+| Windows (Docker Desktop, WSL2) | `-v /run/desktop/mnt/host:/host:ro,rslave` (the `compose.yml` default) | `C:`, `D:`, `E:` …, paths as `D:\GoPro\Alps` |
+| Linux | `VIBECUT_HOST_DRIVES=/` (or `/media`, `/mnt`, `/home`) → `-v /:/host:ro,rslave` | one **Computer** root; with all of `/` mounted, paths read as on the host (`/home/you/Videos`). A narrower mount shows paths relative to it: name it with `VIBECUT_BROWSE_ROOTS` (below). |
+| macOS | `VIBECUT_HOST_DRIVES=/Users` (or `/Volumes`) | one **Computer** root |
+
+`/footage` stays a root of its own ("Footage"). Docker Desktop's own
+`wsl` / `wslg` folders, hidden folders (`.git`, `.Trash…`) and Windows
+system folders (`$RECYCLE.BIN`, `System Volume Information`) are never
+shown, symbolic links are never followed out of a drive, and a whole drive
+can't be used as a footage folder — pick the folder on it. The last five
+folders picked come back as **Recent** cards in the trip list (stored in
+the browser). The dialog is keyboard-driven: arrows move, Enter opens a
+folder, Backspace goes up, Escape closes.
+
+**Settings.**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VIBECUT_HOST_DRIVES` | `/run/desktop/mnt/host` | (`compose.yml` only) Host folder mounted at `/host`. |
+| `VIBECUT_BROWSE_ROOTS` | `auto` | `auto`: every one-letter folder in `/host` is a drive (`/host/d` → `D:\`), or all of `/host` is one root when it has none. `off`: `/footage` only. Or a `;`-separated list of `auto` and `label=/container/path[=shown path]` entries, e.g. `auto;Card=/cards`, or `Home=/host/home/me=/home/me` so paths show as on the host. |
+| `VIBECUT_ALLOWED_HOSTS` | — | Host names the web API answers to besides `localhost`, IP addresses and names without a dot (`nas.local,vibecut.lan`), comma-separated. `VIBECUT_PUBLIC_URL`'s host counts too. |
+
+**Turning it off.** `VIBECUT_BROWSE_ROOTS=off` hides the drives (the mount
+stays, but nothing lists or maps it). To not mount them at all, point
+`VIBECUT_HOST_DRIVES` at an empty folder, or drop the `/host` entry in a
+copy of `compose.yml`. The server starts and runs the same without `/host`:
+browsing then offers `/footage` alone.
+
+**Keep the web UI on `127.0.0.1`.** With the drives mounted, anyone who
+can reach port 8090 can list every folder name on them and read any video
+in them. `compose.yml` binds the ports to `127.0.0.1` by default
+(`VIBECUT_WEB_BIND`); don't change that to a LAN address on a machine with
+`/host` mounted unless you trust everyone on that network. The web API
+(`/api/*`) also refuses requests whose `Host` is a DNS name other than
+`localhost` (`403`), so a web page can't reach it through DNS rebinding;
+IP addresses and names without a dot (`http://mybox:8090`) are fine. If
+you open Vibecut by a dotted name (`http://nas.local:8090`), add it to
+`VIBECUT_ALLOWED_HOSTS` (the host of `VIBECUT_PUBLIC_URL` counts already).
+
+**New drives and cards.** The drive list is read fresh each time the
+dialog opens, so it shows whatever `/host` holds at that moment. Whether a
+drive or SD card the host mounts *after* the container started shows up
+there depends on Docker Desktop passing the new mount through (`rslave`
+asks for that); this hasn't been verified on every setup. If a card you
+just inserted is missing, restart the container (`docker compose restart
+vibecut`).
+
+**Routes.** `GET /api/browse/roots` and `GET /api/browse?path=…`; see
+[CONFIG.md](CONFIG.md#footage-from-any-drive). MCP: `browse_folders`.
+
 ## Test the server in isolation
 
 Two options, both LLM-free:
@@ -246,6 +310,7 @@ form: `http://localhost:8080/`.
 | Container path | Purpose |
 |---|---|
 | `/footage` | Source GoPro / DJI footage. Mount **read-only**. |
+| `/host` | Optional: the host's drives, **read-only**, for Browse your drives (see above). |
 | `/projects` | Generated TOMLs, rendered outputs, conversation logs. |
 | `/cache` | Persisted visual-analysis cache; speeds up re-renders. |
 

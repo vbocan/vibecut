@@ -2,6 +2,7 @@
 //! grouping the crate-level docs describe.
 
 pub mod brief;
+pub mod browse;
 pub mod config;
 pub mod discover;
 pub mod export;
@@ -34,6 +35,8 @@ pub fn api_router() -> Router<AppState> {
         .route("/health", get(health))
         .route("/sources", get(discover::discover_sources))
         .route("/footage", get(discover::list_footage))
+        .route("/browse", get(browse::browse))
+        .route("/browse/roots", get(browse::roots))
         .route("/vibes", get(vibes::list_vibes))
         .route("/propose", post(propose::propose_vibe))
         .route("/recipes", get(recipes::list).post(recipes::save))

@@ -214,6 +214,38 @@ GoPro's low-res proxies (`.LRV`: `GL010042.LRV` in the GX / GH scheme,
 a proxy was renamed to `GL…MP4`; DJI `.LRF` proxies are skipped the
 same way.
 
+### Footage from any drive
+
+`folder` can be anywhere the server can read, not only under `/footage`.
+In Docker the host's drives are mounted read-only at `/host` (see
+DOCKER.md, "Browsing your drives"), and the web UI's **Browse your
+drives…** on the Create screen walks them one folder at a time. A folder
+picked there goes into `folder` as its container path
+(`/host/d/GoPro/Alps`); discover, propose and apply-style also take the
+path the way the host shows it (`D:\GoPro\Alps`, any letter case for
+the drive) and map it back. A whole drive can't be a footage folder
+(discover would walk all of it); pick the folder on it that holds the
+trip.
+
+| Route | What it returns |
+|---|---|
+| `GET /api/browse/roots` | `{"roots": [{label, path, container_path, kind, available}]}`: `/footage` ("Footage", kind `footage`) and each drive (`C:`, path `C:\`, kind `drive`), or configured folders (kind `folder`). |
+| `GET /api/browse?path=…` | One folder: `path` (as shown), `container_path`, `parent`, `crumbs`, `can_use`, `n_videos` directly inside, `sample_video`, `truncated`, and `folders`: each subfolder's `name`, `path`, `container_path`, `n_videos` directly inside, `has_subfolders`, `sample_video` (for a thumbnail via `GET /api/frames/at`) and `complete`. |
+
+`path` is a root's or folder's display path or container path. Anything
+with `..`, a NUL, a hidden or system folder (`.git`, `$RECYCLE.BIN`,
+`System Volume Information`, `wsl`, `wslg`, `node_modules`, …) or that
+is outside every root, including through a symbolic link, is a `400`; a
+folder that isn't there is a `404`. Listings skip symbolic links and
+hidden folders, count videos by the same rules as discovery (`.mp4` /
+`.mov`, proxies and thumbnails left out), stop at 500 subfolders, and
+count the subfolders' videos for at most a few seconds (`complete:
+false` after that). Like every `/api` route they answer only when the
+request's host is `localhost`, an IP address, a name without a dot, or
+one listed in `VIBECUT_ALLOWED_HOSTS` / `VIBECUT_PUBLIC_URL` (`403`
+otherwise), so a web page can't read your folder names through DNS
+rebinding. The MCP tool `browse_folders` returns the same listings.
+
 ---
 
 ## `[[outputs]]` (required, ≥ 1 entry)

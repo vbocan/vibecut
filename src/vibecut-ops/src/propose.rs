@@ -202,6 +202,7 @@ pub async fn propose_vibe(args: ProposeArgs<'_>) -> Result<ProposeResult, OpsErr
             target_folder.to_string_lossy().into_owned(),
         ));
     }
+    crate::browse::check_footage_folder(&target_folder)?;
 
     let vibe = get_vibe(args.vibe)?;
     // The seed is written into the proposal's TOML, whose integers are

@@ -12,6 +12,11 @@ import type { SmartPath } from './reframe';
 import { fileNameFromDisposition } from './download';
 import type { SelectionExclude } from './types/generated/SelectionExclude';
 import type { Transition } from './types/generated/Transition';
+import type { BrowseListing } from './types/generated/BrowseListing';
+import type { BrowseRootInfo } from './types/generated/BrowseRootInfo';
+
+export type { BrowseListing, BrowseRootInfo };
+export type { BrowseEntry } from './types/generated/BrowseEntry';
 
 const BASE = '/api';
 
@@ -105,6 +110,19 @@ export interface FootageFolder {
 
 export function listFootage(): Promise<{ folders: FootageFolder[] }> {
 	return getJson('/footage');
+}
+
+// ---------- browse (drives and folders) ----------
+
+/** Where browsing starts: /footage and, when mounted, the host's drives. */
+export function browseRoots(): Promise<{ roots: BrowseRootInfo[] }> {
+	return getJson('/browse/roots');
+}
+
+/** One folder's subfolders (with video counts). `path`: a display path
+ *  (`D:\GoPro`) or container path under a root. */
+export function browse(path: string, signal?: AbortSignal): Promise<BrowseListing> {
+	return getJson(`/browse?path=${encodeURIComponent(path)}`, signal);
 }
 
 /** `signal` drops a scan the UI no longer wants (the server may still

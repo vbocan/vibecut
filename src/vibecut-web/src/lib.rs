@@ -19,6 +19,7 @@
 //! files.
 
 pub mod error;
+pub mod host_guard;
 pub mod llm;
 pub mod routes;
 pub mod state;
@@ -37,7 +38,10 @@ use tower_http::services::{ServeDir, ServeFile};
 /// table itself ([`routes::api_router`]) stays prefix-agnostic so a
 /// later caller could nest it somewhere other than `/api`.
 pub fn router(state: AppState) -> Router {
-    let mut router = Router::new().nest("/api", routes::api_router());
+    // Every API route answers only to this machine's names (DNS-rebinding
+    // guard, see `host_guard`); the static UI needs no guard.
+    let api = routes::api_router().layer(axum::middleware::from_fn(host_guard::guard));
+    let mut router = Router::new().nest("/api", api);
 
     if let Some(dir) = static_dir() {
         // `adapter-static`'s SPA fallback (`fallback: 'index.html'`,
@@ -235,6 +239,91 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let body = body_json(res).await;
         assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    async fn get_with_host(app: Router, uri: &str, host: &str) -> axum::response::Response {
+        app.oneshot(Request::builder().uri(uri).header("host", host).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The browse routes over one configured root: listing with display
+    /// paths and counts, every traversal / outside / NUL attempt a 400, a
+    /// missing folder a 404, and a rebinding host refused (on every `/api`
+    /// route). The only test that sets `VIBECUT_BROWSE_ROOTS`.
+    #[tokio::test]
+    async fn browse_routes_list_folders_and_refuse_escapes() {
+        let base = std::env::temp_dir().join(format!("vibecut_web_browse_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let trip = base.join("Card/GoPro/Alps");
+        std::fs::create_dir_all(&trip).unwrap();
+        std::fs::create_dir_all(base.join("Card/$RECYCLE.BIN")).unwrap();
+        std::fs::create_dir_all(base.join("secret")).unwrap();
+        std::fs::write(trip.join("GX010001.MP4"), b"x").unwrap();
+        std::fs::write(trip.join("GL010001.LRV"), b"x").unwrap();
+        let card = base.join("Card");
+        let card_s = card.to_string_lossy().replace('\\', "/");
+        std::env::set_var("VIBECUT_BROWSE_ROOTS", format!("Card={card_s}=E:\\Card"));
+        let app = router(AppState::default());
+        let q = |p: &str| format!("/api/browse?path={}", urlencoding_full(p));
+
+        let res = get_with_host(app.clone(), "/api/browse/roots", "localhost:8090").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let labels: Vec<_> = body["roots"].as_array().unwrap().iter().map(|r| r["label"].as_str().unwrap().to_string()).collect();
+        assert_eq!(labels, vec!["Footage", "Card"], "{body}");
+        assert_eq!(body["roots"][1]["path"], "E:\\Card");
+        assert_eq!(body["roots"][1]["available"], true);
+
+        for path in ["E:\\Card\\GoPro", "e:/card/GoPro", &format!("{card_s}/GoPro")] {
+            let res = get_with_host(app.clone(), &q(path), "127.0.0.1:8090").await;
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            let body = body_json(res).await;
+            assert_eq!(body["path"], "E:\\Card\\GoPro", "{body}");
+            assert_eq!(body["folders"][0]["name"], "Alps");
+            assert_eq!(body["folders"][0]["path"], "E:\\Card\\GoPro\\Alps");
+            assert_eq!(body["folders"][0]["n_videos"], 1);
+            assert_eq!(body["parent"], "E:\\Card");
+        }
+        let res = get_with_host(app.clone(), &q("E:\\Card"), "localhost").await;
+        let body = body_json(res).await;
+        let names: Vec<_> = body["folders"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["GoPro"], "the recycle bin is hidden");
+
+        for bad in [
+            "E:\\Card\\..\\secret",
+            "E:\\Card\\GoPro\\..\\..",
+            &format!("{card_s}/../secret"),
+            "/etc",
+            "/etc/passwd",
+            "E:\\Card\\$RECYCLE.BIN",
+            "GoPro",
+            "",
+            "E:\\Card\\GoPro\\Alps\\GX010001.MP4",
+        ] {
+            let res = get_with_host(app.clone(), &q(bad), "localhost").await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let res = get_with_host(app.clone(), "/api/browse?path=E%3A%5CCard%00x", "localhost").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "NUL");
+        let res = get_with_host(app.clone(), &q("E:\\Card\\Nope"), "localhost").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        for uri in ["/api/browse/roots".to_string(), q("E:\\Card"), "/api/vibes".into(), "/api/sources?folder=E%3A%5CCard".into()] {
+            let res = get_with_host(app.clone(), &uri, "evil.example.com:8090").await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Percent-encode everything but unreserved characters.
+    fn urlencoding_full(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
     }
 
     async fn post_json(app: Router, uri: &str, body: serde_json::Value) -> axum::response::Response {

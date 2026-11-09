@@ -152,7 +152,7 @@
 		s.renderMode === 'queued' || s.renderMode === 'running' || s.makeStep === 'failed'
 	);
 	const beat = $derived(s.manifest?.beat_sync ?? null);
-	const trip = $derived(s.footage.find((f) => f.folder === s.folder)?.name ?? s.folder);
+	const trip = $derived(s.folderLabel);
 	const title = $derived(s.proposeResult?.title || s.title || trip || 'Your video');
 	const fileName = $derived(
 		`${(title || 'vibecut').replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-') || 'vibecut'}.mp4`

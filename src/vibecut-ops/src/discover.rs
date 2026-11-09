@@ -42,6 +42,7 @@ pub async fn discover_sources(folder: &str) -> Result<DiscoverResult, OpsError> 
             target.display()
         )));
     }
+    crate::browse::check_footage_folder(&target)?;
 
     let target_camino = Utf8PathBuf::from_path_buf(target.clone())
         .map_err(|_| OpsError::invalid(format!("non-UTF-8 folder path: {}", target.display())))?;
