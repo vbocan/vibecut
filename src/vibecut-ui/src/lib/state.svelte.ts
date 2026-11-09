@@ -206,6 +206,8 @@ class AppState {
 	// ---------- Music library ----------
 	tracks = $state<api.Track[]>([]);
 	loadingMusic = $state(false);
+	/** The library has been read at least once (placeholders only before). */
+	musicLoaded = $state(false);
 	musicError = $state<string | null>(null);
 	/** Library metadata problems worth showing in the import view. */
 	musicWarnings = $state<string[]>([]);
@@ -228,6 +230,7 @@ class AppState {
 			this.musicError = e instanceof api.ApiError ? e.describe() : String(e);
 		} finally {
 			this.loadingMusic = false;
+			this.musicLoaded = true;
 		}
 		void this.refreshAutoPick(true);
 	}

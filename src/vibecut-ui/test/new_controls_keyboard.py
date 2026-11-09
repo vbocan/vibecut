@@ -8,15 +8,23 @@ mid-render "Stop and apply this instead" offers:
   the running job, and reformat jobs are listed with kind "reformat";
 - a keyboard shortcut pressed mid-render offers "Stop and apply" in the
   tweak panel, announced, reachable with Tab, and the focus survives it;
-- the cutting room's Stop keeps the focus while stopping and hands it on
-  (not to the page) once the cutting room goes;
+- the cutting room's Stop says what it does in a tooltip, keeps the focus
+  while stopping and hands it on (not to the page) once the cutting room
+  goes;
 - a song picked mid-render shows its offer in the song list; Escape on it
   keeps rendering and the focus goes back to the song;
 - the Renders list labels each row's kind and buttons, and its Stop keeps
   the focus; a stopped reformat leaves no file behind;
 - the music import view: aria-controls names its panel, "Look again"
-  keeps the focus and announces what it found, and every song radio is
-  described by its licence note.
+  keeps the focus and announces what it found — also when the library was
+  empty and the song list replaces the empty state (the library is faked
+  empty through page.route) — and every song radio is described by its
+  licence note;
+- a tweak key pressed while a Stop is on its way is refused with a notice,
+  the tweak buttons report themselves unavailable meanwhile (the cancel
+  request is held through page.route), and a notice with the focus or the
+  pointer on it doesn't time out, and hands the focus back when dismissed;
+- Shuffle ('s') starts a re-render on the first press, with no error shown.
 
     python test/new_controls_keyboard.py --url http://localhost:8090
 
@@ -29,6 +37,7 @@ import argparse
 import json
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 from playwright.sync_api import sync_playwright
@@ -127,6 +136,16 @@ def wait_render_ends(page, timeout=600):
     return False
 
 
+ERRORS_SHOWN = r"""[...document.querySelectorAll('[role=alert], [role=status], .error')]
+  .map((e) => e.textContent.trim())
+  .filter((t) => t && /could not|couldn.t|error|failed|HTTP \d{3}/i.test(t))"""
+
+
+def errors_shown(page) -> list[str]:
+    """Error text on the page: alerts, and status lines that carry a server error."""
+    return page.evaluate(ERRORS_SHOWN)
+
+
 def status_texts(page, scope: str) -> list[str]:
     return page.evaluate(
         f"[...document.querySelectorAll({json.dumps(scope + ' [role=status]')})].map((e) => e.textContent.trim())"
@@ -146,7 +165,65 @@ def main() -> int:
         ctx = browser.new_context(viewport={"width": 1400, "height": 1000}, reduced_motion="reduce")
         page = ctx.new_page()
         page.on("pageerror", lambda e: FAILS.append(f"page error: {e}"))
+
+        print("Music: 'Look again' on an empty library")
+        # The library answers empty while `empty[0]` is set, else for real.
+        empty = [True]
+        fake = {"tracks": [], "warnings": [], "import_dir": "/projects/music",
+                "dirs": [{"path": "/projects/music", "collection": "user", "exists": True}]}
+
+        def music_route(route):
+            if empty[0]:
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(fake))
+            else:
+                route.continue_()
+
+        def is_music_list(url: str) -> bool:
+            return urllib.parse.urlparse(url).path == "/api/music"
+
+        page.route(is_music_list, music_route)
         page.goto(BASE + "/")
+        page.wait_for_selector(".act .empty")
+        toggle = page.locator(".act .import .toggle")
+        toggle.click()
+        ctl = toggle.get_attribute("aria-controls")
+        look = page.locator(f"[id='{ctl}'] button", has_text="Look again")
+        look.focus()
+        empty[0] = False
+        a = press(page, "Enter", settle=50)
+        check(a is not None and a["name"] in ("Look again", "Looking…"), f"empty library: 'Look again' keeps the focus while it looks ({a})")
+        found = f"""[...document.querySelectorAll("[id='{ctl}'] [role=status]")].some((e) => / songs? in your library/.test(e.textContent))"""
+        try:
+            page.wait_for_function(found, timeout=60000)
+            check(True, "empty library: the import panel announces the songs it found")
+        except Exception:  # noqa: BLE001
+            check(False, f"empty library: the import panel announces the songs it found ({status_texts(page, '.act')})")
+        a = active(page)
+        check(a is not None and a["name"] == "Look again", f"empty library: …the focus is still on 'Look again' ({a and a['name']!r})")
+        check(toggle.get_attribute("aria-expanded") == "true" and page.locator(f"[id='{ctl}']").count() == 1,
+              "empty library: …the panel the user opened is still open")
+        check(page.locator(".act .list [role=radio]").count() >= 2, "empty library: …and the songs are listed")
+        # Empty again, then the empty state's own "Look again".
+        empty[0] = True
+        look.focus()
+        press(page, "Enter", settle=50)
+        page.wait_for_selector(".act .empty", timeout=30000)
+        page.wait_for_timeout(300)
+        page.locator(".act .empty button").focus()
+        empty[0] = False
+        a = press(page, "Enter", settle=50)
+        # (A fast answer may already have moved it on to the list.)
+        check(a is not None and (a["name"] in ("Look again", "Looking…") or a["role"] == "radio"),
+              f"empty state: its 'Look again' keeps the focus while it looks ({a})")
+        page.wait_for_selector(".act .list [role=radio]", timeout=60000)
+        page.wait_for_timeout(300)
+        a = active(page)
+        check(a is not None and a["role"] == "radio" and a["checked"] == "true",
+              f"empty state: once the list replaces it, the focus is on the picked song ({a and a['name'][:40]!r})")
+        st = [t for t in status_texts(page, ".act") if "in your library" in t]
+        check(any("songs in your library" in t for t in st), f"empty state: …and what it found is announced ({st})")
+        toggle.click()
+        page.unroute(is_music_list)
 
         print("Make a first video")
         page.get_by_role("radio", name="Coastline Bike Ride").first.click()
@@ -266,17 +343,43 @@ def main() -> int:
         print("Studio: Stop keeps the focus")
         blur(page)
         page.keyboard.press("s")  # Shuffle
-        started = wait_render_starts(page, timeout=15)
-        if not started:  # once more, after whatever was still settling
-            page.wait_for_timeout(2000)
-            blur(page)
-            page.keyboard.press("s")
-            started = wait_render_starts(page)
-        check(started, "'s' starts a re-render")
+        # One press, no retry: a Shuffle that fails (it used to, about every
+        # other time, on a seed a TOML file can't hold) must fail here.
+        check(wait_render_starts(page, timeout=30), "'s' starts a re-render on the first press")
+        errs = errors_shown(page)
+        check(not errs, f"…with no error shown ({errs})")
         page.wait_for_timeout(1500)
+        # Hold the cancel request, so the Stop stays on its way for a while.
+        held: list = []
+        page.route("**/api/jobs/*/cancel", lambda route: held.append(route))
+        # What Stop does is shown on hover too, not only to screen readers.
+        title = page.get_attribute("button.stop", "title")
+        check(title == "Stop this render and go back to the last version", f"Stop's tooltip says where it goes back to ({title!r})")
         page.locator("button.stop").focus()
         a = press(page, "Enter", settle=80)
         check(a is not None and a["name"] in ("Stop", "Stopping…"), f"Stop keeps the focus while stopping ({a})")
+        t0 = time.time()
+        while not held and time.time() - t0 < 10:
+            page.wait_for_timeout(50)
+        check(bool(held), "the Stop sent its cancel request")
+        busy = page.evaluate(
+            "[...document.querySelectorAll('.tweaks button.tweak:not([disabled]), .tweaks .mix')].map((b) => b.getAttribute('aria-disabled'))"
+        )
+        check(len(busy) > 0 and all(b == "true" for b in busy), f"while the Stop is on its way the tweaks report themselves unavailable ({busy})")
+        check(page.get_attribute("button.stop", "aria-busy") == "true", "…and Stop says it is busy")
+        page.keyboard.press("c")  # Calmer: refused for now
+        try:
+            page.wait_for_function(
+                "[...document.querySelectorAll('[role=status]')].some((e) => e.textContent.includes('Still stopping'))",
+                timeout=3000,
+            )
+            check(True, "a tweak key pressed meanwhile says 'Still stopping' instead of vanishing")
+        except Exception:  # noqa: BLE001
+            check(False, f"a tweak key pressed meanwhile says 'Still stopping' ({[t for t in status_texts(page, 'body') if t][:4]})")
+        check(page.locator(".tweaks .offer").count() == 0, "…and isn't kept as an offer")
+        for r in held:
+            r.continue_()
+        page.unroute("**/api/jobs/*/cancel")
         t0 = time.time()
         while time.time() - t0 < 30 and rendering(page):
             page.wait_for_timeout(100)
@@ -291,7 +394,26 @@ def main() -> int:
             check(False, f"the stop is announced ({[t for t in st if t][:4]})")
         a = active(page)
         check(a is not None, f"after the stop the focus isn't on the page ({a and a['tag']!r} {a and a['name']!r})")
-        page.wait_for_timeout(1500)
+
+        print("Notice toast: waits while someone is on it")
+        notice = page.locator(".toast.notice")
+        dismiss = notice.locator("button[aria-label='Dismiss notice']")
+        if notice.count() == 1:
+            notice.hover()
+            page.wait_for_timeout(6500)  # past its 5 s
+            check(notice.count() == 1, "a notice under the pointer stays past its time")
+            dismiss.focus()
+            page.mouse.move(5, 5)
+            page.wait_for_timeout(6500)
+            a = active(page)
+            check(notice.count() == 1 and a is not None and a["name"] == "Dismiss notice",
+                  f"a notice with the keyboard focus stays too ({a and a['name']!r})")
+            a = press(page, "Enter", settle=300)
+            check(notice.count() == 0, "Dismiss removes it")
+            check(a is not None, f"…and hands the focus back, not to the page ({a and a['tag']!r} {a and a['name']!r})")
+        else:
+            check(False, f"the stop leaves a notice toast ({notice.count()})")
+        page.wait_for_timeout(1000)
 
         print("Studio: a song picked mid-render offers 'Stop and apply' in the song list")
         blur(page)

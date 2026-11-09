@@ -1134,23 +1134,57 @@ pub fn manifest_cuts(source: &Path) -> Vec<f64> {
 /// name ([`crate::staging`]) and only renamed to `output` once ffmpeg has
 /// finished, so a failed or stopped pass ([`crate::cancel`]) never leaves a
 /// truncated file there that would later look like a finished version.
+///
+/// A render can replace `input` while the pass runs (its outputs land by
+/// rename, possibly from another process). The version is only committed
+/// when `input` is still the file the pass started from; otherwise the pass
+/// runs once more over the new one, so a version never shows the cut
+/// before the one next to it.
 pub fn reformat_video(
     input: &Utf8Path,
     output: &Utf8Path,
     opts: &ReformatOptions,
     on_progress: &mut dyn FnMut(f32),
 ) -> Result<ReformatOutcome> {
-    let src = probe_source(input)?;
-    let plan = plan_reformat(&src, opts);
+    reformat_video_with(input, output, opts, on_progress, &mut || {})
+}
+
+/// [`reformat_video`], with `before_commit` run between the pass and the
+/// check that `input` is unchanged (tests replace the input there).
+fn reformat_video_with(
+    input: &Utf8Path,
+    output: &Utf8Path,
+    opts: &ReformatOptions,
+    on_progress: &mut dyn FnMut(f32),
+    before_commit: &mut dyn FnMut(),
+) -> Result<ReformatOutcome> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let staged = crate::staging::StagedOutputs::new([output]);
-    let outcome = write_reformat(input, staged.path(0), &src, plan, opts, on_progress)?;
-    // Last chance to stop: past this point the version replaces the old one.
-    crate::cancel::check()?;
-    staged.commit()?;
-    Ok(outcome)
+    const ATTEMPTS: usize = 2;
+    for attempt in 1..=ATTEMPTS {
+        let started_from = file_identity(input)?;
+        let src = probe_source(input)?;
+        let plan = plan_reformat(&src, opts);
+        let staged = crate::staging::StagedOutputs::new([output]);
+        let outcome = write_reformat(input, staged.path(0), &src, plan, opts, on_progress)?;
+        before_commit();
+        // Last chance to stop: past this point the version replaces the old one.
+        crate::cancel::check()?;
+        if file_identity(input)? == started_from {
+            staged.commit()?;
+            return Ok(outcome);
+        }
+        tracing::info!(%input, attempt, "the video changed while its version was being made; making it again");
+    }
+    anyhow::bail!("{input} kept changing while its version was being made (a render is writing it?); try again")
+}
+
+/// What tells a replaced file from the one read: size and modification
+/// time (a render's commit stamps both anew).
+fn file_identity(p: &Utf8Path) -> Result<(u64, Option<std::time::SystemTime>)> {
+    let m = std::fs::metadata(p).with_context(|| format!("reading {p}"))?;
+    Ok((m.len(), m.modified().ok()))
 }
 
 /// [`reformat_video`]'s ffmpeg pass, straight into `output`.
@@ -1849,7 +1883,7 @@ mod reformat_job_tests {
     use super::*;
     use crate::cancel::{is_cancelled, CancelToken};
     use crate::progress::with_sink_and_cancel;
-    use crate::staging::staging_path;
+    use crate::staging::staged_files;
 
     fn ffmpeg_available() -> bool {
         Command::new("ffmpeg")
@@ -1893,14 +1927,13 @@ mod reformat_job_tests {
         }
         let (d, clip) = render_clip("commit", 1);
         let target = d.join("coast.whatsapp.mp4");
-        let staged = staging_path(&target);
         let mut saw_staged = false;
         reformat_video(&clip, &target, &opts(OutputPreset::Whatsapp), &mut |_| {
-            saw_staged |= staged.exists() && !target.exists();
+            saw_staged |= !staged_files(&target).is_empty() && !target.exists();
         })
         .expect("reformat");
         assert!(saw_staged, "ffmpeg didn't write under the staging name");
-        assert!(!staged.exists(), "staging file left behind");
+        assert!(staged_files(&target).is_empty(), "staging file left behind");
         let made = probe_source(&target).unwrap();
         assert_eq!((made.width, made.height), (720, 1280));
         let _ = std::fs::remove_dir_all(&d);
@@ -1934,7 +1967,7 @@ mod reformat_job_tests {
             started.elapsed()
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"the last good version");
-        assert!(!staging_path(&target).exists(), "partial version left behind");
+        assert!(staged_files(&target).is_empty(), "partial version left behind");
         // Cancelled before it starts: ffmpeg never runs.
         let token = CancelToken::new();
         token.cancel();
@@ -2036,5 +2069,49 @@ mod reformat_job_tests {
             }
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A render replaced the video while its version was being made: the
+    /// pass that read the old cut isn't committed; the version is made
+    /// again from the new one.
+    #[test]
+    fn a_version_of_a_video_replaced_mid_pass_is_made_again() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        }
+        let (d, clip) = render_clip("replaced", 1);
+        // The next render: 2 s long, so the versions tell the cuts apart.
+        let (d2, next_render) = render_clip("replaced_next", 2);
+        let target = d.join("coast.whatsapp.mp4");
+        let mut passes = 0;
+        reformat_video_with(&clip, &target, &opts(OutputPreset::Whatsapp), &mut |_| {}, &mut || {
+            passes += 1;
+            if passes == 1 {
+                // The render commits its new cut by rename, mid-pass.
+                std::fs::copy(&next_render, d.join("next.mp4")).unwrap();
+                std::fs::rename(d.join("next.mp4"), &clip).unwrap();
+            }
+        })
+        .expect("reformat");
+        assert_eq!(passes, 2, "the pass over the old cut was committed");
+        let made = probe_source(&target).unwrap();
+        assert!((made.duration_secs - 2.0).abs() < 0.2, "the version shows the old cut ({} s)", made.duration_secs);
+        assert!(staged_files(&target).is_empty());
+
+        // Replaced on every pass: it gives up, and the last good version stays.
+        std::fs::write(&target, b"the last good version").unwrap();
+        let mut bump = 0u64;
+        let r = reformat_video_with(&clip, &target, &opts(OutputPreset::Whatsapp), &mut |_| {}, &mut || {
+            bump += 1;
+            let t = std::time::SystemTime::now() + std::time::Duration::from_secs(60 * bump);
+            std::fs::File::options().write(true).open(&clip).unwrap().set_modified(t).unwrap();
+        });
+        let err = r.expect_err("a version of a video that keeps changing");
+        assert!(err.to_string().contains("kept changing"), "{err:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"the last good version");
+        assert!(staged_files(&target).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
     }
 }

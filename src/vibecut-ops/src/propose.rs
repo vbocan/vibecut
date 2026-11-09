@@ -204,6 +204,15 @@ pub async fn propose_vibe(args: ProposeArgs<'_>) -> Result<ProposeResult, OpsErr
     }
 
     let vibe = get_vibe(args.vibe)?;
+    // The seed is written into the proposal's TOML, whose integers are
+    // signed 64-bit.
+    if args.seed > vibecut::project_config::MAX_SEED {
+        return Err(OpsError::invalid(format!(
+            "seed {} is too large: a seed is at most {} (it has to fit a TOML integer)",
+            args.seed,
+            vibecut::project_config::MAX_SEED
+        )));
+    }
 
     let folder_label = target_folder
         .file_name()
@@ -374,5 +383,25 @@ mod tests {
     #[tokio::test]
     async fn preview_pick_rejects_unknown_vibes() {
         assert!(preview_pick("no_such_vibe", None, 1).await.is_err());
+    }
+
+    /// A seed a TOML file can't hold is the caller's mistake (400), said
+    /// before anything is written — not "rendered invalid TOML" (500).
+    #[tokio::test]
+    async fn a_seed_past_a_toml_integer_is_refused() {
+        let folder = std::env::temp_dir();
+        let r = propose_vibe(ProposeArgs {
+            folder: &folder.to_string_lossy(),
+            vibe: "kid_reel",
+            title: None,
+            target_duration: None,
+            seed: vibecut::project_config::MAX_SEED + 1,
+            soundtrack: Some("none"),
+        })
+        .await;
+        match r {
+            Err(OpsError::InvalidInput { message, .. }) => assert!(message.contains("seed"), "{message}"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 }

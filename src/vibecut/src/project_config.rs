@@ -30,7 +30,7 @@
 //! than at deserialization — keeps the schema layer simple and validation
 //! errors contextual.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -98,6 +98,11 @@ pub struct Config {
     pub outputs: Vec<RenderOutput>,
 }
 
+/// The largest `[project].seed` a config can hold: TOML integers are
+/// signed 64-bit, so 2^63 − 1. Fresh seeds stay well below it
+/// ([`crate::rng::MAX_FRESH_SEED`]).
+pub const MAX_SEED: u64 = i64::MAX as u64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -108,6 +113,7 @@ pub struct Project {
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub target_duration: Duration,
     pub fps: u32,
+    /// At most [`MAX_SEED`]: TOML integers are signed 64-bit.
     #[serde(default)]
     pub seed: Option<u64>,
     /// Fade-in from black over this duration at the very start. 0 = none.
@@ -381,6 +387,8 @@ pub enum ImageEffect {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export))]
 pub struct InputRange {
+    /// The chapter file: a name or name suffix, or a path ending (see
+    /// [`file_matches`]).
     pub file: String,
     #[serde(with = "humantime_serde")]
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
@@ -388,6 +396,37 @@ pub struct InputRange {
     #[serde(with = "humantime_serde")]
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub end: Duration,
+}
+
+/// Does the `file` of an `[[input.ranges]]` or `[[selection.exclude]]`
+/// entry name the chapter at `path`? Letter case is ignored.
+///
+/// - A bare name (`"GX010320.MP4"`, or a suffix of one: `"0320.MP4"`)
+///   matches any chapter whose file name ends with it — in any folder.
+/// - A path (`"camA/100GOPRO/GX010001.MP4"`, `/` or `\`) matches the
+///   chapters whose path ends with those whole components, so two
+///   cameras' `GX010001.MP4` in different folders can be told apart.
+///   "Drop this moment" writes the chapter's path relative to
+///   `[input].folder` for this reason.
+///
+/// An empty `file` matches nothing.
+pub fn file_matches(file: &str, path: &Utf8Path) -> bool {
+    fn parts(s: &str) -> Vec<&str> {
+        s.split(['/', '\\']).filter(|c| !c.is_empty() && *c != ".").collect()
+    }
+    let want = parts(file);
+    let have = parts(path.as_str());
+    match want.as_slice() {
+        [] => false,
+        [name] => have.last().is_some_and(|base| {
+            let (base, name) = (base.to_ascii_lowercase(), name.to_ascii_lowercase());
+            base.ends_with(&name)
+        }),
+        _ => {
+            have.len() >= want.len()
+                && want.iter().rev().zip(have.iter().rev()).all(|(w, h)| w.eq_ignore_ascii_case(h))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -631,17 +670,20 @@ pub struct SourceWeight {
     pub weight: f32,
 }
 
-/// One source-window the picker must avoid. Matches by chapter
-/// filename suffix (so `"GH010320.MP4"` matches whatever absolute
-/// path the source resolved to). Multiple entries are additive.
+/// One source-window the picker must avoid. Matches chapters by
+/// [`file_matches`]: a file name (suffix) such as `"GH010320.MP4"`
+/// matches whatever absolute path the source resolved to; a path ending
+/// such as `"camA/100GOPRO/GX010001.MP4"` only that folder's file.
+/// Multiple entries are additive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SelectionExclude {
-    /// Filename or filename-suffix to match. Compared case-insensitively
-    /// against the basename of each chapter path. Examples:
-    /// `"GH010320.MP4"` (exact basename) or `"0320.MP4"` (suffix).
+    /// Filename, filename suffix, or path ending to match, ignoring case
+    /// ([`file_matches`]). Examples: `"GH010320.MP4"` (exact basename),
+    /// `"0320.MP4"` (suffix), `"camA/100GOPRO/GX010001.MP4"` (that
+    /// folder's file only — what "Drop this moment" writes).
     pub file: String,
     /// Start of the excluded range, in *chapter-local* seconds.
     #[serde(with = "humantime_serde")]
@@ -1153,6 +1195,15 @@ impl Config {
                 "project.target_duration must be > 0".into(),
             ));
         }
+        // A config only ever reaches the pipeline through a TOML file, whose
+        // integers are signed 64-bit: a larger seed (possible from JSON — the
+        // web wizard, a propose request) can't be written, so say so here
+        // rather than fail later with "out-of-range value for u64 type".
+        if let Some(seed) = self.project.seed.filter(|&s| s > MAX_SEED) {
+            return Err(ConfigError::Validation(format!(
+                "project.seed {seed} is too large: a seed is at most {MAX_SEED} (it has to fit a TOML integer)"
+            )));
+        }
 
         if self.selection.min_clip > self.selection.max_clip {
             return Err(ConfigError::Validation(format!(
@@ -1514,5 +1565,42 @@ stabilize = false
         assert_eq!(Quality::parse("final"), Some(Quality::Final));
         assert_eq!(Quality::parse("preview"), None);
         assert_eq!(Quality::Draft.as_str(), "draft");
+    }
+
+    /// A seed past a TOML integer (only possible from JSON) is refused by
+    /// validation, with the limit named, instead of failing when written.
+    #[test]
+    fn validate_refuses_a_seed_toml_cant_hold() {
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        cfg.project.seed = Some(MAX_SEED);
+        cfg.validate().expect("the largest TOML integer is a fine seed");
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.project.seed, Some(MAX_SEED));
+        cfg.project.seed = Some(MAX_SEED + 1);
+        assert!(toml::to_string(&cfg).is_err(), "TOML learned to hold u64s; this check can go");
+        let e = cfg.validate().expect_err("a seed of 2^63").to_string();
+        assert!(e.contains("project.seed") && e.contains(&MAX_SEED.to_string()), "{e}");
+    }
+
+    #[test]
+    fn file_matches_names_suffixes_and_path_endings() {
+        let a = Utf8Path::new("/footage/trip/camA/100GOPRO/GX010001.MP4");
+        let b = Utf8Path::new("/footage/trip/camB/100GOPRO/GX010001.MP4");
+        // A bare name (or suffix) matches the file in any folder, as before.
+        for f in ["GX010001.MP4", "gx010001.mp4", "0001.MP4"] {
+            assert!(file_matches(f, a) && file_matches(f, b), "{f}");
+        }
+        // A path ending picks one camera's file.
+        for f in ["camA/100GOPRO/GX010001.MP4", r"cama\100gopro\gx010001.mp4", "./camA/100GOPRO/GX010001.MP4"] {
+            assert!(file_matches(f, a), "{f}");
+            assert!(!file_matches(f, b), "{f} matched the other camera");
+        }
+        assert!(file_matches("/footage/trip/camA/100GOPRO/GX010001.MP4", a));
+        assert!(file_matches("E:/clips/a.mp4", Utf8Path::new(r"E:\clips\a.mp4")));
+        // Whole components only: no suffix match on a folder name.
+        assert!(!file_matches("mA/100GOPRO/GX010001.MP4", a));
+        assert!(!file_matches("x/camA/100GOPRO/GX010001.MP4", Utf8Path::new("camA/100GOPRO/GX010001.MP4")));
+        assert!(!file_matches("", a));
+        assert!(!file_matches("/", a));
     }
 }

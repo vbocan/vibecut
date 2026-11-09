@@ -179,7 +179,9 @@
 				class="btn danger stop"
 				type="button"
 				aria-disabled={!canStop}
+				aria-busy={s.stopping}
 				aria-describedby="{uid}-stop-what"
+				title={s.renderHistory.length > 0 ? 'Stop this render and go back to the last version' : 'Stop this render'}
 				use:keepFocus={() => document.querySelector<HTMLElement>('#main video')}
 				onclick={() => {
 					if (canStop) void s.stopRender();

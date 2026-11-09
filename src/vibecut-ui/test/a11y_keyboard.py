@@ -655,8 +655,24 @@ def main() -> int:
         print("Studio: a tweak keeps the keyboard focus through its re-render")
         focus_top(page)
         tab_to(page, lambda a: a["tag"] == "button" and a["name"].endswith("Calmer"), "'Calmer'")
-        a = press(page, "Enter", settle=800)
+        # Hold the change's request, so it is still being written for a while.
+        held = []
+        page.route("**/api/feedback", lambda route: held.append(route))
+        a = press(page, "Enter", settle=300)
         check(a is not None and a["name"].endswith("Calmer"), f"tweak: focus stays on 'Calmer' while it works ({a and a['name']!r})")
+        t0 = time.time()
+        while not held and time.time() - t0 < 10:
+            page.wait_for_timeout(50)
+        busy = page.evaluate("[...document.querySelectorAll('.tweaks .mix, .tweaks button.tweak:not([disabled])')].map((b) => b.getAttribute('aria-disabled'))")
+        check(
+            bool(held) and len(busy) > 0 and all(b == "true" for b in busy),
+            f"tweak: while its change is being written, every tweak reports itself unavailable ({busy})",
+        )
+        press(page, "Enter", settle=400)
+        check(len(held) == 1, f"tweak: ...and pressing it again doesn't send the change twice ({len(held)} requests)")
+        for r in held:
+            r.continue_()
+        page.unroute("**/api/feedback")
         # Mid-render the tweaks stay live: a press offers "Stop and apply
         # this instead" (see test/new_controls_keyboard.py), so the button
         # doesn't report itself unavailable once the re-render runs.

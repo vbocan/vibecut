@@ -29,7 +29,12 @@ impl IntoResponse for ApiError {
                 (StatusCode::NOT_FOUND, format!("{what} not found"), detail)
             }
             OpsError::InvalidInput { message, hint } => (StatusCode::BAD_REQUEST, message, hint),
-            OpsError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg, None),
+            OpsError::Internal(msg) => {
+                // The caller only sees the JSON body; a 500 is a server
+                // fault, so it goes in the server log too.
+                tracing::error!(error = %msg, "request failed with 500");
+                (StatusCode::INTERNAL_SERVER_ERROR, msg, None)
+            }
         };
         let mut body = serde_json::json!({ "error": message });
         if let Some(h) = hint {
