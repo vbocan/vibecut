@@ -14,9 +14,13 @@
 //! - [`FeedbackAction::DifferentMusic`] — "different music"
 //! - [`FeedbackAction::Reroll`] — "same but different"
 //!
-//! Three more (`MoreOf`, `LessOf`, `DropSegment`, `ExtendSegment`) need
-//! a `[[selection.exclude]]` mechanism on the picker side that doesn't
-//! exist yet.
+//! Three more steer the picker for the next render:
+//!
+//! - [`FeedbackAction::MoreOf`] / [`FeedbackAction::LessOf`] — double or
+//!   halve a source's `[[selection.source_weights]]` entry
+//! - [`FeedbackAction::DropSegment`] — "drop the bit at M:SS", via a
+//!   `[[selection.exclude]]` entry for what the manifest's timeline says
+//!   played there
 
 use std::time::Duration;
 
@@ -83,24 +87,26 @@ pub enum FeedbackAction {
     /// neighbourhood of the same scoring landscape.
     Reroll,
 
-    /// "more of [source X]". Appends a
-    /// `[[selection.source_weights]]` entry per requested source_id
-    /// with `weight = 1.5` (50 % boost). Picker multiplies the score
-    /// curve before composing picks, so those sources win more
-    /// candidate slots in the next render.
+    /// "more of [source X]". Doubles each requested source's
+    /// `[[selection.source_weights]]` entry (unset counts as 1.0), up
+    /// to 8.0. The picker multiplies the source's score curve by its
+    /// weight before composing picks, so a boosted source wins more
+    /// candidate slots in the next render. Repeating it keeps boosting;
+    /// it exactly undoes one "less of".
     MoreOf {
         /// Source IDs to boost. For GoPro chapters these are the
         /// trailing-4-digit ids (e.g. `["0320", "0321"]`).
         source_ids: Vec<String>,
     },
 
-    /// "less of [source X]". Appends a
-    /// `[[selection.source_weights]]` entry per requested source_id
-    /// with `weight = 0.0` (effectively drops that source from picks).
-    /// Use Reroll plus a few LessOf entries to refresh a cut while
-    /// excluding specific sources.
+    /// "less of [source X]". Halves each requested source's
+    /// `[[selection.source_weights]]` entry (unset counts as 1.0),
+    /// down to 0.125 — never 0, which would ban the source outright.
+    /// The source still competes, just at a fraction of its score, so
+    /// it shows up less. Repeating it keeps reducing; it exactly undoes
+    /// one "more of".
     LessOf {
-        /// Source IDs to drop.
+        /// Source IDs to show less of.
         source_ids: Vec<String>,
     },
 
@@ -176,28 +182,68 @@ pub fn apply(cfg: &mut Config, action: &FeedbackAction) -> Result<Vec<ChangeNote
         FeedbackAction::DropSegment { at_seconds, manifest_path } => {
             apply_drop_segment(cfg, *at_seconds, manifest_path.as_deref())
         }
-        FeedbackAction::MoreOf { source_ids } => Ok(apply_source_weight(cfg, source_ids, 1.5)),
-        FeedbackAction::LessOf { source_ids } => Ok(apply_source_weight(cfg, source_ids, 0.0)),
+        FeedbackAction::MoreOf { source_ids } => {
+            Ok(apply_source_weight(cfg, source_ids, WeightStep::More))
+        }
+        FeedbackAction::LessOf { source_ids } => {
+            Ok(apply_source_weight(cfg, source_ids, WeightStep::Less))
+        }
+    }
+}
+
+/// One "more of" multiplies a source's weight by this; one "less of"
+/// divides by it, so the two undo each other exactly.
+const SOURCE_WEIGHT_STEP: f32 = 2.0;
+/// "less of" stops here: the picker multiplies the source's score curve
+/// by its weight and treats an all-zero curve as "never pick this
+/// source", so the floor stays above 0. At 1/8 the source still fills
+/// slots other sources can't, but rarely wins one outright.
+const SOURCE_WEIGHT_FLOOR: f32 = 0.125;
+/// "more of" stops here, three steps up as the floor is three down (the
+/// picker accepts up to 10).
+const SOURCE_WEIGHT_CAP: f32 = 8.0;
+
+#[derive(Debug, Clone, Copy)]
+enum WeightStep {
+    More,
+    Less,
+}
+
+/// The weight one more/less step moves `current` to. Never crosses
+/// its own direction: "less" never raises a weight already below the
+/// floor (a hand-set 0 stays 0), "more" never lowers one already above
+/// the cap.
+fn stepped_weight(current: f32, step: WeightStep) -> f32 {
+    let current = if current.is_finite() { current.max(0.0) } else { 1.0 };
+    match step {
+        WeightStep::Less => current.min((current / SOURCE_WEIGHT_STEP).max(SOURCE_WEIGHT_FLOOR)),
+        WeightStep::More => current
+            .max((current.max(SOURCE_WEIGHT_FLOOR) * SOURCE_WEIGHT_STEP).min(SOURCE_WEIGHT_CAP)),
     }
 }
 
 fn apply_source_weight(
     cfg: &mut Config,
     source_ids: &[String],
-    weight: f32,
+    step: WeightStep,
 ) -> Vec<ChangeNote> {
     let mut notes = Vec::new();
     for sid in source_ids {
-        // Last-write-wins: drop any prior entry for the same source_id
-        // before appending the new one, so calling MoreOf then LessOf
-        // on the same source doesn't leave both entries fighting.
-        let before = cfg
+        // The picker reads the last entry for a source, so that's the
+        // current weight; unset means 1.0.
+        let current = cfg
             .selection
             .source_weights
             .iter()
+            .rev()
             .find(|w| w.source_id == *sid)
-            .map(|w| format!("{:.2}", w.weight))
+            .map(|w| w.weight);
+        let before = current
+            .map(|w| format!("{w:.3}"))
             .unwrap_or_else(|| "(unset; default 1.0)".to_string());
+        let weight = stepped_weight(current.unwrap_or(1.0), step);
+        // Replace any prior entries for the same source_id, so repeated
+        // MoreOf / LessOf calls leave exactly one entry.
         cfg.selection
             .source_weights
             .retain(|w| w.source_id != *sid);
@@ -208,7 +254,7 @@ fn apply_source_weight(
         notes.push(note(
             &format!("selection.source_weights[{sid}]"),
             &before,
-            &format!("{weight:.2}"),
+            &format!("{weight:.3}"),
         ));
     }
     notes
@@ -452,61 +498,22 @@ fn apply_drop_segment(
             )
         })?;
 
-    // Find the segment whose output position covers `at_seconds`. The
-    // manifest stores segments in output order with a per-segment
-    // `duration_secs`. We sum durations to compute output positions
-    // until we land on (or past) the target.
-    let segments = manifest
-        .get("segments")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("manifest has no `segments` array"))?;
-    let intro_dur = manifest
-        .get("intro_duration_secs")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0) as f32;
-
-    let mut output_offset = intro_dur;
-    let mut found: Option<&serde_json::Value> = None;
-    let mut seg_index = 0usize;
-    for (i, s) in segments.iter().enumerate() {
-        let dur = s.get("duration_secs").and_then(|v| v.as_f64()).unwrap_or(0.0)
-            as f32;
-        let end = output_offset + dur;
-        if at_seconds >= output_offset && at_seconds < end {
-            found = Some(s);
-            seg_index = i;
-            break;
-        }
-        output_offset = end;
-    }
-    let seg = found.ok_or_else(|| {
-        anyhow!(
-            "no segment covers output time {at_seconds:.2}s (manifest has {} segments)",
-            segments.len()
-        )
-    })?;
-
-    // Pull the source-window we want to exclude.
-    let chapter_path = seg
-        .get("chapter_path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("segment has no chapter_path"))?;
-    let in_chapter_start = seg
-        .get("in_chapter_start_secs")
-        .and_then(|v| v.as_f64())
-        .ok_or_else(|| anyhow!("segment has no in_chapter_start_secs"))?
-        as f32;
-    let segment_dur = seg
-        .get("duration_secs")
-        .and_then(|v| v.as_f64())
-        .ok_or_else(|| anyhow!("segment has no duration_secs"))?
-        as f32;
+    // What played at `at_seconds`: from the manifest's exact output
+    // timeline when it has one (one entry per clip and per beat-burst cut,
+    // with the real source window), else the old estimate for manifests
+    // written before the timeline existed.
+    let DropTarget { chapter_path, in_chapter_start, source_secs, seg_index } =
+        match drop_target_from_timeline(&manifest, at_seconds) {
+            Some(hit) => hit?,
+            None => drop_target_by_summed_durations(&manifest, at_seconds)?,
+        };
+    let chapter_path = chapter_path.as_str();
+    let segment_dur = source_secs;
     let basename = std::path::Path::new(chapter_path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(chapter_path)
         .to_string();
-
     // Pad the exclude window slightly so the picker can't snap right
     // back to the same neighbourhood — enough to skip past min_clip
     // worth of overlap. 0.5 s on each side is plenty.
@@ -530,6 +537,116 @@ fn apply_drop_segment(
             ),
         },
     ])
+}
+
+/// The source window that played at an output time.
+struct DropTarget {
+    chapter_path: String,
+    in_chapter_start: f32,
+    /// Seconds of source the clip read (its length plus any speed-ramp
+    /// tail).
+    source_secs: f32,
+    seg_index: usize,
+}
+
+/// Look `t` up in the manifest's exact `timeline` (written by
+/// `vibecut::output_timeline`): the clip whose visible span — cut in to
+/// cut out — covers it. A folded beat-burst has one entry per burst cut,
+/// so a drop inside the burst excludes that cut's own footage. `None`
+/// when the manifest has no timeline.
+fn drop_target_from_timeline(
+    manifest: &serde_json::Value,
+    t: f32,
+) -> Option<Result<DropTarget>> {
+    let timeline = manifest.get("timeline").filter(|v| !v.is_null())?;
+    let clips = timeline.get("clips")?.as_array()?;
+    let t = t as f64;
+    let num = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64());
+    let hit = clips.iter().find(|c| {
+        matches!(
+            (num(c, "cut_in_secs"), num(c, "cut_out_secs")),
+            (Some(a), Some(b)) if t >= a && t < b
+        )
+    });
+    let Some(c) = hit else {
+        let cut = |k: &str| timeline.get(k).and_then(|card| num(card, "cut_secs"));
+        let what = if cut("intro").is_some_and(|c| t < c) {
+            "the intro card".to_string()
+        } else if cut("outro").is_some_and(|c| t >= c) {
+            "the outro card".to_string()
+        } else {
+            format!(
+                "past the end of the video ({:.2}s)",
+                num(timeline, "duration_secs").unwrap_or(0.0)
+            )
+        };
+        return Some(Err(anyhow!(
+            "output time {t:.2}s is {what}, not a clip — nothing to drop"
+        )));
+    };
+    let field = |k: &str| num(c, k).ok_or_else(|| anyhow!("timeline clip has no {k}"));
+    Some((|| {
+        let chapter_path = c
+            .get("source_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("timeline clip has no source_path"))?
+            .to_string();
+        let a = field("source_in_secs")?;
+        let b = field("source_out_secs")?;
+        Ok(DropTarget {
+            chapter_path,
+            in_chapter_start: a as f32,
+            source_secs: (b - a).max(0.0) as f32,
+            seg_index: c.get("segment_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        })
+    })())
+}
+
+/// The estimate for manifests without a `timeline`: segments laid end to
+/// end by `duration_secs` from 0, ignoring crossfades, speed ramps and the
+/// intro card. Kept so a drop on an old render still resolves the segment
+/// the UI shows for it (the UI makes the same estimate for such manifests).
+fn drop_target_by_summed_durations(
+    manifest: &serde_json::Value,
+    at_seconds: f32,
+) -> Result<DropTarget> {
+    let segments = manifest
+        .get("segments")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("manifest has no `segments` array"))?;
+    let mut output_offset = 0.0_f32;
+    let mut found: Option<(usize, &serde_json::Value)> = None;
+    for (i, s) in segments.iter().enumerate() {
+        let dur = s.get("duration_secs").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let end = output_offset + dur;
+        if at_seconds >= output_offset && at_seconds < end {
+            found = Some((i, s));
+            break;
+        }
+        output_offset = end;
+    }
+    let (seg_index, seg) = found.ok_or_else(|| {
+        anyhow!(
+            "no segment covers output time {at_seconds:.2}s (manifest has {} segments)",
+            segments.len()
+        )
+    })?;
+    let chapter_path = seg
+        .get("chapter_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("segment has no chapter_path"))?
+        .to_string();
+    let in_chapter_start = seg
+        .get("in_chapter_start_secs")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("segment has no in_chapter_start_secs"))?
+        as f32;
+    let source_secs = seg
+        .get("duration_secs")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("segment has no duration_secs"))?
+        as f32;
+    Ok(DropTarget { chapter_path, in_chapter_start, source_secs, seg_index })
 }
 
 fn apply_reroll(cfg: &mut Config) -> Vec<ChangeNote> {
@@ -994,51 +1111,206 @@ stabilize = false
         assert_eq!(cfg.selection.source_weights.len(), n_before + 2);
         let w0318 = cfg.selection.source_weights.iter()
             .find(|w| w.source_id == "0318").unwrap();
-        assert!((w0318.weight - 1.5).abs() < 1e-4);
+        assert!((w0318.weight - 2.0).abs() < 1e-4);
+        cfg.validate().unwrap();
+    }
+
+    fn weight_of(cfg: &Config, sid: &str) -> f32 {
+        let entries: Vec<_> =
+            cfg.selection.source_weights.iter().filter(|w| w.source_id == sid).collect();
+        assert_eq!(entries.len(), 1, "exactly one entry for {sid}");
+        entries[0].weight
+    }
+
+    #[test]
+    fn less_of_reduces_the_weight_but_never_bans_the_source() {
+        // Weight 0 zeroes the source's score curve and the planner never
+        // picks it again; "less of" must leave it in the running.
+        let mut cfg = base_config();
+        let less = FeedbackAction::LessOf { source_ids: vec!["0320".into()] };
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            apply(&mut cfg, &less).unwrap();
+            seen.push(weight_of(&cfg, "0320"));
+        }
+        assert_eq!(seen, vec![0.5, 0.25, 0.125, 0.125, 0.125]);
+        assert!(seen.iter().all(|&w| w > 0.0));
         cfg.validate().unwrap();
     }
 
     #[test]
-    fn less_of_appends_zero_weight() {
+    fn more_of_keeps_boosting_up_to_the_cap() {
         let mut cfg = base_config();
-        let notes = apply(
-            &mut cfg,
-            &FeedbackAction::LessOf {
-                source_ids: vec!["0320".into()],
-            },
-        )
-        .unwrap();
-        assert_eq!(notes.len(), 1);
-        let w = cfg.selection.source_weights.iter()
-            .find(|w| w.source_id == "0320").unwrap();
-        assert_eq!(w.weight, 0.0);
-        cfg.validate().unwrap();
+        let more = FeedbackAction::MoreOf { source_ids: vec!["0318".into()] };
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            apply(&mut cfg, &more).unwrap();
+            seen.push(weight_of(&cfg, "0318"));
+        }
+        assert_eq!(seen, vec![2.0, 4.0, 8.0, 8.0, 8.0]);
     }
 
     #[test]
     fn more_of_then_less_of_overrides_not_duplicates() {
         let mut cfg = base_config();
-        // First MoreOf.
-        apply(
+        let more = FeedbackAction::MoreOf { source_ids: vec!["0318".into()] };
+        let less = FeedbackAction::LessOf { source_ids: vec!["0318".into()] };
+        // One step each way cancels out, with ONE entry left behind.
+        apply(&mut cfg, &more).unwrap();
+        apply(&mut cfg, &less).unwrap();
+        assert_eq!(weight_of(&cfg, "0318"), 1.0);
+        apply(&mut cfg, &less).unwrap();
+        apply(&mut cfg, &more).unwrap();
+        assert_eq!(weight_of(&cfg, "0318"), 1.0);
+    }
+
+    #[test]
+    fn weight_steps_never_move_the_wrong_way() {
+        // A hand-set 0 ("never use this source") stays 0 under "less of";
+        // "more of" brings it back into play.
+        assert_eq!(stepped_weight(0.0, WeightStep::Less), 0.0);
+        assert_eq!(stepped_weight(0.0, WeightStep::More), 0.25);
+        // Hand-set weights past the bounds aren't pulled back.
+        assert_eq!(stepped_weight(0.05, WeightStep::Less), 0.05);
+        assert_eq!(stepped_weight(10.0, WeightStep::More), 10.0);
+        assert_eq!(stepped_weight(10.0, WeightStep::Less), 5.0);
+    }
+
+    /// A manifest whose timeline disagrees with the summed-durations
+    /// estimate: a 3 s intro card, crossfades, and a folded beat-burst.
+    fn timeline_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "segments": [
+                { "chapter_path": "E:/footage/GH010320.MP4",
+                  "in_chapter_start_secs": 4.0, "duration_secs": 3.0 },
+                { "chapter_path": "/work/.vibecut_x/beat_burst.mp4",
+                  "in_chapter_start_secs": 0.0, "duration_secs": 2.0 },
+                { "chapter_path": "E:/footage/GH010322.MP4",
+                  "in_chapter_start_secs": 20.0, "duration_secs": 3.0 },
+            ],
+            "timeline": {
+                "fps": 30, "frames": 300, "duration_secs": 10.0,
+                "intro": { "start_frame": 0, "end_frame": 90,
+                           "output_start_secs": 0.0, "output_end_secs": 3.0,
+                           "cut_secs": 2.8, "transition_secs": 0.4 },
+                "clips": [
+                    { "segment_index": 0, "source_id": "0320",
+                      "source_path": "E:/footage/GH010320.MP4",
+                      "source_in_secs": 4.0, "source_out_secs": 7.4, "speed": 1.0,
+                      "ramp": { "output_start_secs": 5.4, "factor": 3.0 },
+                      "start_frame": 78, "end_frame": 168,
+                      "output_start_secs": 2.6, "output_end_secs": 5.6,
+                      "cut_in_secs": 2.8, "cut_out_secs": 5.55,
+                      "transition_in_secs": 0.4, "transition_out_secs": 0.1 },
+                    { "segment_index": 1, "burst_part": 0, "source_id": "0304",
+                      "source_path": "E:/footage/GX010304.MP4",
+                      "source_in_secs": 8.0, "source_out_secs": 9.0, "speed": 1.0,
+                      "start_frame": 165, "end_frame": 195,
+                      "output_start_secs": 5.5, "output_end_secs": 6.5,
+                      "cut_in_secs": 5.55, "cut_out_secs": 6.5,
+                      "transition_in_secs": 0.1, "transition_out_secs": 0.0 },
+                    { "segment_index": 1, "burst_part": 1, "source_id": "0301",
+                      "source_path": "E:/footage/GX010301.MP4",
+                      "source_in_secs": 3.0, "source_out_secs": 4.0, "speed": 1.0,
+                      "start_frame": 195, "end_frame": 225,
+                      "output_start_secs": 6.5, "output_end_secs": 7.5,
+                      "cut_in_secs": 6.5, "cut_out_secs": 7.3,
+                      "transition_in_secs": 0.0, "transition_out_secs": 0.4 },
+                    { "segment_index": 2, "source_id": "0322",
+                      "source_path": "E:/footage/GH010322.MP4",
+                      "source_in_secs": 20.0, "source_out_secs": 23.0, "speed": 1.0,
+                      "start_frame": 213, "end_frame": 300,
+                      "output_start_secs": 7.1, "output_end_secs": 10.0,
+                      "cut_in_secs": 7.3, "cut_out_secs": 10.0,
+                      "transition_in_secs": 0.4, "transition_out_secs": 0.0 },
+                ],
+            },
+        })
+    }
+
+    fn drop_at(manifest: &serde_json::Value, name: &str, t: f32) -> Result<Config> {
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(manifest).unwrap()).unwrap();
+        let mut cfg = base_config();
+        let r = apply(
             &mut cfg,
-            &FeedbackAction::MoreOf { source_ids: vec!["0318".into()] },
-        )
-        .unwrap();
-        // Then LessOf on the same source.
-        apply(
-            &mut cfg,
-            &FeedbackAction::LessOf { source_ids: vec!["0318".into()] },
-        )
-        .unwrap();
-        // Should be ONE entry, with weight=0.0.
-        let entries: Vec<_> = cfg
-            .selection
-            .source_weights
-            .iter()
-            .filter(|w| w.source_id == "0318")
-            .collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].weight, 0.0);
+            &FeedbackAction::DropSegment {
+                at_seconds: t,
+                manifest_path: Some(manifest_path.to_string_lossy().into()),
+            },
+        );
+        let _ = std::fs::remove_file(&manifest_path);
+        let _ = std::fs::remove_dir(&dir);
+        r.map(|_| cfg)
+    }
+
+    #[test]
+    fn drop_segment_reads_the_exact_timeline() {
+        // 4.0 s: summing durations from 0 says segment 1 (3–5 s); the clip
+        // really on screen is segment 0 (cuts at 2.8 and 5.55 s), whose
+        // window includes its speed-ramp tail.
+        let cfg = drop_at(&timeline_manifest(), "sv_drop_timeline", 4.0).unwrap();
+        let added = cfg.selection.exclude.last().unwrap();
+        assert_eq!(added.file, "GH010320.MP4");
+        assert!((added.start.as_secs_f32() - 3.5).abs() < 1e-3);
+        assert!((added.end.as_secs_f32() - 7.9).abs() < 1e-3);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn drop_segment_inside_the_burst_drops_that_burst_cut() {
+        // Not the workspace's folded beat_burst.mp4 — the cut's own footage.
+        let cfg = drop_at(&timeline_manifest(), "sv_drop_burst", 6.8).unwrap();
+        let added = cfg.selection.exclude.last().unwrap();
+        assert_eq!(added.file, "GX010301.MP4");
+        assert!((added.start.as_secs_f32() - 2.5).abs() < 1e-3);
+        assert!((added.end.as_secs_f32() - 4.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn drop_segment_reads_the_timeline_the_engine_writes() {
+        // The reader above walks raw JSON; build the timeline with the
+        // engine's own code so a renamed field can't slip past.
+        use vibecut::output_timeline::{ChainItem, ChainLayout, ClipSource, OutputTimeline};
+        let clip = |i: usize, path: &str, start: f64| ClipSource {
+            segment_index: i,
+            source_id: format!("s{i}"),
+            source_path: path.into(),
+            source_in_secs: start,
+            duration_secs: 2.0,
+            ramp: None,
+        };
+        let layout = ChainLayout::new(&[3.0, 2.0, 2.0], &[0.4, 0.4], 30);
+        let items = vec![
+            ChainItem::IntroCard,
+            ChainItem::Clip(clip(0, "E:/footage/GX010320.MP4", 4.0)),
+            ChainItem::Clip(clip(1, "E:/footage/GX010322.MP4", 20.0)),
+        ];
+        let timeline = OutputTimeline::build(&layout, &items);
+        let manifest = serde_json::json!({
+            "segments": [
+                { "chapter_path": "E:/footage/GX010320.MP4", "in_chapter_start_secs": 4.0, "duration_secs": 2.0 },
+                { "chapter_path": "E:/footage/GX010322.MP4", "in_chapter_start_secs": 20.0, "duration_secs": 2.0 },
+            ],
+            "timeline": serde_json::to_value(&timeline).unwrap(),
+        });
+        // 4.6 s: past both segments by summed durations (0–4 s); on screen
+        // it's the second clip (cuts at 4.4 and 6.2 s).
+        let cfg = drop_at(&manifest, "sv_drop_engine_timeline", 4.6).unwrap();
+        let added = cfg.selection.exclude.last().unwrap();
+        assert_eq!(added.file, "GX010322.MP4");
+        assert!((added.start.as_secs_f32() - 19.5).abs() < 1e-3);
+        assert!((added.end.as_secs_f32() - 22.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn drop_segment_on_the_intro_card_drops_nothing() {
+        let e = drop_at(&timeline_manifest(), "sv_drop_intro", 1.0).unwrap_err();
+        assert!(e.to_string().contains("intro card"), "{e}");
+        let e = drop_at(&timeline_manifest(), "sv_drop_past", 12.0).unwrap_err();
+        assert!(e.to_string().contains("past the end"), "{e}");
     }
 
     #[test]

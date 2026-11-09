@@ -2027,9 +2027,16 @@ pub fn concat_with_xfade(
     //  ...
     //
     // O_k = cum_k - dur_t_k  where cum_k is the running output total after
-    // applying all prior xfades.
+    // applying all prior xfades — rounded to a whole frame and written with
+    // enough digits to land exactly on it, by the same layout the manifest
+    // timeline and the beat-sync check use (see `output_timeline`).
+    let layout = crate::output_timeline::ChainLayout::new(
+        &inputs.iter().map(|(_, d)| *d as f64).collect::<Vec<_>>(),
+        &durs.iter().map(|&d| d as f64).collect::<Vec<_>>(),
+        fps,
+    );
     let mut filter = String::new();
-    let mut cum: f32 = inputs[0].1;
+    let cum = layout.duration_secs() as f32;
     for k in 1..n {
         let in_left = if k == 1 {
             "[0:v]".to_string()
@@ -2039,14 +2046,13 @@ pub fn concat_with_xfade(
         let in_right = format!("[{}:v]", k);
         let out_label = format!("[v{}]", k);
         let dur_t = durs[k - 1];
-        let offset = cum - dur_t;
+        let offset = layout.start_secs(k);
         let trans = &transitions[k - 1].0;
         filter.push_str(&format!(
-            "{in_left}{in_right}xfade=transition={trans}:duration={dur:.3}:offset={off:.3}{out_label};",
+            "{in_left}{in_right}xfade=transition={trans}:duration={dur:.3}:offset={off:.6}{out_label};",
             dur = dur_t,
             off = offset,
         ));
-        cum += inputs[k].1 - dur_t;
     }
     let mut final_v = format!("v{}", n - 1);
 
@@ -2626,5 +2632,28 @@ mod tests {
         assert!(args.iter().any(|a| a == "-cq"));
         assert!(args.iter().any(|a| a == "20"));
         assert!(!args.iter().any(|a| a == "-crf"));
+    }
+
+    #[test]
+    fn xfade_offsets_sit_exactly_on_frames() {
+        // Three 1 s clips: a 0.1 s near-cut, then a 13-frame crossfade. Input
+        // 1 starts at frame 27, input 2 at frame 44 (1.4667 s). Written to
+        // three decimals that is "1.467", past the frame boundary — ffmpeg
+        // starts a transition on the first frame at or after its offset, so
+        // the clip came in a frame late. Offsets carry six decimals.
+        let runner = MockRunner::new();
+        let out = camino::Utf8PathBuf::from("/tmp/sv_xfade_offsets/body.mp4");
+        let hw = HwConfig::resolve(HwSupport::default(), EncoderPref::Libx264);
+        let inputs: Vec<(camino::Utf8PathBuf, f32)> = vec![
+            ("a.mp4".into(), 1.0),
+            ("b.mp4".into(), 1.0),
+            ("c.mp4".into(), 1.0),
+        ];
+        let trans = vec![("fade".to_string(), 0.1), ("fade".to_string(), 1.0 - 17.0 / 30.0)];
+        concat_with_xfade(&runner, &inputs, &trans, 64, 36, 30, 20, 0.0, 0.0, &hw, &out).unwrap();
+        let calls = runner.calls.borrow();
+        let fc = calls[0].iter().find(|a| a.contains("xfade=")).unwrap();
+        assert!(fc.contains("offset=0.900000[v1]"), "{fc}");
+        assert!(fc.contains("offset=1.466667[v2]"), "{fc}");
     }
 }

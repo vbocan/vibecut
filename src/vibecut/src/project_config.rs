@@ -516,7 +516,8 @@ pub struct Selection {
     /// Per-source scoring weights. The picker multiplies
     /// each source's score curve by its weight before composing the
     /// pick set. The MCP server's `apply_feedback(MoreOf)` /
-    /// `apply_feedback(LessOf)` actions append entries here. Hand-edits
+    /// `apply_feedback(LessOf)` actions double / halve entries here
+    /// (between 0.125 and 8; never 0). Hand-edits
     /// work too — drop in a `[[selection.source_weights]]` entry to
     /// tilt the picker for a given render.
     #[serde(default)]
@@ -526,7 +527,8 @@ pub struct Selection {
 /// One per-source scoring multiplier. `weight = 1.5` means "give this
 /// source 50 % more weight" — the picker multiplies its score curve
 /// by 1.5 before composing the pick set. `weight = 0.0` effectively
-/// drops the source from candidacy entirely. Last-write-wins if the
+/// drops the source from candidacy entirely (it only fills slots
+/// nothing else can). Last-write-wins if the
 /// same `source_id` appears more than once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -151,7 +151,14 @@ beat_burst_max_beats  = 12               # cap on burst length (default: 12)
 
 `beat_burst = "auto"` enables the burst iff: tempo ∈ [80, 180] BPM,
 pulse strength ≥ 1.8, and the loud region is ≥ 6 s long. Cuts every beat
-≤ 140 BPM, every-other above. Placed in the middle 25–70% of the output.
+≤ 140 BPM, every-other above. Starts in the middle 25–70% of the output, at
+the loudest moment of the song that actually *plays* there — through loop
+copies of a looped soundtrack, and after the intro card — on the beat: the
+clip it lands in is cut short so the burst starts right on it. Every burst
+cut is a different moment. When the footage runs short of them the burst
+gets fewer cuts — two beats long when one-beat cuts can't reach
+`beat_burst_min_beats` — and when even that falls short it is skipped
+rather than repeat a shot.
 
 ### Beat grid
 
@@ -346,6 +353,26 @@ order          = "chronological"         # "chronological" | "energy_arc"
 max_per_source = 5                       # optional override; default: ceil(K / n_sources_with_signal)
 variety        = 0.0                     # 0..1; deterministic top-K when 0; see below
 ```
+
+Per-source weights and excluded ranges tilt the picker for the next
+render; the feedback actions write them, and hand edits work too:
+
+```toml
+[[selection.source_weights]]
+source_id = "0320"                       # GoPro source id (trailing digits of the file name)
+weight    = 0.5                          # × the source's score curve; 1.0 = unchanged, clamped to [0, 10]
+
+[[selection.exclude]]
+file  = "GX010320.MP4"                   # chapter file name (or suffix)
+start = "12s"                            # chapter-local range the picker must avoid
+end   = "17s"
+```
+
+`weight = 0` takes the source out (it only fills slots no other source
+can). "Less of this clip" halves the
+weight (down to 0.125, never 0 — the source still appears, just less) and
+"more of" doubles it (up to 8), so one undoes the other. "Drop this
+moment" adds an `exclude` for the footage that played there.
 
 Use `max_per_source` when target duration is large vs. number of sources
 (e.g., 5-min cut over 80 sources where each has only a couple of strong
@@ -645,4 +672,10 @@ or building tooling on top of it:
   alongside the mp4 with the resolved segment list, sources, and
   effective settings — plus, with a soundtrack, the `beat_sync` report
   (see [Beat-sync report](#beat-sync-report)). Useful for postprocessing,
-  audits, or driving external tooling.
+  audits, or driving external tooling. Its `timeline` records exactly
+  where everything plays, frame for frame, as the concat stage built it:
+  the intro/outro card spans, and per clip (one entry per beat-burst cut)
+  its output start/end frame and seconds, the visible cut in and out
+  (mid-crossfade), the source file and window read, the speed-ramp tail,
+  and the crossfade in and out. Ducking, the beat-sync check and the
+  "drop this moment" feedback all read the same layout.

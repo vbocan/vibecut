@@ -16,13 +16,32 @@ export interface SegmentLayout {
 	index: number;
 	segment: Segment;
 	/** Where the segment plays in the rendered video: exact (from the
-	 *  manifest's beat-sync cut list) when available, else approximate. */
+	 *  manifest's timeline, or its beat-sync cut list) when available,
+	 *  else approximate. */
 	startSecs: number;
 	endSecs: number;
 	/** Cumulative-duration position — what the server's drop-segment
-	 *  feedback uses to identify a segment, so feedback must use these. */
+	 *  feedback uses to identify a segment in manifests without a
+	 *  timeline, so feedback on those must use these. */
 	approxStartSecs: number;
 	approxEndSecs: number;
+}
+
+/** Each segment's visible span `[cut in, cut out)` from the manifest's
+ *  exact timeline (a folded beat-burst has one entry per burst cut, all
+ *  with its segment index), or null when the manifest has no timeline or
+ *  it doesn't cover every segment. */
+function timelineSpans(manifest: Manifest, n: number): [number, number][] | null {
+	const clips = manifest.timeline?.clips;
+	if (!clips?.length) return null;
+	const spans: [number, number][] = Array.from({ length: n }, () => [Infinity, -Infinity]);
+	for (const c of clips) {
+		const s = spans[c.segment_index];
+		if (!s) return null;
+		s[0] = Math.min(s[0], c.cut_in_secs);
+		s[1] = Math.max(s[1], c.cut_out_secs);
+	}
+	return spans.every(([a, b]) => b > a) ? spans : null;
 }
 
 /** One completed render, tracked client-side for the A/B compare
@@ -788,14 +807,12 @@ class AppState {
 	}
 
 	/**
-	 * Segments laid out along the OUTPUT timeline by cumulative
-	 * `duration_secs` — deliberately the same approximation
-	 * `apply_drop_segment` already uses server-side (intro cards and
-	 * per-seam transition/speed-ramp overlap aren't in the manifest at
-	 * all). It won't always land on the exact rendered frame, but it
-	 * identifies the same segment the server would for the same
-	 * `at_seconds`, which is the property that actually matters for
-	 * the feedback actions below.
+	 * Segments laid out along the OUTPUT timeline. Exact when the
+	 * manifest has a `timeline` (each clip's visible cut in/out, as the
+	 * concat stage built it). Older manifests fall back to the beat-sync
+	 * cut list, else to cumulative `duration_secs` — the same estimate
+	 * `apply_drop_segment` makes server-side for manifests without a
+	 * timeline, so feedback identifies the same segment either way.
 	 */
 	segmentLayout = $derived.by((): SegmentLayout[] => {
 		if (!this.manifest) return [];
@@ -815,8 +832,17 @@ class AppState {
 		const intro = cuts.find((c) => c.kind === 'intro_to_body')?.output_secs;
 		const outro = cuts.find((c) => c.kind === 'body_to_outro')?.output_secs;
 		const exact = body.length === segs.length - 1;
-		const starts = exact ? [intro ?? 0, ...body] : approx.map((a) => a[0]);
-		const ends = exact ? [...body, outro ?? this.videoDuration ?? cum] : approx.map((a) => a[1]);
+		const fromTimeline = timelineSpans(this.manifest, segs.length);
+		const starts = fromTimeline
+			? fromTimeline.map((t) => t[0])
+			: exact
+				? [intro ?? 0, ...body]
+				: approx.map((a) => a[0]);
+		const ends = fromTimeline
+			? fromTimeline.map((t) => t[1])
+			: exact
+				? [...body, outro ?? this.videoDuration ?? cum]
+				: approx.map((a) => a[1]);
 		return segs.map((segment, index) => ({
 			index,
 			segment,
@@ -827,11 +853,12 @@ class AppState {
 		}));
 	});
 
-	/** True when segment times come from the exact cut list. */
+	/** True when segment times come from the exact timeline or cut list. */
 	exactTimeline = $derived(
-		!!this.manifest?.beat_sync &&
-			this.manifest.beat_sync.cuts.filter((c) => c.kind === 'body').length ===
-				this.manifest.segments.length - 1
+		(!!this.manifest && timelineSpans(this.manifest, this.manifest.segments.length) !== null) ||
+			(!!this.manifest?.beat_sync &&
+				this.manifest.beat_sync.cuts.filter((c) => c.kind === 'body').length ===
+					this.manifest.segments.length - 1)
 	);
 
 	/** Rendered video length, set by the player once metadata loads. */
@@ -842,7 +869,8 @@ class AppState {
 	 *  loop crossfades are whole beats). */
 	beatTimes = $derived.by((): number[] => {
 		const r = this.manifest?.beat_sync;
-		const dur = this.videoDuration ?? this.segmentLayout.at(-1)?.endSecs ?? 0;
+		const dur =
+			this.videoDuration ?? this.manifest?.timeline?.duration_secs ?? this.segmentLayout.at(-1)?.endSecs ?? 0;
 		if (!r || r.beat_interval_secs <= 0 || !r.cuts.length || dur <= 0) return [];
 		const anchor = r.cuts[0].beat_secs;
 		const step = r.beat_interval_secs;
@@ -859,7 +887,12 @@ class AppState {
 	}
 
 	async dropSegment(layout: SegmentLayout) {
-		const midpoint = (layout.approxStartSecs + layout.approxEndSecs) / 2;
+		// The server looks the time up in the manifest's timeline when it
+		// has one; for older manifests it sums durations, so send that.
+		const midpoint =
+			this.manifest && timelineSpans(this.manifest, this.manifest.segments.length)
+				? (layout.startSecs + layout.endSecs) / 2
+				: (layout.approxStartSecs + layout.approxEndSecs) / 2;
 		await this.quickFeedback({
 			kind: 'drop_segment',
 			at_seconds: midpoint,

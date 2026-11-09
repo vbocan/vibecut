@@ -826,6 +826,12 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub beat_sync: Option<crate::beat_sync::BeatSyncReport>,
+    /// Exactly where every clip and card plays in the rendered video, as
+    /// the concat stage laid it out (see `output_timeline`). Absent in
+    /// manifests written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub timeline: Option<crate::output_timeline::OutputTimeline>,
     pub generator: String,
 }
 

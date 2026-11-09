@@ -6,7 +6,8 @@
 //! 1. **Where the cut really is.** Each crossfade overlaps its two clips,
 //!    ramped seams collapse to near-cuts, the beat-burst is folded into one
 //!    input with its own internal hard cuts, and an intro card shifts
-//!    everything after it. [`planned_cuts`] mirrors the concat stage exactly.
+//!    everything after it. [`planned_cuts`] lays the chain out with the
+//!    concat stage's own frame-exact arithmetic (`output_timeline`).
 //! 2. **Where each beat really plays.** The smart loop chains copies of the
 //!    soundtrack with ~2 s crossfades, which shifts the beat grid at every
 //!    loop seam. [`beats_in_output`] maps the soundtrack's beats through
@@ -75,49 +76,25 @@ pub struct PlannedCut {
 /// `k + 1` as the renderer applies it (0 for hard concat). `burst` is
 /// `(input_index, sub_clip_durations)` for a folded beat-burst input.
 ///
-/// Mirrors `concat_with_xfade`: input `k` starts at the running output
-/// length minus its incoming crossfade, and the visible cut sits in the
-/// middle of that crossfade.
+/// Laid out by [`ChainLayout`](crate::output_timeline::ChainLayout), the
+/// same frame-exact arithmetic the concat stage takes its xfade offsets
+/// from: input `k` starts at the running output length minus its incoming
+/// crossfade, and the visible cut sits in the middle of that crossfade.
 pub fn planned_cuts(
     input_durs: &[f32],
     seam_durs: &[f32],
     has_intro: bool,
     has_outro: bool,
     burst: Option<(usize, &[f32])>,
+    fps: u32,
 ) -> Vec<PlannedCut> {
-    let n = input_durs.len();
-    let mut cuts = Vec::new();
-    if n == 0 {
-        return cuts;
-    }
-    let mut starts = Vec::with_capacity(n);
-    starts.push(0.0_f32);
-    let mut cum = input_durs[0];
-    for k in 1..n {
-        let x = seam_durs.get(k - 1).copied().unwrap_or(0.0).max(0.0);
-        let start = cum - x;
-        starts.push(start);
-        let kind = if has_intro && k == 1 {
-            CutKind::IntroToBody
-        } else if has_outro && k == n - 1 {
-            CutKind::BodyToOutro
-        } else {
-            CutKind::Body
-        };
-        cuts.push(PlannedCut { output_secs: start + x * 0.5, kind });
-        cum += input_durs[k] - x;
-    }
-    if let Some((idx, subs)) = burst {
-        if let Some(&s) = starts.get(idx) {
-            let mut t = s;
-            for d in subs.iter().take(subs.len().saturating_sub(1)) {
-                t += d;
-                cuts.push(PlannedCut { output_secs: t, kind: CutKind::BurstInternal });
-            }
-        }
-    }
-    cuts.sort_by(|a, b| a.output_secs.total_cmp(&b.output_secs));
-    cuts
+    use crate::output_timeline::{chain_cuts, ChainLayout};
+    let durs: Vec<f64> = input_durs.iter().map(|&d| d as f64).collect();
+    let seams: Vec<f64> = seam_durs.iter().map(|&d| d as f64).collect();
+    let subs: Option<(usize, Vec<f64>)> =
+        burst.map(|(i, d)| (i, d.iter().map(|&x| x as f64).collect()));
+    let layout = ChainLayout::new(&durs, &seams, fps);
+    chain_cuts(&layout, has_intro, has_outro, subs.as_ref().map(|(i, d)| (*i, d.as_slice())))
 }
 
 /// Map soundtrack beat times into output time through the mux layout.
@@ -352,7 +329,7 @@ mod tests {
         // Intro 3 s, three 2 s clips, outro 2 s, 0.4 s crossfades.
         let durs = [3.0, 2.0, 2.0, 2.0, 2.0];
         let seams = [0.4; 4];
-        let cuts = planned_cuts(&durs, &seams, true, true, None);
+        let cuts = planned_cuts(&durs, &seams, true, true, None, 30);
         let times: Vec<f32> = cuts.iter().map(|c| c.output_secs).collect();
         // Input k starts at Σd − k·0.4; cut at start + 0.2.
         let want = [2.8, 4.4, 6.0, 7.6];
@@ -366,7 +343,7 @@ mod tests {
 
     #[test]
     fn hard_concat_cuts_are_cumulative() {
-        let cuts = planned_cuts(&[1.5, 2.0, 2.5], &[0.0, 0.0], false, false, None);
+        let cuts = planned_cuts(&[1.5, 2.0, 2.5], &[0.0, 0.0], false, false, None, 30);
         let times: Vec<f32> = cuts.iter().map(|c| c.output_secs).collect();
         assert!(approx(times[0], 1.5) && approx(times[1], 3.5), "{times:?}");
         assert!(cuts.iter().all(|c| c.kind == CutKind::Body));
@@ -376,7 +353,7 @@ mod tests {
     fn burst_internal_cuts_follow_the_burst_input_start() {
         // Inputs: clip 2 s, burst (4 × 0.5 s) 2 s, clip 2 s; 0.4 s seams.
         let subs = [0.5, 0.5, 0.5, 0.5];
-        let cuts = planned_cuts(&[2.0, 2.0, 2.0], &[0.4, 0.4], false, false, Some((1, &subs)));
+        let cuts = planned_cuts(&[2.0, 2.0, 2.0], &[0.4, 0.4], false, false, Some((1, &subs)), 30);
         let internal: Vec<f32> = cuts
             .iter()
             .filter(|c| c.kind == CutKind::BurstInternal)

@@ -17,24 +17,35 @@
 //!
 //! # Placement
 //!
-//! Burst start = `energy_peak_time` (the argmax of the soundtrack's energy
-//! curve), snapped to the next beat. The burst replaces a contiguous slice
-//! of normally-paced segments around that output time so the total runtime
+//! Everything happens in *output* time. Song time only equals output time
+//! until the soundtrack first loops, so the energy curve is mapped through
+//! the mux's soundtrack layout (every loop copy) and the burst starts at the
+//! loudest moment that actually plays inside the placement window, snapped
+//! to the next beat in output time. Where each pick sits comes from the
+//! concat stage's own layout arithmetic (intro card, crossfades, beat
+//! lock). Speed-ramp near-cuts are decided after the burst; the beat lock
+//! absorbs them, but with `beat_align = false` each ramped seam ahead of
+//! the burst moves it later by the crossfade it no longer has. The pick
+//! the drop falls in is cut short so the burst starts
+//! on it, and the burst replaces the picks it covers so the total runtime
 //! stays close to `target_duration`.
 //!
 //! # Source clips
 //!
 //! Burst sub-clips come from the *same* score curves the main picker drew
 //! from, but explicitly avoid moments already chosen by the main picker.
-//! NMS-spaced (≥ 1 s apart in source time) to avoid two consecutive burst
-//! cuts being from the same instant of the same source.
+//! NMS-spaced (≥ 1 s, and ≥ one cut, apart in source time) so no two burst
+//! cuts show the same instant. Short of distinct moments, the burst uses
+//! fewer, longer cuts, or none — it never repeats a shot.
 
 use camino::Utf8PathBuf;
 
 use crate::audio_analysis::AnalyzedAudio;
+use crate::beat_sync::beats_in_output;
 use crate::project_config::{BeatBurstMode, Soundtrack};
 use crate::selection_planner::{Segment, Source, snap_to_chapter};
 use crate::selection_scoring::ScoreCurve;
+use crate::video_renderer::SoundtrackSpan;
 
 // ---- Suitability gate thresholds ----
 /// Minimum tempo for beat-burst suitability: slow ballads don't cut well.
@@ -58,8 +69,13 @@ const BURST_EVERY_OTHER_BEAT_THRESHOLD_BPM: f32 = 140.0;
 
 // ---- NMS spacing inside the burst candidate pool ----
 /// Minimum source-time gap (seconds) between two burst sub-clip candidates from
-/// the same source, enforced by non-maximum suppression during pool building.
+/// the same source, enforced by non-maximum suppression during pool building
+/// (raised to the cut length for longer cuts, so windows never overlap).
 const BURST_NMS_SPACING_SECS: f64 = 1.0;
+
+/// Shortest stretch of the segment the drop falls in worth keeping ahead of
+/// the burst; with less, the burst starts at that segment's own cut.
+const BURST_MIN_LEAD_IN_SECS: f64 = 1.0;
 
 /// Was a burst attempted? Why or why not?
 #[derive(Debug, Clone)]
@@ -142,38 +158,62 @@ pub struct BurstSubClip {
 pub struct BurstPlan {
     /// Index into `segments[]` where the burst replaces existing picks.
     pub replace_at: usize,
-    /// How many existing segments are removed at `replace_at`.
+    /// How many existing segments are removed at `replace_at` (may be 0:
+    /// the burst is then inserted between two picks).
     pub replace_count: usize,
-    /// New burst sub-clips to insert.
+    /// Seconds to cut from the end of `segments[replace_at - 1]` so the
+    /// burst starts on the drop instead of at the next existing cut.
+    pub trim_before_secs: Option<f64>,
+    /// New burst sub-clips to insert. Never two of the same moment.
     pub sub_clips: Vec<BurstSubClip>,
     /// For logs / explain output.
     pub verdict: SuitabilityVerdict,
     /// Output time (in the rendered timeline) where the burst starts.
     pub output_start_secs: f32,
-    /// Per-clip beat duration after applying the every-other-beat rule.
+    /// Length of each burst cut (`beats_per_cut` beats).
     pub beat_secs: f32,
-    /// Number of beats per burst cut: 1 (normal) or 2 (every-other for fast tempos).
+    /// Beats per burst cut: 1 normally, 2 for fast tempos or when there
+    /// aren't enough distinct moments for one-beat cuts.
     pub beats_per_cut: u32,
 }
 
-/// Plan a single beat-burst at the soundtrack's energy peak.
-///
-/// `output_starts[i]` and `output_durs[i]` are the existing main-picker
-/// segments' offsets in the OUTPUT timeline, accounting for intro and xfade
-/// overlaps. Both are parallel to `segments`.
+/// Where the planned cut and the soundtrack sit in the output, for
+/// [`plan_burst`].
+#[derive(Debug, Clone, Copy)]
+pub struct BurstContext<'a> {
+    /// Visible span `(cut_in, cut_out)` of each segment in output seconds,
+    /// parallel to `segments` — predicted with the concat stage's own
+    /// arithmetic (`output_timeline::predict_layout`).
+    pub clip_spans: &'a [(f64, f64)],
+    /// Where each copy of the soundtrack plays in the output (the mux
+    /// layout, `SoundtrackLoopPlan::spans`): song time is not output time
+    /// once the soundtrack loops.
+    pub soundtrack: &'a [SoundtrackSpan],
+    /// Output time the footage starts (after an intro card) and ends.
+    pub body_start: f64,
+    pub body_end: f64,
+    /// Length of the whole output.
+    pub total: f64,
+}
+
+/// Plan a single beat-burst at the soundtrack's energy peak *as it plays in
+/// the output*: the loudest moment of the song inside the placement window,
+/// looking through every loop copy, snapped to the next beat in output
+/// time. The segment that moment falls in is cut short so the burst starts
+/// right there (or, when that would leave a stub, the burst starts at the
+/// segment's own cut), and the burst replaces the picks it covers.
 ///
 /// Returns `None` if the soundtrack isn't suitable, the burst won't fit, or
-/// no burst clips can be drawn from the score curves.
+/// there aren't enough distinct moments to fill it: when one-beat cuts would
+/// need more moments than the footage has, the burst uses fewer, two-beat
+/// cuts, and skips altogether rather than repeat a shot.
 pub fn plan_burst(
     audio: &AnalyzedAudio,
     snd: &Soundtrack,
     segments: &[Segment],
-    output_starts: &[f32],
-    output_durs: &[f32],
+    ctx: &BurstContext<'_>,
     sources: &[Source],
     curves: &[ScoreCurve],
-    intro_dur_secs: f32,
-    total_output_secs: f32,
 ) -> Option<BurstPlan> {
     if matches!(snd.beat_burst, BeatBurstMode::Off) {
         return None;
@@ -183,162 +223,193 @@ pub fn plan_burst(
     if !verdict.is_suitable() && !force_on {
         return None;
     }
-
-    let (peak_secs, loud_start, loud_end) = match verdict {
-        SuitabilityVerdict::Suitable {
-            peak_secs,
-            loud_start,
-            loud_end,
-        } => (peak_secs, loud_start, loud_end),
-        _ => {
-            // force_on path: fall back to the middle of the track so the burst still lands somewhere musical.
-            (
-                audio.duration_secs * 0.5,
-                0.0,
-                audio.duration_secs.max(6.0),
-            )
-        }
-    };
-
-    // The soundtrack plays under the OUTPUT timeline starting at output_t = 0.
-    // We additionally clamp the burst to the middle ~half of the output so it
-    // never lands too close to the start (visually disorienting before the
-    // viewer settles in) or too close to the end (collides with the outro and
-    // truncates the burst's effect). [25%, 70%] is a good compromise: well
-    // past the intro, well before the closing tail, and biased slightly past
-    // the midpoint so the burst feels like a "build to climax" moment.
-    let max_t = total_output_secs.max(1.0);
-    let placement_lo = (max_t * BURST_PLACEMENT_LO_FRACTION).max(intro_dur_secs);
-    let placement_hi = (max_t * BURST_PLACEMENT_HI_FRACTION).max(placement_lo + 1.0);
-    let loud_end = loud_end.min(placement_hi);
-    let loud_start = loud_start.max(placement_lo);
-    let mut peak_secs = peak_secs.clamp(placement_lo, placement_hi);
-    if peak_secs < loud_start {
-        // Loud region got clipped past the peak; aim near the middle of what's audible.
-        peak_secs = ((loud_start + loud_end) * 0.5).max(placement_lo);
+    if segments.is_empty() || ctx.clip_spans.len() != segments.len() || ctx.soundtrack.is_empty() {
+        return None;
     }
-
-    let beat_interval = audio.beat_interval_secs();
+    // Loud region of the song (song time). Forced on an unsuitable track:
+    // the whole song counts.
+    let (loud_start, loud_end) = match verdict {
+        SuitabilityVerdict::Suitable { loud_start, loud_end, .. } => (loud_start, loud_end),
+        _ => (0.0, audio.duration_secs),
+    };
+    let beat_interval = audio.beat_interval_secs() as f64;
     if beat_interval <= 0.0 || audio.beats.is_empty() {
         return None;
     }
 
-    // Every-other-beat for fast tempos so the cut rate stays under ~3 Hz.
-    let beats_per_cut: u32 = if audio.tempo_bpm > BURST_EVERY_OTHER_BEAT_THRESHOLD_BPM { 2 } else { 1 };
-    let beat_secs = beat_interval * beats_per_cut as f32;
+    // Placement window, in output time. [25 %, 70 %] keeps the burst away
+    // from the very start (the viewer hasn't settled in) and from the
+    // closing tail, and never before the footage starts.
+    let max_t = ctx.total.max(1.0) as f32;
+    let placement_lo = (max_t * BURST_PLACEMENT_LO_FRACTION).max(ctx.body_start as f32);
+    let placement_hi = (max_t * BURST_PLACEMENT_HI_FRACTION).max(placement_lo + 1.0);
+    let loud = Some((loud_start, loud_end));
+    let peak = output_energy_peak(audio, ctx.soundtrack, placement_lo, placement_hi, loud)
+        .or_else(|| output_energy_peak(audio, ctx.soundtrack, placement_lo, placement_hi, None))?;
+    let beats = beats_in_output(&audio.beats, ctx.soundtrack);
+    let peak_beat = *beats.get(beats.partition_point(|&b| b < peak - 1e-4))? as f64;
 
-    // How many beats fit in the loud region?
-    let loud_len = (loud_end - loud_start).max(0.0);
-    let max_beats_by_loud = (loud_len / beat_secs).floor() as u32;
-    let mut n_beats = max_beats_by_loud.min(snd.beat_burst_max_beats);
-    if n_beats < snd.beat_burst_min_beats {
-        if force_on {
-            n_beats = snd.beat_burst_min_beats;
-        } else {
+    // Start the burst on the drop: keep the segment it falls in, cut short,
+    // unless that leaves a stub — then the burst starts at that segment's
+    // own (beat-locked) cut instead.
+    let i0 = ctx.clip_spans.iter().position(|&(a, b)| peak_beat >= a && peak_beat < b)?;
+    let (cut_in, cut_out) = ctx.clip_spans[i0];
+    let (replace_at, trim_before_secs, start) = if peak_beat - cut_in >= BURST_MIN_LEAD_IN_SECS {
+        let trim = cut_out - peak_beat;
+        (i0 + 1, (trim > 1e-3).then_some(trim), peak_beat)
+    } else {
+        (i0, None, cut_in)
+    };
+
+    // How many beats fit: while the music stays loud (song time inside the
+    // loud region, whichever copy is playing) and the footage lasts.
+    let loud_at = |o: f64| {
+        song_time_at(ctx.soundtrack, o as f32).is_some_and(|t| t >= loud_start && t <= loud_end)
+    };
+    let room = ((ctx.body_end - start) / beat_interval + 1e-6).floor().max(0.0) as u32;
+    let mut n_beats = 0u32;
+    while n_beats < room.min(snd.beat_burst_max_beats)
+        && loud_at(start + n_beats as f64 * beat_interval)
+    {
+        n_beats += 1;
+    }
+    let min_beats = snd.beat_burst_min_beats.max(2);
+    if n_beats < min_beats {
+        if !force_on || room < min_beats {
             return None;
         }
+        n_beats = min_beats;
     }
 
-    // The soundtrack starts at output_t = 0 (it plays under the entire output
-    // including the intro card). So peak_secs in the soundtrack === peak_secs
-    // in the output timeline. Snap to the next beat ≥ peak_secs.
-    let mut burst_output_start = audio.beat_at_or_after(peak_secs);
-    // Ensure the burst doesn't fall outside the output. If we don't know total
-    // output duration here, we just ensure it doesn't start before the intro
-    // ends (so it lands on real footage, not on the intro card).
-    if burst_output_start < intro_dur_secs {
-        burst_output_start = audio.beat_at_or_after(intro_dur_secs);
-    }
-    let burst_secs = beat_secs * n_beats as f32;
-    let burst_output_end = burst_output_start + burst_secs;
-
-    // Find the segment slice that ACTUALLY overlaps the burst output window.
-    // A segment [s, s+d] overlaps the burst window [bs, be] iff s+d > bs && s < be.
-    if segments.is_empty() {
-        return None;
-    }
-    let mut first_overlap: Option<usize> = None;
-    let mut last_overlap: Option<usize> = None;
-    for i in 0..segments.len() {
-        let s = output_starts[i];
-        let e = s + output_durs[i];
-        if e > burst_output_start && s < burst_output_end {
-            if first_overlap.is_none() {
-                first_overlap = Some(i);
-            }
-            last_overlap = Some(i);
-        }
-    }
-    let (replace_at, replace_end) = match (first_overlap, last_overlap) {
-        (Some(a), Some(b)) => (a, b + 1),
-        _ => {
-            // Burst falls past the end of the existing picks (e.g. peak near
-            // the end of a long song that exceeds output duration). Snap the
-            // burst to a fitting earlier window: the LAST few segments of the
-            // output, replacing them. We keep `replace_count` proportional to
-            // the burst's total duration so the output length stays close to
-            // target.
-            let target_replace = ((burst_secs / (output_durs.first().copied().unwrap_or(1.0))).round() as usize).max(1);
-            let count = target_replace.min(segments.len());
-            (segments.len() - count, segments.len())
-        }
-    };
-    let replace_count = replace_end.saturating_sub(replace_at).max(1);
-
-    // Pick burst sub-clips: the highest-scoring moments NOT already used by
-    // main picks, NMS-spaced ≥ 1 s apart in their source's virtual timeline.
+    // Burst sub-clips: the highest-scoring moments NOT already used by main
+    // picks, never the same moment twice. One-beat cuts (two above 140 BPM,
+    // so the cut rate stays under ~3 Hz); with too few distinct moments for
+    // those, cuts twice as long — and no burst at all if even that falls
+    // short of `beat_burst_min_beats`.
     let used: Vec<(String, f64, f64)> = segments
         .iter()
-        .map(|s| {
-            (
-                s.source_id.clone(),
-                s.virtual_start_secs,
-                s.virtual_start_secs + s.duration_secs,
-            )
-        })
+        .map(|s| (s.source_id.clone(), s.virtual_start_secs, s.virtual_start_secs + s.duration_secs))
         .collect();
-    let candidates =
-        rank_burst_candidates(sources, curves, &used, beat_secs as f64, n_beats as usize * 4);
-    if candidates.is_empty() {
-        return None;
-    }
+    let base: u32 = if audio.tempo_bpm > BURST_EVERY_OTHER_BEAT_THRESHOLD_BPM { 2 } else { 1 };
+    let (beats_per_cut, sub_clips) = [base, base * 2].into_iter().find_map(|per| {
+        let wanted = (n_beats / per) as usize;
+        if wanted < 2 {
+            return None;
+        }
+        let cut_secs = beat_interval * per as f64;
+        let spacing = BURST_NMS_SPACING_SECS.max(cut_secs);
+        let candidates = rank_burst_candidates(sources, curves, &used, cut_secs, spacing, wanted * 4);
+        let clips = distinct_sub_clips(&candidates, sources, &used, cut_secs, wanted);
+        (clips.len() >= 2 && clips.len() as u32 * per >= min_beats).then_some((per, clips))
+    })?;
+    let beat_secs = (beat_interval * beats_per_cut as f64) as f32;
 
-    let mut sub_clips = Vec::with_capacity(n_beats as usize);
-    for k in 0..(n_beats as usize) {
-        let cand = &candidates[k % candidates.len()];
-        let source = match sources.iter().find(|s| s.id == cand.source_id) {
-            Some(s) => s,
-            None => continue,
-        };
-        // Center the beat-clip on the candidate moment.
-        let v_start = (cand.center_secs - beat_secs as f64 * 0.5).max(0.0);
-        let snapped = match snap_to_chapter(source, v_start, beat_secs as f64) {
-            Some(seg) => seg,
-            None => continue,
-        };
-        sub_clips.push(BurstSubClip {
-            source_id: snapped.source_id,
-            chapter_path: snapped.chapter_path,
-            chapter_index: snapped.chapter_index,
-            in_chapter_start_secs: snapped.in_chapter_start_secs,
-            duration_secs: beat_secs as f64,
-            virtual_start_secs: snapped.virtual_start_secs,
-            score: cand.score,
-        });
-    }
-    if sub_clips.is_empty() {
-        return None;
+    // Replace the picks the burst covers: those whose middle falls before
+    // the burst ends, so the runtime stays close to the plan.
+    let burst_end = start + sub_clips.len() as f64 * beat_secs as f64;
+    let mut replace_end = replace_at;
+    while replace_end < segments.len() {
+        let (a, b) = ctx.clip_spans[replace_end];
+        if (a + b) * 0.5 >= burst_end {
+            break;
+        }
+        replace_end += 1;
     }
 
     Some(BurstPlan {
         replace_at,
-        replace_count,
+        replace_count: replace_end - replace_at,
+        trim_before_secs,
         sub_clips,
         verdict,
-        output_start_secs: burst_output_start,
+        output_start_secs: start as f32,
         beat_secs,
         beats_per_cut,
     })
+}
+
+/// Song time playing at output time `o`, if the soundtrack plays there.
+fn song_time_at(spans: &[SoundtrackSpan], o: f32) -> Option<f32> {
+    spans
+        .iter()
+        .find(|s| o >= s.output_start && o < s.output_end)
+        .map(|s| s.source_start + (o - s.output_start))
+}
+
+/// Output time of the soundtrack's loudest moment within `[lo, hi]`,
+/// looking at every copy the mux lays down. `loud` restricts it to song
+/// times inside the loud region. The earliest of equally loud moments wins.
+fn output_energy_peak(
+    audio: &AnalyzedAudio,
+    spans: &[SoundtrackSpan],
+    lo: f32,
+    hi: f32,
+    loud: Option<(f32, f32)>,
+) -> Option<f32> {
+    let dt = 1.0 / audio.energy_rate.max(1.0);
+    let mut best: Option<(f32, f32)> = None; // (energy, output time)
+    for span in spans {
+        for (i, &e) in audio.energy_curve.iter().enumerate() {
+            let t = i as f32 * dt;
+            if loud.is_some_and(|(a, b)| t < a || t > b) {
+                continue;
+            }
+            let o = span.output_start + (t - span.source_start);
+            if o < span.output_start || o >= span.output_end || o < lo || o > hi {
+                continue;
+            }
+            if best.map_or(true, |(be, bo)| e > be || (e == be && o < bo)) {
+                best = Some((e, o));
+            }
+        }
+    }
+    best.map(|(_, o)| o)
+}
+
+/// Snap ranked candidates to clips of `cut_secs`, keeping only windows that
+/// overlap neither each other nor a main pick (in virtual source time): a
+/// window slid back to fit its chapter can land on a moment already shown.
+fn distinct_sub_clips(
+    candidates: &[BurstCandidate],
+    sources: &[Source],
+    used: &[(String, f64, f64)],
+    cut_secs: f64,
+    want: usize,
+) -> Vec<BurstSubClip> {
+    let mut out: Vec<BurstSubClip> = Vec::with_capacity(want);
+    for cand in candidates {
+        if out.len() >= want {
+            break;
+        }
+        let Some(source) = sources.iter().find(|s| s.id == cand.source_id) else {
+            continue;
+        };
+        let v_start = (cand.center_secs - cut_secs * 0.5).max(0.0);
+        let Some(snapped) = snap_to_chapter(source, v_start, cut_secs) else {
+            continue;
+        };
+        let (a, b) = (snapped.virtual_start_secs, snapped.virtual_start_secs + cut_secs);
+        let overlaps_burst = out.iter().any(|c| {
+            c.source_id == snapped.source_id
+                && a < c.virtual_start_secs + c.duration_secs
+                && c.virtual_start_secs < b
+        });
+        let overlaps_pick =
+            used.iter().any(|(id, us, ue)| *id == snapped.source_id && a < *ue && *us < b);
+        if overlaps_burst || overlaps_pick {
+            continue;
+        }
+        out.push(BurstSubClip {
+            source_id: snapped.source_id,
+            chapter_path: snapped.chapter_path,
+            chapter_index: snapped.chapter_index,
+            in_chapter_start_secs: snapped.in_chapter_start_secs,
+            duration_secs: cut_secs,
+            virtual_start_secs: snapped.virtual_start_secs,
+            score: cand.score,
+        });
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -349,14 +420,15 @@ struct BurstCandidate {
 }
 
 /// Rank candidate moments across all sources for the burst pool. Excludes
-/// moments overlapping the main picker's segments and applies a minimum
-/// 1 s spacing per source so we don't draw two adjacent burst cuts from the
+/// moments overlapping the main picker's segments and keeps candidates from
+/// the same source at least `spacing` apart, so no two burst cuts show the
 /// same instant.
 fn rank_burst_candidates(
     sources: &[Source],
     curves: &[ScoreCurve],
     used: &[(String, f64, f64)],
     beat_secs: f64,
+    spacing: f64,
     want: usize,
 ) -> Vec<BurstCandidate> {
     let mut cands: Vec<BurstCandidate> = Vec::new();
@@ -401,7 +473,7 @@ fn rank_burst_candidates(
     for c in cands {
         let collide = kept.iter().any(|k| {
             k.source_id == c.source_id
-                && (k.center_secs - c.center_secs).abs() < BURST_NMS_SPACING_SECS
+                && (k.center_secs - c.center_secs).abs() < spacing
         });
         if !collide {
             kept.push(c);
@@ -503,60 +575,198 @@ mod tests {
         toml::from_str(s).unwrap()
     }
 
-    #[test]
-    fn plan_returns_burst_when_suitable() {
-        // 3 sources of 30s each; main picker took 5 segments.
-        let sources = vec![
-            make_source("A", 30.0),
-            make_source("B", 30.0),
-            make_source("C", 30.0),
-        ];
-        // Curves: each source has alternating peaks + valleys → many local maxima.
-        let mut curves = Vec::new();
-        for _ in 0..3 {
-            let mut c = ScoreCurve::zeros(30.0, 4.0);
-            for i in 0..c.samples.len() {
-                c.samples[i] = if i % 2 == 0 { 0.5 + (i as f32 * 0.01).sin().abs() } else { 0.0 };
-            }
-            curves.push(c);
+    /// Peaks every other sample (every 0.5 s at 4 Hz) — plenty of
+    /// distinct burst candidates.
+    fn busy_curve(dur: f32) -> ScoreCurve {
+        let mut c = ScoreCurve::zeros(dur, 4.0);
+        for i in 0..c.samples.len() {
+            c.samples[i] = if i % 2 == 0 { 0.5 + (i as f32 * 0.01).sin().abs() } else { 0.0 };
         }
-        // 5 main segments at output_t 0, 3, 6, 9, 12 (3s each).
-        let mut segments = Vec::new();
-        for k in 0..5 {
-            segments.push(Segment {
-                source_id: format!("{}", ['A', 'B', 'C'][k % 3]),
-                chapter_path: format!("{}.MP4", ['A', 'B', 'C'][k % 3]).into(),
-                chapter_index: 1,
-                in_chapter_start_secs: (k * 5) as f64,
-                duration_secs: 3.0,
-                virtual_start_secs: (k * 5) as f64,
-                reason: "test".into(),
-                score: None,
-            });
-        }
-        let output_starts: Vec<f32> = (0..5).map(|k| k as f32 * 3.0).collect();
-        let output_durs: Vec<f32> = vec![3.0; 5];
+        c
+    }
 
-        // Audio with peak at t=10s.
-        let mut energy = vec![0.5_f32; 80];
-        for i in 36..44 {
-            energy[i] = 1.0;
+    /// A curve with peaks only at `peaks` (seconds).
+    fn sparse_curve(dur: f32, peaks: &[f32]) -> ScoreCurve {
+        let mut c = ScoreCurve::zeros(dur, 4.0);
+        for &p in peaks {
+            let i = (p * 4.0) as usize;
+            c.samples[i] = 1.0;
         }
-        // Trim edges so loud-region detection picks the middle.
+        c
+    }
+
+    /// 120 BPM song with quiet edges and a loud stretch `[peak, peak + 2)`.
+    fn song_with_peak(dur: f32, peak: f32) -> AnalyzedAudio {
+        let n = (dur * 4.0) as usize;
+        let mut energy = vec![0.5_f32; n];
+        for (i, e) in energy.iter_mut().enumerate() {
+            let t = i as f32 / 4.0;
+            if t >= peak && t < peak + 2.0 {
+                *e = 1.0;
+            }
+        }
         for i in 0..6 {
             energy[i] = 0.05;
-            energy[80 - 1 - i] = 0.05;
+            energy[n - 1 - i] = 0.05;
         }
-        let audio = make_audio(120.0, 3.0, 20.0, energy);
-        let snd = default_soundtrack();
+        make_audio(120.0, 3.0, dur, energy)
+    }
 
-        let plan = plan_burst(
-            &audio, &snd, &segments, &output_starts, &output_durs, &sources, &curves, 0.0, 30.0,
-        );
-        let plan = plan.expect("expected a burst plan");
+    /// `n` main picks of `len` seconds back to back from `source`.
+    fn picks(n: usize, len: f64, source: &str) -> (Vec<Segment>, Vec<(f64, f64)>) {
+        let segs = (0..n)
+            .map(|k| Segment {
+                source_id: source.into(),
+                chapter_path: format!("{source}.MP4").into(),
+                chapter_index: 1,
+                in_chapter_start_secs: k as f64 * len,
+                duration_secs: len,
+                virtual_start_secs: k as f64 * len,
+                reason: "test".into(),
+                score: None,
+            })
+            .collect();
+        let spans = (0..n).map(|k| (k as f64 * len, (k + 1) as f64 * len)).collect();
+        (segs, spans)
+    }
+
+    fn whole_song(len: f32) -> Vec<SoundtrackSpan> {
+        vec![SoundtrackSpan { output_start: 0.0, output_end: len, source_start: 0.0 }]
+    }
+
+    fn ctx<'a>(spans: &'a [(f64, f64)], soundtrack: &'a [SoundtrackSpan]) -> BurstContext<'a> {
+        let end = spans.last().map_or(0.0, |s| s.1);
+        BurstContext { clip_spans: spans, soundtrack, body_start: 0.0, body_end: end, total: end }
+    }
+
+    fn assert_distinct(plan: &BurstPlan) {
+        for (i, a) in plan.sub_clips.iter().enumerate() {
+            for b in &plan.sub_clips[i + 1..] {
+                let overlap = a.source_id == b.source_id
+                    && a.virtual_start_secs < b.virtual_start_secs + b.duration_secs
+                    && b.virtual_start_secs < a.virtual_start_secs + a.duration_secs;
+                assert!(!overlap, "repeated shot: {a:?} / {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_returns_burst_when_suitable() {
+        let sources = vec![make_source("A", 30.0), make_source("B", 30.0), make_source("C", 30.0)];
+        let curves = vec![busy_curve(30.0), busy_curve(30.0), busy_curve(30.0)];
+        // 5 main picks at output 0, 3, 6, 9, 12 (3 s each).
+        let (segments, spans) = picks(5, 3.0, "A");
+        // Loudest 9–11 s; the song plays once, from output 0.
+        let audio = song_with_peak(20.0, 9.0);
+        let snd = default_soundtrack();
+        let st = whole_song(20.0);
+        let c = BurstContext { total: 30.0, ..ctx(&spans, &st) };
+        let plan = plan_burst(&audio, &snd, &segments, &c, &sources, &curves)
+            .expect("expected a burst plan");
         assert_eq!(plan.beats_per_cut, 1);
         assert!(plan.sub_clips.len() >= snd.beat_burst_min_beats as usize);
-        assert!(plan.output_start_secs >= 6.0 && plan.output_start_secs <= 16.0);
+        // 9.0 s is on a cut: the burst starts there, replacing what it covers.
+        assert!((plan.output_start_secs - 9.0).abs() < 1e-4, "{}", plan.output_start_secs);
+        assert_eq!((plan.replace_at, plan.trim_before_secs), (3, None));
+        assert_distinct(&plan);
+    }
+
+    #[test]
+    fn burst_cuts_short_the_pick_the_drop_lands_in() {
+        let sources = vec![make_source("A", 60.0), make_source("B", 60.0)];
+        let curves = vec![busy_curve(60.0), busy_curve(60.0)];
+        let (segments, spans) = picks(10, 3.0, "A");
+        // Drop at 10 s: 1 s into the pick spanning 9–12 s.
+        let audio = song_with_peak(40.0, 10.0);
+        let snd = default_soundtrack();
+        let st = whole_song(40.0);
+        let plan = plan_burst(&audio, &snd, &segments, &ctx(&spans, &st), &sources, &curves).unwrap();
+        assert!((plan.output_start_secs - 10.0).abs() < 1e-4, "{}", plan.output_start_secs);
+        // That pick stays, 2 s shorter, so the burst starts on the drop.
+        assert_eq!(plan.replace_at, 4);
+        assert!((plan.trim_before_secs.unwrap() - 2.0).abs() < 1e-6);
+        // 12 one-beat cuts end at 16 s: the picks whose middle comes first
+        // go (12–15 s); the 15–18 s pick stays and follows the burst.
+        assert_eq!(plan.replace_count, 1);
+    }
+
+    #[test]
+    fn burst_finds_the_drop_in_a_loop_copy() {
+        // A 20 s song under a 60 s cut: the natural intro plays to 18 s, then
+        // the loud region [4, 18) loops. The drop (song 12 s) first plays at
+        // output 12 s — before the placement window (15 s) — and next in loop
+        // copy 1, which starts at 16 s and plays song 12 s at output 24 s.
+        // Treating song time as output time would put the burst at 15 s.
+        let plan_loop = crate::video_renderer::SoundtrackLoopPlan {
+            first_play_end_secs: 18.0,
+            loop_start_secs: 4.0,
+            loop_secs: 14.0,
+            beat_interval_secs: 0.5,
+        };
+        let st = plan_loop.spans(60.0, 20.0);
+        let audio = song_with_peak(20.0, 12.0);
+        let sources = vec![make_source("A", 90.0), make_source("B", 60.0)];
+        let curves = vec![busy_curve(90.0), busy_curve(60.0)];
+        let (segments, spans) = picks(20, 3.0, "A");
+        let snd = default_soundtrack();
+        let plan = plan_burst(&audio, &snd, &segments, &ctx(&spans, &st), &sources, &curves).unwrap();
+        assert!((plan.output_start_secs - 24.0).abs() < 1e-3, "{}", plan.output_start_secs);
+        assert_eq!(plan.replace_at, 8);
+    }
+
+    #[test]
+    fn burst_starts_after_the_intro_card() {
+        // Footage starts at 8 s (intro card); the song is loudest at 6 s,
+        // which plays over the card.
+        let sources = vec![make_source("A", 60.0), make_source("B", 60.0)];
+        let curves = vec![busy_curve(60.0), busy_curve(60.0)];
+        let (segments, mut spans) = picks(8, 3.0, "A");
+        for s in &mut spans {
+            *s = (s.0 + 8.0, s.1 + 8.0);
+        }
+        let audio = song_with_peak(40.0, 6.0);
+        let snd = default_soundtrack();
+        let st = whole_song(40.0);
+        let c = BurstContext { body_start: 8.0, total: 32.0, ..ctx(&spans, &st) };
+        let plan = plan_burst(&audio, &snd, &segments, &c, &sources, &curves).unwrap();
+        assert!(plan.output_start_secs >= 8.0, "{}", plan.output_start_secs);
+    }
+
+    #[test]
+    fn short_of_moments_the_burst_uses_longer_cuts_not_repeats() {
+        // Only five distinct moments exist outside the main picks: twelve
+        // one-beat cuts would repeat shots, so the burst takes five two-beat
+        // cuts (ten beats, above the eight-beat minimum).
+        let sources = vec![make_source("A", 60.0), make_source("D", 60.0)];
+        let curves = vec![
+            ScoreCurve::zeros(60.0, 4.0),
+            sparse_curve(60.0, &[5.0, 15.0, 25.0, 35.0, 45.0]),
+        ];
+        let (segments, spans) = picks(10, 3.0, "A");
+        let audio = song_with_peak(40.0, 10.0);
+        let snd = default_soundtrack();
+        let st = whole_song(40.0);
+        let plan = plan_burst(&audio, &snd, &segments, &ctx(&spans, &st), &sources, &curves).unwrap();
+        assert_eq!(plan.beats_per_cut, 2);
+        assert_eq!(plan.sub_clips.len(), 5);
+        assert!((plan.beat_secs - 1.0).abs() < 1e-6);
+        assert_distinct(&plan);
+    }
+
+    #[test]
+    fn too_few_moments_skip_the_burst() {
+        // Three moments: even two-beat cuts make only six beats.
+        let sources = vec![make_source("A", 60.0), make_source("D", 60.0)];
+        let curves = vec![ScoreCurve::zeros(60.0, 4.0), sparse_curve(60.0, &[5.0, 25.0, 45.0])];
+        let (segments, spans) = picks(10, 3.0, "A");
+        let audio = song_with_peak(40.0, 10.0);
+        let st = whole_song(40.0);
+        for mode in [BeatBurstMode::Auto, BeatBurstMode::On] {
+            let mut snd = default_soundtrack();
+            snd.beat_burst = mode;
+            let plan = plan_burst(&audio, &snd, &segments, &ctx(&spans, &st), &sources, &curves);
+            assert!(plan.is_none(), "{mode:?}: {plan:?}");
+        }
     }
 
     #[test]
@@ -564,9 +774,8 @@ mod tests {
         let mut snd = default_soundtrack();
         snd.beat_burst = BeatBurstMode::Off;
         let audio = make_audio(120.0, 3.0, 20.0, vec![1.0; 80]);
-        let plan = plan_burst(
-            &audio, &snd, &[], &[], &[], &[], &[], 0.0, 20.0,
-        );
+        let st = whole_song(20.0);
+        let plan = plan_burst(&audio, &snd, &[], &ctx(&[], &st), &[], &[]);
         assert!(plan.is_none());
     }
 }
