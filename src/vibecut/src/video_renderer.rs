@@ -2761,7 +2761,9 @@ fn build_overlay_drawtext(d: &OverlayDirective<'_>) -> Option<String> {
         t.fade_out_secs,
     );
     let full_alpha = format!("({fade_expr})*{alpha_factor:.4}");
-    let (x, y) = position_to_xy(&t.position);
+    // Offsets apply here too, as on a card: stacked overlay layers and the
+    // lifted range captions rely on them.
+    let (x, y) = position_to_xy_with_offset(&t.position, t.x_offset, t.y_offset);
     let mut s = format!(
         "drawtext=text='{txt}':fontsize={size}:fontcolor={rgb}:alpha='{alpha_expr}':x={x}:y={y}",
         txt = escape_drawtext(&t.content),
@@ -2909,6 +2911,24 @@ mod phase5_tests {
         t.disappear_at_secs = 3.5;
         let dt = build_drawtext(&t, 5.0);
         assert!(dt.contains("enable='between(t,1.5000,3.5000)'"), "got: {dt}");
+    }
+
+    /// Text drawn over footage keeps its offsets, like text on a card: an
+    /// overlay-mode subtitle with `y_offset` sat on top of its title.
+    #[test]
+    fn overlay_drawtext_applies_the_offsets() {
+        let mut t = make_text_overlay("March", 48);
+        t.position = "bottom-center".into();
+        let at = |t: &TextOverlay| {
+            build_overlay_drawtext(&OverlayDirective { overlay: t, start_secs: 0.4, duration_secs: 2.0 }).unwrap()
+        };
+        let plain = at(&t);
+        assert!(plain.contains(":x=(w-text_w)/2:y=h-text_h-40"), "{plain}");
+        t.y_offset = -64;
+        t.x_offset = 12;
+        let lifted = at(&t);
+        assert!(lifted.contains(":x=((w-text_w)/2)+(12):y=(h-text_h-40)+(-64)"), "{lifted}");
+        assert!(lifted.contains("enable='between(t,0.4000,2.4000)'"), "{lifted}");
     }
 }
 

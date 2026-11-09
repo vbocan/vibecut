@@ -27,6 +27,7 @@ pub mod paths;
 pub mod plan;
 pub mod propose;
 pub mod recipe;
+pub mod recap;
 pub mod reformat;
 pub mod render;
 pub mod timeline_export;

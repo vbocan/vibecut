@@ -13,6 +13,7 @@ import { decideChange } from './changes';
 import { matchFrames, thumbRequests } from './storyboard';
 import { extractStyleCode } from './stylecode';
 import { applyWatchEvent, reelNotification, reelTitle } from './watch';
+import { offeredYear, recapProposal, recapRemakeArgs, recapTiles, scaledRecapLength, thumbKey } from './recap';
 
 type RenderMode = 'idle' | 'queued' | 'running' | 'done' | 'failed';
 
@@ -491,6 +492,18 @@ class AppState {
 
 	/** Apply a quick tweak and immediately re-render (undoable). */
 	async tweakAndRender(action: FeedbackAction, label = 'Change') {
+		// A recap's moments are fixed ranges: its length and its draw of
+		// moments come from making it again.
+		const recap = this.proposeResult?.recap;
+		if (recap && action.kind === 'scale_duration') {
+			await this.withUndo(label, () => this.remakeRecap({ length: scaledRecapLength(recap.length, action.factor) }));
+			return;
+		}
+		if (recap && action.kind === 'reroll') {
+			const shuffle = 1 + Math.floor(Math.random() * 2 ** 31);
+			await this.withUndo(label, () => this.remakeRecap({ shuffle }));
+			return;
+		}
 		await this.withUndo(label, () => this.quickFeedback(action));
 	}
 
@@ -575,8 +588,14 @@ class AppState {
 			memory_keeper: 'documentary',
 			documentary: 'family_chronicle'
 		};
-		const next = NEXT[this.effectiveVibe ?? ''] ?? 'family_chronicle';
+		// A recap's song came from a vibe's music profile; its footage is fixed.
+		const recap = this.proposeResult?.recap;
+		const next = NEXT[(recap ? this.proposeResult?.vibe : this.effectiveVibe) ?? ''] ?? 'family_chronicle';
 		const name = this.vibes.find((v) => v.key === next)?.name ?? next;
+		if (recap) {
+			await this.withUndo(`Mix: ${name}`, () => this.remakeRecap({ vibe: next }));
+			return;
+		}
 		await this.withUndo(`Mix: ${name}`, async () => {
 			this.selectedVibe = next;
 			this.selectedTrackPath = null;
@@ -1922,6 +1941,147 @@ class AppState {
 		if (this.folder !== e.folder) this.selectFolder(e.folder);
 		this.persist();
 		return true;
+	}
+
+	// ---------- "Your year" recap ----------
+	/** What a recap of `recapYear` would play, and every year's summary. */
+	recap = $state<api.RecapPreview | null>(null);
+	/** The year the Create screen offers a recap of (the latest with enough
+	 *  months or trips); null: no recap to offer. */
+	recapYear = $state<number | null>(null);
+	recapLength = $state(60);
+	loadingRecap = $state(false);
+	recapError = $state<string | null>(null);
+	makingRecap = $state(false);
+	/** `thumbKey(tile)` → frame of that month's (or trip's) first moment. */
+	recapThumbs = $state<Record<string, string>>({});
+	/** Only the latest `loadRecap` call's answer lands. */
+	private recapSeq = 0;
+
+	/** The project plays exactly its listed moments (a recap): there is
+	 *  no picker for "more / less of this clip" to steer. */
+	get rangesOnly(): boolean {
+		const p = this.proposeResult;
+		if (!p) return false;
+		const loaded = this.configStructured !== null && this.structuredFor === p.config_path;
+		return loaded ? !!this.configStructured?.input.ranges_only : !!p.recap;
+	}
+
+	/** The offered year's plan, once loaded. */
+	get recapPlan(): api.RecapPlan | null {
+		const p = this.recap?.plan;
+		return p && this.recapYear !== null && p.period.year === this.recapYear ? p : null;
+	}
+
+	/** Find the year to offer and plan it at `recapLength`. Failing quietly
+	 *  is fine: the card just doesn't show. */
+	async loadRecap() {
+		const seq = ++this.recapSeq;
+		this.loadingRecap = true;
+		try {
+			let r = await api.recapPreview({ year: this.recapYear ?? undefined, length: this.recapLength });
+			if (seq !== this.recapSeq) return;
+			const year = offeredYear(r);
+			if (year !== null && r.plan?.period.year !== year) {
+				r = await api.recapPreview({ year, length: this.recapLength });
+				if (seq !== this.recapSeq) return;
+			}
+			this.recapYear = year;
+			this.recap = r;
+			void this.loadRecapThumbs();
+		} catch {
+			if (seq === this.recapSeq) this.recap = null;
+		} finally {
+			if (seq === this.recapSeq) this.loadingRecap = false;
+		}
+	}
+
+	async setRecapLength(secs: number) {
+		if (secs === this.recapLength) return;
+		this.recapLength = secs;
+		await this.loadRecap();
+	}
+
+	private async loadRecapThumbs() {
+		const plan = this.recapPlan;
+		if (!plan) return;
+		const missing = recapTiles(plan).filter((t) => t.thumb && !this.recapThumbs[thumbKey(t)]);
+		await runLimited(missing, 3, async (t) => {
+			try {
+				const r = await api.inspectAt(t.thumb!.path, [t.thumb!.t]);
+				const uri = r.frames_inline[0]?.data_uri;
+				if (uri) this.recapThumbs = { ...this.recapThumbs, [thumbKey(t)]: uri };
+			} catch {
+				/* a missing thumbnail is cosmetic */
+			}
+		});
+	}
+
+	/** Write the recap's config and render it like any video: the cutting
+	 *  room, then the Studio, with versions, tweaks and sharing. */
+	async makeRecap() {
+		const year = this.recapYear;
+		if (year === null || this.rendering || this.makingRecap) return;
+		this.makingRecap = true;
+		this.recapError = null;
+		this.makeError = null;
+		try {
+			const r = await api.makeRecap({ year, length: this.recapLength, seed: this.seed, render: false });
+			this.proposeResult = recapProposal(r);
+			this.configToml = r.config_toml;
+			this.configDirty = false;
+			this.resetRender();
+			await this.loadStructuredConfig();
+			// The song under the wait, as for any first render.
+			this.startBed(this.tracks.find((t) => t.path === r.soundtrack?.path) ?? null);
+			await this.startRenderAsync();
+			this.persist();
+		} catch (e) {
+			this.recapError = e instanceof api.ApiError ? e.describe() : String(e);
+		} finally {
+			this.makingRecap = false;
+		}
+	}
+
+	/** Make the recap on screen again with a new length, another vibe's
+	 *  song or another draw of moments (they re-fit to the song's beat),
+	 *  keeping the moments dropped from it; `withUndo` renders it. False
+	 *  when that changed nothing (said in a notice) or failed (the error is
+	 *  in `configError`). */
+	private async remakeRecap(changes: { length?: number; vibe?: string; shuffle?: number }): Promise<boolean> {
+		const p = this.proposeResult;
+		if (!p) return false;
+		// The dropped moments and the transitions (Calmer / More energy),
+		// from the project's own config once it's loaded.
+		const cfg = this.configStructured !== null && this.structuredFor === p.config_path ? this.configStructured : null;
+		const kept = { exclude: cfg?.selection.exclude ?? [], transition: cfg?.transition };
+		const args = recapRemakeArgs(p, changes, this.projectSong, kept, this.seed);
+		if (!args) return false;
+		this.configError = null;
+		try {
+			const res = await api.makeRecap(args);
+			const same = res.config_toml === this.configToml;
+			// Even when nothing changed, the next mix moves on from this vibe.
+			this.proposeResult = recapProposal(res);
+			if (same) {
+				this.showNotice(
+					changes.vibe !== undefined
+						? `${res.vibe_name} picks the same song — try another mix.`
+						: changes.shuffle !== undefined
+							? 'Every moment is already in your recap — nothing else to draw.'
+							: 'Your recap already plays that way.'
+				);
+				return false;
+			}
+			this.configToml = res.config_toml;
+			this.configDirty = false;
+			this.configChangedSinceRender = true;
+			await this.loadStructuredConfig();
+			return true;
+		} catch (e) {
+			this.configError = e instanceof api.ApiError ? e.describe() : String(e);
+			return false;
+		}
 	}
 
 	// ---------- Persistence ----------

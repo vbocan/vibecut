@@ -7,6 +7,7 @@
 	import CommandBar from './CommandBar.svelte';
 	import StyleCodeCard from './StyleCodeCard.svelte';
 	import NewFootage from './NewFootage.svelte';
+	import RecapCard from './RecapCard.svelte';
 
 	// Keyboard focus scrolls clear of the fixed "Make it" dock.
 	onMount(() => {
@@ -17,6 +18,9 @@
 
 	/** A style code in use decides the vibe and the song. */
 	const style = $derived(s.stylePreview);
+	// Every visit: a render since the last one may have made a recap possible.
+	onMount(() => void s.loadRecap());
+
 	const ready = $derived(!!s.folder && (!!s.effectiveVibe || !!style) && !s.discovering);
 	const vibe = $derived(s.vibes.find((v) => v.key === s.effectiveVibe));
 	const track = $derived(s.effectiveTrack);
@@ -49,6 +53,7 @@
 	{#if s.watch && (s.watch.enabled || s.watch.entries.length > 0)}
 		<div class="glass act-card watch-card" class:found={s.watch.entries.length > 0}><NewFootage /></div>
 	{/if}
+	<RecapCard />
 
 	<div class="acts">
 		<div class="glass act-card"><TripPicker /></div>

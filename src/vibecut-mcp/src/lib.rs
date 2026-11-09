@@ -199,6 +199,36 @@ pub struct ExportTimelineArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RecapToolArgs {
+    /// Calendar year to recap, e.g. 2026. Omit (with `from` / `to`) for
+    /// the latest year that has saved versions.
+    pub year: Option<i32>,
+    /// Start of a custom period instead of a year: `2026-03` or `2026-03-14`.
+    pub from: Option<String>,
+    /// End of a custom period: `2026-06` or `2026-06-30`.
+    pub to: Option<String>,
+    /// Target length: seconds (`"60"`) or `"1m30s"`. Default 60 s.
+    pub length: Option<String>,
+    /// Title-card text; default "2026 in moments" or "March – June 2026".
+    pub title: Option<String>,
+    /// Song file; omit to let Vibecut pick a library song, `"none"` for no music.
+    pub soundtrack: Option<String>,
+    /// Another draw of each month's strong moments: any number; the same
+    /// number always draws the same. Omit for each month's best.
+    pub shuffle: Option<u64>,
+    /// Only report which months / trips and moments it would use; write nothing.
+    #[serde(default)]
+    pub preview_only: bool,
+    /// Submit the render in the background (default true); poll `render_status`.
+    #[serde(default = "default_true")]
+    pub render: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ApplyFeedbackArgs {
     /// Path to the TOML config to mutate (typically the
     /// `config_path` returned by the most recent `propose_vibe` or
@@ -564,6 +594,60 @@ impl VibecutMcpServer {
         result
     }
 
+    /// "Your year" recap from the versions every render keeps.
+    #[tool(description = "Make a \"your year\" recap reel from the user's saved renders: the best moment(s) of each month (or of each trip, when the footage spans under three months) of a year or a from/to period, in the order they were filmed, with month captions, a title card and an auto-picked song, beat-locked. Writes an ordinary project config to /projects/recaps and (by default) submits its render: poll `render_status(job_id)`. Needs saved versions from at least 3 months or 3 trips. `preview_only: true` reports the months / trips and moments without writing anything.")]
+    async fn make_recap(&self, Parameters(args): Parameters<RecapToolArgs>) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result = self.make_recap_impl(args).await;
+        self.log_string_call("make_recap", args_json, &result, started);
+        result
+    }
+
+    async fn make_recap_impl(&self, args: RecapToolArgs) -> Result<String, ErrorData> {
+        let length_secs = match args.length.as_deref().map(vibecut_ops::recap::parse_length).transpose() {
+            Ok(l) => l,
+            Err(e) => return ops_error_to_string_result(e),
+        };
+        let recap_args = vibecut_ops::recap::RecapArgs {
+            year: args.year,
+            from: args.from,
+            to: args.to,
+            length_secs,
+            title: args.title,
+            vibe: None,
+            soundtrack: args.soundtrack,
+            seed: default_seed(),
+            exclude: Vec::new(),
+            shuffle: args.shuffle,
+            transition: None,
+        };
+        if args.preview_only {
+            return match vibecut_ops::recap::preview(recap_args).await {
+                Ok(p) => Ok(serde_json::to_string_pretty(&p).unwrap_or_else(|_| "{}".into())),
+                Err(e) => ops_error_to_string_result(e),
+            };
+        }
+        let r = match vibecut_ops::recap::make(recap_args).await {
+            Ok(r) => r,
+            Err(e) => return ops_error_to_string_result(e),
+        };
+        let mut body = serde_json::to_value(&r).unwrap_or_default();
+        if args.render {
+            match render::submit_async(&self.jobs, &r.config_path).await {
+                Ok(job_id) => {
+                    body["job_id"] = job_id.into();
+                    body["state"] = "queued".into();
+                    body["next_step"] = "Poll `render_status` with this job_id until state is `done`; the recap is at output_path.".into();
+                }
+                Err(e) => return ops_error_to_string_result(e),
+            }
+        } else {
+            body["next_step"] = "Call `render_async` (or `render`) with this config_path to produce the recap.".into();
+        }
+        Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
+    }
+
     /// Mutate a TOML config in response to user feedback, then save it
     /// back to the same path. Does NOT re-render — the caller chains
     /// this with a follow-up `render` call when the user is ready.
@@ -858,6 +942,13 @@ fn excerpt_for(tool: &str, body: &serde_json::Value) -> serde_json::Value {
             // Keep the change list — small, replay-relevant.
             "changes": body.get("changes").cloned().unwrap_or(json!([])),
             "action": body.get("action").cloned().unwrap_or(json!(null)),
+        }),
+        "make_recap" => json!({
+            "config_path": body.get("config_path").cloned().unwrap_or(json!(null)),
+            "output_path": body.get("output_path").cloned().unwrap_or(json!(null)),
+            "grouping": body.pointer("/plan/grouping").cloned().unwrap_or(json!(null)),
+            "n_moments": body.pointer("/plan/moments").and_then(|m| m.as_array()).map(|a| a.len()),
+            "error": body.get("error").cloned().unwrap_or(json!(null)),
         }),
         "render" => json!({
             "ok": body.get("ok").cloned().unwrap_or(json!(false)),

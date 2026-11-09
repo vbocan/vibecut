@@ -63,13 +63,13 @@ pub struct ProposeArgs<'a> {
 
 /// What the caller asked for, music-wise.
 #[derive(Debug, PartialEq)]
-enum MusicRequest<'a> {
+pub(crate) enum MusicRequest<'a> {
     Auto,
     Off,
     File(&'a str),
 }
 
-fn music_request(s: Option<&str>) -> MusicRequest<'_> {
+pub(crate) fn music_request(s: Option<&str>) -> MusicRequest<'_> {
     match s.map(str::trim) {
         None => MusicRequest::Auto,
         Some(v) if v.is_empty() || v.eq_ignore_ascii_case("none") => MusicRequest::Off,
@@ -126,7 +126,7 @@ fn target_secs(vibe: &vibes::Vibe, target_duration: &str) -> Result<f32, OpsErro
 
 impl ProposedSoundtrack {
     /// The comment written above `[soundtrack]`.
-    fn note(&self) -> String {
+    pub(crate) fn note(&self) -> String {
         match &self.reason {
             Some(r) => format!("Picked for you: {}. {r}", self.title),
             None => format!("Your pick: {}.", self.title),
@@ -136,7 +136,7 @@ impl ProposedSoundtrack {
 
 /// The proposal's song and, when there is none, why: the caller's file,
 /// no music, or — by default — the library's auto pick.
-fn decide_soundtrack(
+pub(crate) fn decide_soundtrack(
     request: &MusicRequest<'_>,
     auto_pick: Option<&AutoPick>,
     tracks: &[TrackInfo],

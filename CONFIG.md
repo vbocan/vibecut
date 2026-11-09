@@ -138,10 +138,43 @@ include = ["**/*.MP4", "**/*.mp4"]         # glob patterns (default shown)
 # Optional: hard-coded "must include this exact range" overrides the picker
 # for one or more sources. Time strings accept any humantime form.
 [[input.ranges]]
-file  = "GX010023.MP4"                     # filename (suffix) or path ending; see [selection]
-start = "1m12s"
-end   = "1m30s"
+file    = "GX010023.MP4"                   # filename (suffix) or path ending; see [selection]
+start   = "1m12s"
+end     = "1m30s"
+caption = "March"                          # optional lower third over this clip
 ```
+
+**Ranges.** Every `[[input.ranges]]` plays on top of the picker's picks.
+`file` names the footage by file name (any letter case) or a suffix of
+it (`"0023.MP4"`). When two folders hold files of the same name — GoPro
+numbers repeat from card to card — give a path instead
+(`"/footage/alps/GX010023.MP4"`, or just `"alps/GX010023.MP4"`): it is
+matched against the trailing components of the file's path, whole
+components only. A `caption` draws a small lower third — white text on
+a translucent box, centred in the lower third of the frame, sized to it
+(4.5 % of the height) — over the clip that plays the range, for about
+2.4 s from just after its incoming crossfade. A clip too short to read
+it gets none; when two clips play parts of one range, the one that plays
+more of it carries the caption.
+
+**Exactly these moments: `ranges_only`.** With `ranges_only = true`
+under `[input]` the render plays the ranges and nothing else, in the
+order they are listed: the picker adds no clips, `[selection].order`
+is not applied, and there is no beat-burst or multi-angle pass — so no
+footage analysis either, which makes such a render quick. Each range's
+file must still be found: list it under `[[input.videos]]` (or point
+`folder` at it). With a soundtrack and `beat_align`, the clip lengths
+are beat-locked as in any render, and speed ramps and crossfades work
+as usual. A `ranges_only` config without a range (or an image) fails
+validation, and a render whose ranges match no video stops with an
+error. Generated configs such as the [year recap](#year-recap) use it.
+
+"Drop this moment" in the app (the `drop_segment` feedback) adds a
+`[[selection.exclude]]` entry for what played; when that moment came
+from a range, it also removes the range — the picker's excludes never
+applied to ranges. In a `ranges_only` config, whose list is the playing
+order, a dropped range's caption moves to the next range unless that
+one has its own (so a recap's month keeps its caption).
 
 **GoPro chapters.** Long GoPro recordings are split into chapter files;
 the files of one recording in one folder are stitched back into one
@@ -628,6 +661,8 @@ fade_out     = "500ms"
 
 **Position anchors** (text and image): `center` (default), `top-left`,
 `top-right`, `top-center`, `bottom-left`, `bottom-right`, `bottom-center`.
+`x_offset` / `y_offset` move a layer from its anchor in both modes,
+`card` and `overlay`.
 
 **Visibility windows** (`appear_at` / `disappear_at`): default to `0s` →
 card duration. Set them to stage layers in and out of view (e.g. a
@@ -1166,6 +1201,84 @@ code is accepted, a saved style's name works too.
 
 Bad codes answer `400` with `error` and `hint`; an unknown footage folder or
 saved name `404`.
+
+---
+
+## Year recap
+
+"Your year" is a reel of the best moment of each month — or of each trip,
+when the footage spans fewer than three months — made from the versions
+every render keeps (`out/versions/<name>__<tag>.mp4` and its
+`.manifest.json`). It is not a second renderer: Vibecut writes an
+ordinary project config and renders it like any other.
+
+1. **Moments.** Every kept manifest under `/projects` is read (not the
+   recaps' own, in `/projects/recaps`; not hidden folders, `music/` or
+   `sessions/`). Each version offers its four best segments by score,
+   scored against its own best pick; photos and folded beat-bursts don't
+   count, and footage that is gone is skipped. The same file with an
+   overlapping range is one moment however many versions picked it (each
+   extra version counts a little in its favour). A moment is dated by
+   when it was filmed: the file's `creation_time` plus the offset into
+   it, else — no date, or a camera clock never set (before 2000) — the
+   file's modification time. Never the render's date.
+2. **Plan.** The period is a calendar `year`, a `from` / `to` range
+   (`2026`, `2026-03` or `2026-03-14`; an open end reaches the first or
+   last moment), or by default the latest year with moments. Moments from
+   at least three months make one bucket per month; fewer, one per trip
+   (the project's name before its ` · date`). A recap needs at least
+   three months or three trips. Every bucket gets its best moment, then
+   the rest of the length goes round the buckets, the one with the fewest
+   picks first; when there are more buckets than the length can hold, the
+   strongest make it. The length (default 60 s, kept within 20 s – 5 min)
+   sets about 4 s per moment (2.5–6 s), after a 3 s title card. Moments
+   play in the order they were filmed (a trip's stay together), each
+   window centred on the moment and kept inside its file; two windows on
+   one file never share footage. With a song, every moment lasts a whole
+   number of its beats, so the beat lock keeps the recap at its length.
+3. **Config.** `/projects/recaps/recap_<period>.toml` (`recap_2026.toml`,
+   `recap_2026-03_2026-06.toml`) with `ranges_only = true`, one
+   `[[input.videos]]` per file and one `[[input.ranges]]` per moment by
+   full path, the month (or trip) as the `caption` of its first moment, a
+   title card ("2026 in moments", "March – June 2026", or your `title`)
+   over "12 moments · 5 months", 300 ms crossfades, and a library song
+   auto-picked with the `family_chronicle` vibe's music profile (or
+   another `vibe`, a `soundtrack` file, or `"none"`), beat-aligned, with
+   no beat-burst. Its render goes to
+   `/projects/recaps/out/recap_<period>.mp4` and keeps versions like any
+   other. Making the same period again rewrites the file.
+
+**Web API.** `GET /api/recap?year=2026` (or `from` / `to`, and `length`)
+answers what a recap would play without writing anything: `plan` (the
+period, title, `grouping` — `month` or `trip` — every bucket with how
+many of its moments play, the moments in playing order with their
+windows and captions, the estimated length, `eligible`, and notes such
+as months left out or missing footage) and `years` (each year's months,
+trips and moments, and whether that is enough for a recap).
+`POST /api/recap` with `{ "year": 2026 }` (or `from` / `to`; optional
+`length` in seconds or `"1m30s"`, `title`, `vibe`, `soundtrack`, `seed`)
+writes the config and submits its render as an ordinary job: the answer
+carries `config_path`, `output_path`, the `plan`, the song, and `job_id`
+(`"render": false` writes the config only). Three more fields serve the
+Studio's changes to a recap on screen: `exclude`, the windows already
+dropped from it (its `[[selection.exclude]]` entries, `{ file, start,
+end }`), which stay out and are written into the new config;
+`transition`, its `[transition]` table (as Calmer / More energy left
+it), written into the new config instead of the default 300 ms
+crossfades; and `shuffle`, any number, for another draw of each month's
+strong moments (the same number draws the same; a much weaker moment
+never leads). Too few months or trips is a 400. The MCP server's `make_recap` tool does
+the same (`preview_only` for the plan alone).
+
+**In the app.** The Create screen shows a "Your 2026 recap" card when a
+year has enough months or trips: the months (or trips) with a frame of
+each, how many moments each gives, which are left out at the chosen
+length (45, 60 or 90 s), and "Make my 2026 recap", which renders it into
+the Studio. There, Shorter / Longer and Shuffle make the recap again,
+keeping its song, the moments you dropped and its transitions; Another
+mix does the same but lets the next vibe pick the song; "Drop this
+moment" removes that moment's range; and "More / Less of this clip" are
+off, as there is no picker to steer.
 
 ---
 
