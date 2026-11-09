@@ -9,7 +9,7 @@ import type { Manifest } from './types/generated/Manifest';
 import type { Segment } from './types/generated/Segment';
 import type { Config } from './types/generated/Config';
 import { captionMusicLines, labelsFollowProject, projectSongPath, trackForPath } from './music';
-import { decideChange } from './changes';
+import { decideChange, decideFinish } from './changes';
 import { matchFrames, thumbRequests } from './storyboard';
 import { extractStyleCode } from './stylecode';
 import { applyWatchEvent, reelNotification, reelTitle } from './watch';
@@ -775,7 +775,12 @@ class AppState {
 			if (text.trim()) this.styleError = 'That isn’t a style code — they start with VC1-.';
 			return;
 		}
-		if (this.stylePreview?.code === code) return;
+		if (this.stylePreview?.code === code) {
+			// An older check still in flight won't land (its seq is stale):
+			// it can't clear the flag, so clear it here.
+			this.styleChecking = false;
+			return;
+		}
 		this.styleChecking = true;
 		try {
 			const p = await api.previewStyle(code);
@@ -1234,7 +1239,9 @@ class AppState {
 		if (!path) return false;
 		let i = this.renderHistory.findIndex((v) => v.output_path === path);
 		if (i < 0 && this.proposeResult && j.config_path === this.proposeResult.config_path) {
-			this.recordRenderHistory(j);
+			// Its config isn't known here (the editor holds whatever was
+			// edited since): finishing it renders the project as a new version.
+			this.recordRenderHistory(j, undefined);
 			i = this.renderHistory.length - 1;
 		}
 		if (i < 0) return false;
@@ -1276,7 +1283,7 @@ class AppState {
 				// The draft on screen, finished: same version, now full quality.
 				this.finishVersion(f.index, data);
 			} else {
-				this.recordRenderHistory(data);
+				this.recordRenderHistory(data, this.renderingConfigToml ?? undefined);
 			}
 			if (f?.then) {
 				this.deliver = { what: f.then, id: Date.now() };
@@ -1568,7 +1575,9 @@ class AppState {
 	compareA = $state<number | null>(null);
 	compareB = $state<number | null>(null);
 
-	private recordRenderHistory(r: api.RenderResult) {
+	/** `configToml`: the config text this render was made from, when
+	 *  known (finishing a draft renders exactly that); undefined otherwise. */
+	private recordRenderHistory(r: api.RenderResult, configToml: string | undefined) {
 		const outputPath = r.version_path ?? r.output_path;
 		if (!outputPath) return;
 		const beat = r.manifest_summary?.beat_sync;
@@ -1583,7 +1592,7 @@ class AppState {
 			beats_locked:
 				beat && beat.n_cuts ? `${beat.within_tolerance ?? 0}/${beat.n_cuts} on the beat` : null,
 			quality: r.quality ?? this.renderQuality,
-			config_toml: this.renderingConfigToml ?? this.configToml
+			config_toml: configToml
 		};
 		this.renderHistory = [...this.renderHistory, entry];
 		this.compareB = this.renderHistory.length - 1;
@@ -1671,22 +1680,49 @@ class AppState {
 	 *  share sheet, then clears this. */
 	deliver = $state<{ what: DeliverWhat; id: number } | null>(null);
 
+	/** "Finish in full quality" found the edit changed since the draft on
+	 *  screen: the Studio asks whether to finish the draft as shown or to
+	 *  render the changes as a new version. */
+	finishAsk = $state<{ then: DeliverWhat | null; unsaved: boolean } | null>(null);
+
 	/** Render the version on screen (a draft) in full quality: the same
 	 *  edit, every output, at the project's own settings. `then`: download
-	 *  it or open the share sheet once it's done. An earlier draft's
-	 *  settings are put back first, so the final is the draft on screen. */
-	async finishFullQuality(then: DeliverWhat | null = null) {
+	 *  it or open the share sheet once it's done. When the edit changed
+	 *  since the draft (unsaved edits, or a saved edit), it asks first
+	 *  (`finishAsk`); `choice` is the answer: `draft` puts the draft's
+	 *  config back and finishes it, `edits` renders the project as it is
+	 *  now as a new version. A draft whose config isn't known here (opened
+	 *  from the Renders list) is rendered as a new version. */
+	async finishFullQuality(then: DeliverWhat | null = null, choice?: 'draft' | 'edits') {
 		const p = this.proposeResult;
 		if (!p || this.rendering || this.stopping) return;
 		const index = this.renderHistory.findIndex((v) => v.output_path === this.outputPath);
 		const v = this.renderHistory[index];
-		if (v?.config_toml && v.config_toml !== this.configToml) {
+		const unsaved = this.structuredConfigDirty || this.configDirty;
+		// Without unsaved edits the editor's text is what is on disk.
+		const savedSince = !!v?.config_toml && !this.configDirty && v.config_toml !== this.configToml;
+		const decision = decideFinish({ known: !!v?.config_toml, unsaved, savedSince, choice });
+		if (decision === 'ask') {
+			this.finishAsk = { then, unsaved };
+			return;
+		}
+		this.finishAsk = null;
+		if (decision === 'new_version') {
+			if (!v?.config_toml && !choice) {
+				this.showNotice('Rendering the project as it is now in full quality, as a new version.');
+			}
+			// Unsaved edits are saved by the render: they're the new version.
+			await this.startRenderAsync({ quality: 'final', finishing: { index: -1, then } });
+			return;
+		}
+		if (decision === 'restore_and_finish' && v?.config_toml) {
 			try {
 				const r = await api.writeConfig(p.config_path, v.config_toml);
 				this.configToml = r.config_toml;
 				this.configDirty = false;
 				this.proposeResult = { ...p, config_toml: r.config_toml };
 				this.lastChanges = [];
+				// Drops unsaved Guided edits too: the snapshot is the file.
 				await this.loadStructuredConfig();
 			} catch (e) {
 				this.configError = e instanceof api.ApiError ? e.describe() : String(e);
@@ -1935,7 +1971,7 @@ class AppState {
 		this.compareA = null;
 		this.compareB = null;
 		await this.loadStructuredConfig();
-		this.recordRenderHistory(render);
+		this.recordRenderHistory(render, toml);
 		await this.openVersion(0);
 		// The footage behind it, for the Studio's clip thumbnails.
 		if (this.folder !== e.folder) this.selectFolder(e.folder);

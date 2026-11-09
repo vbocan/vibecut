@@ -320,6 +320,28 @@
 			</div>
 		</header>
 
+		<p class="sr-only" role="status">{s.finishAsk ? 'The edit changed since this draft. Choose how to finish it.' : ''}</p>
+		{#if s.finishAsk}
+			{@const ask = s.finishAsk}
+			<div class="finish-ask" role="group" aria-labelledby="finish-ask-what">
+				<span id="finish-ask-what"
+					>{ask.unsaved ? 'You have unsaved changes' : 'You changed the edit'} since this draft.</span
+				>
+				<button
+					class="btn primary small"
+					type="button"
+					onclick={() => void s.finishFullQuality(ask.then, 'edits')}>Render my changes as a new version</button
+				>
+				<button
+					class="btn ghost small"
+					type="button"
+					title="Puts the draft's settings back: the changes since are dropped"
+					onclick={() => void s.finishFullQuality(ask.then, 'draft')}>Finish the draft as shown (drops them)</button
+				>
+				<button class="btn ghost small" type="button" onclick={() => (s.finishAsk = null)}>Cancel</button>
+			</div>
+		{/if}
+
 		<div class="player-wrap">
 			<Player bind:currentTime bind:video />
 			{#if draftShown && !rerendering}
@@ -481,6 +503,24 @@
 
 	.finish:hover:not([aria-disabled='true']) {
 		box-shadow: var(--glow);
+	}
+
+	.finish-ask {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 12px;
+		padding: 10px 12px;
+		border-radius: var(--r-md);
+		border: 1px solid var(--line-strong);
+		color: var(--text-dim);
+		font-size: var(--fs-sm);
+	}
+
+	.finish-ask .small {
+		padding: 6px 12px;
+		font-size: var(--fs-xs);
 	}
 
 	.finish[aria-disabled='true'] {

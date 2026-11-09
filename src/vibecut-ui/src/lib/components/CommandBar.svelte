@@ -62,6 +62,9 @@
 		if (r.kind !== 'plan') return false;
 		if (r.vibe) s.selectedVibe = r.vibe;
 		if (r.duration) s.targetDuration = r.duration;
+		// A style code in use would make the proposal and ignore what was
+		// just asked for: a typed vibe or length replaces the code.
+		if (r.vibe || r.duration) s.clearStyle();
 		const vibe = s.vibes.find((v) => v.key === s.effectiveVibe)?.name ?? 'your vibe';
 		note = `Understood: ${vibe}${r.duration ? `, ${r.duration}` : ''}.`;
 		void s.makeVideo();
@@ -109,6 +112,8 @@
 		}
 		await s.submitBrief();
 		if (s.briefError) return;
+		// The brief chose the vibe and length: it replaces a style code.
+		s.clearStyle();
 		if (s.effectiveVibe && s.folder) void s.makeVideo();
 	}
 </script>

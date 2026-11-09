@@ -16,6 +16,37 @@ export function decideChange(state: { stopping: boolean; rendering: boolean }): 
 	return state.rendering ? 'offer' : 'run';
 }
 
+/** How "Finish in full quality" goes for the draft on screen. */
+export type FinishDecision =
+	/** The edit hasn't changed since the draft: finish it, same version. */
+	| 'finish'
+	/** It has (unsaved edits, or a saved edit since the draft): ask. */
+	| 'ask'
+	/** Put the draft's own config back (dropping the edits), then finish it. */
+	| 'restore_and_finish'
+	/** Render the project as it is now as a new version, not as the draft. */
+	| 'new_version';
+
+/**
+ * `known`: the draft's config text is known here (a version rendered in
+ * this session; one opened from the Renders list isn't). `unsaved`: the
+ * editors hold unsaved edits. `savedSince`: the config on disk differs
+ * from the draft's. `choice`: the user's answer to the ask, if any.
+ * A saved edit is never overwritten without asking, and edits are never
+ * folded into a finish of the draft.
+ */
+export function decideFinish(state: {
+	known: boolean;
+	unsaved: boolean;
+	savedSince: boolean;
+	choice?: 'draft' | 'edits';
+}): FinishDecision {
+	if (!state.known || state.choice === 'edits') return 'new_version';
+	const changed = state.unsaved || state.savedSince;
+	if (!changed) return 'finish';
+	return state.choice === 'draft' ? 'restore_and_finish' : 'ask';
+}
+
 /** The Studio's single-key shortcuts that change the project (the
  *  shortcuts list: shorter, longer, energy, calmer, shuffle, mix, song). */
 export const TWEAK_SHORTCUTS: readonly string[] = ['[', ']', 'e', 'c', 's', 'm', 'n'];
