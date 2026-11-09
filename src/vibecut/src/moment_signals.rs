@@ -268,10 +268,20 @@ pub fn explain_segments(
 /// Move picks off hard scene changes ([`scoring::place_clear_of_cuts`]):
 /// a pick that straddles a cut moves into the scene its middle is in, and
 /// one that starts just after a cut starts on it. A move is kept only when
-/// the pick still fits its chapter, ends up clear of cuts (or no worse)
-/// and doesn't overlap another pick of the same source. `telemetries` is
-/// parallel to `sources`. Returns how many picks moved.
-pub fn avoid_scene_cuts(segments: &mut [Segment], sources: &[Source], telemetries: &[SourceTelemetry]) -> usize {
+/// the pick still fits its chapter, ends up clear of cuts (or no worse),
+/// doesn't overlap another pick of the same source, and still sits on
+/// what the picker ranked: on `curves` (the final per-source curves,
+/// with exclusions and floors zeroed), the new window may cover no more
+/// zeroed time than the old one and must keep at least
+/// [`MOVE_KEEPS_SCORE`] of its mean score. `telemetries` and `curves` are
+/// parallel to `sources` (a missing curve skips the score check). Returns
+/// how many picks moved.
+pub fn avoid_scene_cuts(
+    segments: &mut [Segment],
+    sources: &[Source],
+    telemetries: &[SourceTelemetry],
+    curves: &[ScoreCurve],
+) -> usize {
     let mut moved = 0;
     for i in 0..segments.len() {
         let seg = &segments[i];
@@ -300,6 +310,13 @@ pub fn avoid_scene_cuts(segments: &mut [Segment], sources: &[Source], telemetrie
         if overlaps {
             continue;
         }
+        if let Some(curve) = curves.get(si).filter(|c| !c.samples.is_empty()) {
+            let (old_mean, old_zeros) = window_stats(curve, start, start + len);
+            let (new_mean, new_zeros) = window_stats(curve, a as f32, b as f32);
+            if new_zeros > old_zeros || new_mean < MOVE_KEEPS_SCORE * old_mean {
+                continue;
+            }
+        }
         next.reason = seg.reason.clone();
         next.score = seg.score;
         next.signals = seg.signals.clone();
@@ -307,6 +324,19 @@ pub fn avoid_scene_cuts(segments: &mut [Segment], sources: &[Source], telemetrie
         moved += 1;
     }
     moved
+}
+
+/// The share of a pick's mean score a scene-cut move must keep.
+pub const MOVE_KEEPS_SCORE: f32 = 0.7;
+
+/// `curve`'s mean over `[start, end)` and how many of those samples are
+/// zero (excluded, floored or unscored time).
+fn window_stats(curve: &ScoreCurve, start: f32, end: f32) -> (f32, usize) {
+    let i0 = curve.time_to_index(start.max(0.0));
+    let i1 = curve.time_to_index(end.max(start)).max(i0 + 1).min(curve.samples.len());
+    let w = &curve.samples[i0.min(i1.saturating_sub(1))..i1];
+    let mean = w.iter().sum::<f32>() / w.len().max(1) as f32;
+    (mean, w.iter().filter(|&&v| v <= 0.0).count())
 }
 
 /// The highest sample of `curve` in `[start, end]`.
@@ -634,19 +664,57 @@ mod tests {
         let tels = [SourceTelemetry { scene_cuts: vec![[29.5, 30.0]], ..visual(60.0) }];
         // 28.5–31.5 straddles the cut and its middle is past it: it now
         // starts on the cut.
+        let flat = [flat_curve(60.0, 0.5)];
         let mut segs = vec![pick(28.5, 0.4), pick(45.0, 0.3)];
-        assert_eq!(avoid_scene_cuts(&mut segs, &sources, &tels), 1);
+        assert_eq!(avoid_scene_cuts(&mut segs, &sources, &tels, &flat), 1);
         assert_eq!(segs[0].virtual_start_secs, 30.0);
         assert_eq!(segs[0].in_chapter_start_secs, 30.0);
         assert_eq!((segs[0].score, segs[0].reason.as_str()), (Some(0.4), "score=0.400 (multi-source)"));
         assert_eq!(segs[1].virtual_start_secs, 45.0);
         // ...unless that would run into another pick of the same source.
         let mut crowded = vec![pick(28.5, 0.4), pick(32.0, 0.3)];
-        assert_eq!(avoid_scene_cuts(&mut crowded, &sources, &tels), 0);
+        assert_eq!(avoid_scene_cuts(&mut crowded, &sources, &tels, &flat), 0);
         assert_eq!(crowded[0].virtual_start_secs, 28.5);
         // No cuts, nothing moves.
         let mut plain = vec![pick(28.5, 0.4)];
-        assert_eq!(avoid_scene_cuts(&mut plain, &sources, &[visual(60.0)]), 0);
+        assert_eq!(avoid_scene_cuts(&mut plain, &sources, &[visual(60.0)], &flat), 0);
+    }
+
+    fn flat_curve(secs: f32, v: f32) -> ScoreCurve {
+        let mut c = ScoreCurve::zeros(secs, RATE);
+        c.samples.iter_mut().for_each(|s| *s = v);
+        c
+    }
+
+    /// A move off a cut never lands a pick on time the picker ruled out
+    /// (an excluded range, a floored blurry stretch) or well off the
+    /// moment it ranked.
+    #[test]
+    fn scene_cut_moves_keep_picks_on_what_was_ranked() {
+        let sources = [source(60.0)];
+        let tels = [SourceTelemetry { scene_cuts: vec![[29.5, 30.0]], ..visual(60.0) }];
+        // 28.5–31.5 would move to 30.0–33.0; 32–34 is excluded (zeroed).
+        let mut excluded = flat_curve(60.0, 0.5);
+        excluded.zero_range(32.0, 34.0);
+        let mut segs = vec![pick(28.5, 0.4)];
+        assert_eq!(avoid_scene_cuts(&mut segs, &sources, &tels, &[excluded]), 0);
+        assert_eq!(segs[0].virtual_start_secs, 28.5);
+        // The peak it was picked for is before the cut; after it, the
+        // curve is a fraction of that: the pick stays.
+        let mut peaked = flat_curve(60.0, 0.1);
+        for (i, v) in peaked.samples.iter_mut().enumerate() {
+            let t = i as f32 / RATE;
+            if (28.5..30.0).contains(&t) {
+                *v = 1.0;
+            }
+        }
+        let mut segs = vec![pick(28.5, 0.4)];
+        assert_eq!(avoid_scene_cuts(&mut segs, &sources, &tels, &[peaked]), 0);
+        assert_eq!(segs[0].virtual_start_secs, 28.5);
+        // A curve about as good on the far side: it moves.
+        let mut segs = vec![pick(28.5, 0.4)];
+        assert_eq!(avoid_scene_cuts(&mut segs, &sources, &tels, &[flat_curve(60.0, 0.5)]), 1);
+        assert_eq!(segs[0].virtual_start_secs, 30.0);
     }
 
     #[test]

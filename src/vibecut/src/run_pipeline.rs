@@ -805,7 +805,7 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
     };
     // Keep picks off hard scene cuts in the footage, then record why each
     // one was chosen (the manifest's `segments[].signals`).
-    let moved_off_cuts = crate::moment_signals::avoid_scene_cuts(&mut segments, &sources, &telemetries);
+    let moved_off_cuts = crate::moment_signals::avoid_scene_cuts(&mut segments, &sources, &telemetries, &curves);
     if moved_off_cuts > 0 {
         println!("\nscene cuts: moved {moved_off_cuts} pick{} clear of a scene change", plural(moved_off_cuts));
     }
