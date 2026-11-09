@@ -238,6 +238,14 @@ pub struct EditPlan {
     burst_range: Option<(usize, usize, f32)>,
     /// The intro card's beat-locked length, when the beat lock moved it.
     intro_card_len: Option<f64>,
+    /// The song's bars, phrases and sections (see `pacing`), when fitted.
+    music_plan: Option<crate::pacing::MusicPlan>,
+    /// What music-led pacing decided: clip spans, the best moment, the ending.
+    paced: Option<Paced>,
+    /// The song plays once through, un-looped (a paced cut that ends with it).
+    play_through: bool,
+    /// The music's fade-out length (whole beats with a musical ending).
+    music_fade_secs: f32,
 }
 
 /// Plan phase: probe, music analysis, footage analysis (cached), picking,
@@ -732,6 +740,20 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
     let beat_locked = cfg.soundtrack.as_ref().is_some_and(|s| s.beat_align)
         && audio.as_ref().is_some_and(|a| a.tempo_bpm > 0.0 && !a.beats.is_empty());
     let inflated_target = picker_budget(video_target, clip_len, intro_dur, outro_dur, xfade, beat_locked);
+    // Music-led pacing (see `pacing`): the clip count, the ending and how
+    // the soundtrack is laid under the video, from the song's bars,
+    // phrases and sections — planned before the picker runs.
+    let music_plan = match (audio.as_ref(), cfg.soundtrack.as_ref()) {
+        (Some(a), Some(snd)) if beat_locked => plan_music(cfg, a, snd, clip_len, image_total_dur),
+        _ => None,
+    };
+    let (inflated_target, pick_len) = match &music_plan {
+        Some(m) => {
+            let len = m.pick_secs(image_total_dur);
+            (m.clips.max(1) as f64 * len, len)
+        }
+        None => (inflated_target, clip_len),
+    };
     // Apply [[selection.source_weights]] BEFORE excludes.
     // Last-write-wins on duplicate source_ids; weight is clamped to
     // [0, 10]. weight = 0 effectively drops the source from picks
@@ -797,7 +819,7 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
             &sources,
             &curves,
             inflated_target,
-            clip_len,
+            pick_len,
             cfg.selection.max_per_source,
             cfg.selection.variety,
             cfg.project.seed.unwrap_or(0),
@@ -1049,6 +1071,32 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
         segments
     };
 
+    // Music-led pacing (see `pacing`): every clip's length from the song's
+    // energy where it plays, the cuts on bars and phrases, the best moment
+    // on the drop and the ending. `cut_targets[i]` is where clip i's
+    // outgoing cut (or the end of the video) must land, for the beat lock.
+    let mut cut_targets: Vec<Option<f64>> = vec![None; segments.len()];
+    let mut paced = music_plan.as_ref().and_then(|m| {
+        let energy_arc = matches!(cfg.selection.order, crate::project_config::Order::EnergyArc);
+        pace_segments(m, &mut segments, &sources, energy_arc)
+    });
+    if let (Some(m), Some(p)) = (&music_plan, &paced) {
+        cut_targets = p.spans.iter().map(|s| Some(s.1)).collect();
+        print_pacing(m, p, &segments);
+    }
+    // The song plays once through, un-looped, when the paced cut ends with
+    // it; every later stage lays the soundtrack out the same way.
+    let play_through = paced.is_some() && music_plan.as_ref().is_some_and(|m| m.play_through);
+    // The music's fade-out. With a musical ending it is whole beats, so it
+    // starts on a beat and completes on the downbeat the video ends on.
+    let music_fade_secs: f32 = match (&cfg.soundtrack, &music_plan) {
+        (Some(snd), Some(m)) if snd.musical_ending && paced.is_some() => {
+            crate::pacing::fade_on_beats(snd.fade_out.as_secs_f64(), m.interval) as f32
+        }
+        (Some(snd), _) => snd.fade_out.as_secs_f32(),
+        (None, _) => 0.0,
+    };
+
     // Insert a beat-aligned rapid-cut burst at the soundtrack's
     // energy peak when the music is suitable. The burst replaces a contiguous
     // slice of normal-paced segments around that output time. Tracked by
@@ -1073,23 +1121,42 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
             };
             let planned: Vec<f64> = segments.iter().map(|s| s.duration_secs).collect();
             let predicted = crate::output_timeline::predict_layout(
-                card_secs(&cfg.intro),
+                paced.as_ref().and(music_plan.as_ref()).and_then(|m| m.intro_card_secs).or_else(|| card_secs(&cfg.intro)),
                 &planned,
-                card_secs(&cfg.outro),
+                paced.as_ref().and_then(|p| p.ending.outro_card_secs).or_else(|| card_secs(&cfg.outro)),
                 seam,
                 beat_locked,
                 cfg.project.fps,
             );
             // The soundtrack as the mux lays it under the output (loop
             // copies included): the drop's song time is not its output time.
-            let soundtrack_spans = soundtrack_loop_plan(audio_ref)
+            let soundtrack_spans = loop_plan_for(audio_ref, play_through)
                 .spans(predicted.total as f32 + 60.0, audio_ref.duration_secs);
+            // Paced to the music: the burst fills a high section of the
+            // song, leaves the best moment and the final clip (which carries
+            // the ending) alone.
+            let high_sections: Vec<(f64, f64)> = match (&paced, &audio_ref.structure) {
+                (Some(_), Some(s)) => crate::pacing::sections_in_output(s, &soundtrack_spans, predicted.total)
+                    .into_iter()
+                    .filter(|x| x.level == crate::music_structure::Level::High)
+                    .map(|x| (x.start_secs, x.end_secs))
+                    .collect(),
+                _ => Vec::new(),
+            };
             let burst_ctx = crate::beat_burst::BurstContext {
-                clip_spans: &predicted.clip_spans,
+                // Paced: the plan's own cuts, exactly (the prediction agrees
+                // to within a frame).
+                clip_spans: paced.as_ref().map_or(&predicted.clip_spans, |p| &p.spans),
                 soundtrack: &soundtrack_spans,
                 body_start: predicted.body_start,
-                body_end: predicted.body_end,
+                body_end: match &paced {
+                    Some(p) => p.spans.last().map_or(predicted.body_end, |s| s.0),
+                    None => predicted.body_end,
+                },
                 total: predicted.total,
+                keep: paced.as_ref().and_then(|p| p.hero.map(|(i, _)| p.spans[i])),
+                high_sections: &high_sections,
+                end_on_planned_cut: paced.is_some(),
             };
             if let Some(plan) = crate::beat_burst::plan_burst(
                 audio_ref,
@@ -1110,12 +1177,30 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
                     plural(plan.replace_count),
                     plan.trim_before_secs
                         .map(|t| format!(", the pick before it {t:.2}s shorter"))
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                        + &plan
+                            .trim_after_secs
+                            .map(|t| format!(", the pick after it {t:.2}s shorter"))
+                            .unwrap_or_default(),
                 );
                 // Cut the pick the drop falls in short so the burst starts on it.
                 if let Some(trim) = plan.trim_before_secs {
                     if let Some(s) = plan.replace_at.checked_sub(1).and_then(|i| segments.get_mut(i)) {
                         s.duration_secs = (s.duration_secs - trim).max(0.1);
+                    }
+                    if let Some(t) = plan.replace_at.checked_sub(1).and_then(|i| cut_targets.get_mut(i)) {
+                        *t = t.map(|_| plan.output_start_secs as f64);
+                    }
+                }
+                // A paced burst that ends inside a pick: the pick starts
+                // where the burst ends, its window still centred on its
+                // moment, and keeps its planned cut-out.
+                if let Some(trim) = plan.trim_after_secs {
+                    if let Some(s) = segments.get_mut(plan.replace_at + plan.replace_count) {
+                        let trim = trim.min(s.duration_secs - 0.1).max(0.0);
+                        s.duration_secs -= trim;
+                        s.in_chapter_start_secs += trim * 0.5;
+                        s.virtual_start_secs += trim * 0.5;
                     }
                 }
                 let total_burst_secs: f32 =
@@ -1145,6 +1230,17 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
                 let start = plan.replace_at;
                 let end = (plan.replace_at + plan.replace_count).min(segments.len());
                 segments.splice(start..end, new_segments);
+                // Burst cuts are one beat each; the plan's cuts after the
+                // burst keep their targets.
+                cut_targets.splice(start..end, std::iter::repeat(None).take(plan.sub_clips.len()));
+                if let Some(p) = paced.as_mut() {
+                    let (removed, added) = (end - start, plan.sub_clips.len());
+                    p.hero = p.hero.and_then(|(h, x)| match h {
+                        h if h < start => Some((h, x)),
+                        h if h >= end => Some((h + added - removed, x)),
+                        _ => None,
+                    });
+                }
                 burst_range = Some((start, start + plan.sub_clips.len(), total_burst_secs));
             } else {
                 // Surface the verdict briefly when off-by-criterion (helps users tune).
@@ -1290,7 +1386,7 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
             // of the cut gives the same beats.
             let planned_total: f64 = segments.iter().map(|s| s.duration_secs).sum();
             let horizon = (intro_card.unwrap_or(0.0) + planned_total * 1.6 + 60.0) as f32;
-            let spans = soundtrack_loop_plan(a).spans(horizon, a.duration_secs);
+            let spans = loop_plan_for(a, play_through).spans(horizon, a.duration_secs);
             let beats = crate::beat_sync::beats_in_output(&a.beats, &spans);
             let (start, card_len) = beat_lock_start(
                 intro_card,
@@ -1331,6 +1427,7 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
                         tail_extra_secs: if ramped { ramp_extra_input as f64 } else { 0.0 },
                         seam_out_secs: seam_out,
                         seam_out_without_ramp: (ramped && xfade_path).then_some(default_seam),
+                        target_secs: cut_targets.get(i).copied().flatten(),
                     }
                 })
                 .collect();
@@ -1390,6 +1487,10 @@ fn plan_edit(cfg: &Config, no_visual: bool, no_cache: bool, purpose: PlanFor) ->
         seg_ramps,
         burst_range,
         intro_card_len,
+        music_plan,
+        paced,
+        play_through,
+        music_fade_secs,
     })
 }
 
@@ -1413,6 +1514,10 @@ fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) ->
         mut seg_ramps,
         burst_range,
         intro_card_len,
+        music_plan,
+        paced,
+        play_through,
+        music_fade_secs,
     } = plan;
     let runner = NativeRunner::new();
     // What this quality encodes: the body's size and CRF, the outputs, and
@@ -1592,7 +1697,16 @@ fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) ->
             }
         }
     }
-    if let Some(outro) = &cfg.outro {
+    // The outro card at the length the musical ending gave it (a whole
+    // number of bars, or the song's ring-out), when it has one.
+    let outro_cfg: Option<crate::project_config::TextCard> = cfg.outro.clone().map(|mut c| {
+        let len = paced.as_ref().and_then(|p| p.ending.outro_card_secs);
+        if let Some(len) = len.filter(|_| matches!(c.mode, crate::project_config::CardMode::Card)) {
+            c.duration = std::time::Duration::from_secs_f64(len);
+        }
+        c
+    });
+    if let Some(outro) = &outro_cfg {
         let dur = outro.duration.as_secs_f32();
         let (texts, images) = scale_layers(card_to_layers(outro), targets.layer_scale);
         match outro.mode {
@@ -2035,7 +2149,7 @@ fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) ->
             // Only activated when the loud region differs meaningfully from
             // the full track. For tracks that are already loud throughout,
             // we fall back to a simple full-track loop (loud_start = 0).
-            let loop_plan = audio.as_ref().map(soundtrack_loop_plan).unwrap_or_default();
+            let loop_plan = audio.as_ref().map(|a| loop_plan_for(a, play_through)).unwrap_or_default();
             let crate::video_renderer::SoundtrackLoopPlan {
                 first_play_end_secs,
                 loop_start_secs,
@@ -2059,7 +2173,7 @@ fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) ->
                 &win_args,
                 snd.ducking_db,
                 body_total,
-                snd.fade_out.as_secs_f32(),
+                music_fade_secs,
                 loop_plan,
                 &muxed_body,
             )
@@ -2171,7 +2285,7 @@ fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) ->
                 timeline: &timeline,
                 loop_plan: plan,
                 body_secs,
-                fade_out_secs: snd.fade_out.as_secs_f32(),
+                fade_out_secs: music_fade_secs,
                 duck_windows: &duck_windows,
                 soundtrack: snd_path,
                 rendered: staged.path(0),
@@ -2180,6 +2294,27 @@ fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) ->
         }
         _ => None,
     };
+    // The song's structure as it plays under the video, and what pacing
+    // made of it.
+    let music = audio.as_ref().and_then(|a| {
+        let s = a.structure.as_ref()?;
+        let spans = loop_plan_for(a, play_through).spans(timeline.duration_secs as f32 + 1.0, a.duration_secs);
+        Some(crate::pacing::music_record(
+            a.tempo_bpm,
+            &a.beats,
+            s,
+            &spans,
+            music_plan.as_ref().filter(|_| paced.is_some()),
+            // The hero's index in the folded list (the burst is one segment there).
+            paced.as_ref().and_then(|p| p.hero).map(|(h, x)| match burst_range {
+                Some((bs, be, _)) if be > bs && h >= be => (h - (be - bs - 1), x),
+                _ => (h, x),
+            }),
+            paced.as_ref().map(|p| &p.ending),
+            &timeline,
+            music_fade_secs,
+        ))
+    });
 
     // What a timeline export (OTIO / FCPXML) needs beyond the clips: where
     // the music plays, exactly as the mux laid it, and the titles' text.
@@ -2233,6 +2368,7 @@ fn render_plan(cfg: &Config, plan: EditPlan, quality: Quality, explain: bool) ->
         beat_sync,
         timeline: Some(timeline),
         quality: (quality == Quality::Draft).then_some(quality),
+        music,
         generator: format!("vibecut {}", env!("CARGO_PKG_VERSION")),
     };
     // Last chance to stop: past this point the new video replaces the old.
@@ -2417,7 +2553,7 @@ impl EditPlan {
         let beats: Vec<f64> = match &self.audio {
             Some(a) if a.tempo_bpm > 0.0 => {
                 // Laid out as the mux lays the song under the video.
-                let spans = soundtrack_loop_plan(a).spans(duration as f32, a.duration_secs);
+                let spans = loop_plan_for(a, self.play_through).spans(duration as f32, a.duration_secs);
                 crate::beat_sync::beats_in_output(&a.beats, &spans)
                     .into_iter()
                     .map(|b| b as f64)
@@ -2895,6 +3031,32 @@ fn arrange_energy_arc(segs: &mut Vec<Segment>) {
         // 0/1/2 picks: arc has no meaning. Leave as-is.
         return;
     }
+    arc_with_peak(segs, n / 2);
+}
+
+/// [`arrange_energy_arc`] with the peak at `peak` — the slot the music plan
+/// put on the drop — and only the `eligible` positions taking part: stills
+/// and forced `[[input.ranges]]` clips keep their places.
+fn arrange_energy_arc_at(segs: &mut [Segment], peak: usize, eligible: &[bool]) {
+    let pos: Vec<usize> = (0..segs.len()).filter(|&i| eligible.get(i).copied().unwrap_or(false)).collect();
+    let Some(j) = pos.iter().position(|&i| i == peak) else {
+        return;
+    };
+    let mut sub: Vec<Segment> = pos.iter().map(|&i| segs[i].clone()).collect();
+    arc_with_peak(&mut sub, j);
+    for (s, &i) in sub.into_iter().zip(&pos) {
+        segs[i] = s;
+    }
+}
+
+/// Center-out zigzag around position `peak` (see [`arrange_energy_arc`]):
+/// the strongest pick at `peak`, the next on its left, the next on its
+/// right, alternating outward, then filling whichever side has room.
+fn arc_with_peak(segs: &mut Vec<Segment>, peak: usize) {
+    let n = segs.len();
+    if n == 0 {
+        return;
+    }
     // Sort indices by (score desc, original-index asc) so the strongest pick
     // is first, ties resolve deterministically.
     let mut ordered: Vec<usize> = (0..n).collect();
@@ -2909,7 +3071,7 @@ fn arrange_energy_arc(segs: &mut Vec<Segment>) {
     let original: Vec<Segment> = std::mem::take(segs).into_iter().collect();
     let mut placed: Vec<Option<Segment>> = (0..n).map(|_| None).collect();
 
-    let mid: i64 = (n as i64) / 2;
+    let mid: i64 = peak.min(n - 1) as i64;
     // Pick rank 0 → mid, rank 1 → mid-1, rank 2 → mid+1, rank 3 → mid-2, ...
     placed[mid as usize] = Some(original[ordered[0]].clone());
     let mut left = mid - 1;
@@ -3811,6 +3973,267 @@ fn soundtrack_loop_plan(a: &crate::audio_analysis::AnalyzedAudio) -> crate::vide
     }
 }
 
+/// The soundtrack layout every stage shares: played once through,
+/// un-looped, when the song's own ending closes the video (see
+/// `plan_music`), else the smart loop ([`soundtrack_loop_plan`]).
+fn loop_plan_for(a: &crate::audio_analysis::AnalyzedAudio, play_through: bool) -> crate::video_renderer::SoundtrackLoopPlan {
+    if play_through {
+        crate::video_renderer::SoundtrackLoopPlan {
+            first_play_end_secs: 0.0,
+            loop_start_secs: 0.0,
+            loop_secs: 0.0,
+            beat_interval_secs: a.beat_interval_secs(),
+        }
+    } else {
+        soundtrack_loop_plan(a)
+    }
+}
+
+/// `[[input.ranges]]` clips carry this reason; they keep their length.
+const FORCED_RANGE_REASON: &str = "forced via [[input.ranges]]";
+
+/// The music plan for this render (see `pacing`): the song's beats as
+/// they will play, where the footage starts, the ending and the clip
+/// count. `None` when the song has no bar structure (no fitted beat grid)
+/// or every music-led option is off.
+fn plan_music(
+    cfg: &Config,
+    a: &crate::audio_analysis::AnalyzedAudio,
+    snd: &crate::project_config::Soundtrack,
+    clip_len: f64,
+    image_secs: f64,
+) -> Option<crate::pacing::MusicPlan> {
+    use crate::pacing;
+    let s = a.structure.as_ref()?;
+    if !(snd.energy_drives_pacing || snd.musical_ending || snd.hero_on_drop) {
+        return None;
+    }
+    let interval = a.beat_interval_secs() as f64;
+    let target = cfg.project.target_duration.as_secs_f64();
+    let seam = if cfg.transition.hard_cut() {
+        0.0
+    } else {
+        cfg.transition.duration.as_secs_f32().max(crate::video_renderer::MIN_XFADE_SECS) as f64
+    };
+    let outro = chain_card_secs(cfg.outro.as_ref()).map(|d| (d, seam));
+    let pace = pacing::Pace {
+        strength: if snd.energy_drives_pacing { snd.pacing_strength.clamp(0.0, 1.0) } else { 0.0 },
+        base_beats: clip_len / interval,
+    };
+    // The plan with the song played once through, un-looped, ending on its
+    // final hit (`play_through`), or with the smart loop.
+    let plan_with = |play_through: bool| -> Option<pacing::MusicPlan> {
+        let spans = loop_plan_for(a, play_through).spans((target * 1.6 + 60.0) as f32, a.duration_secs);
+        let grid = pacing::grid_in_output(&a.beats, s, &spans);
+        // The footage comes in where the beat lock will put it.
+        let beats: Vec<f32> = grid.iter().map(|b| b.t as f32).collect();
+        let (lock, intro_card_secs) =
+            beat_lock_start(chain_card_secs(cfg.intro.as_ref()), seam, &beats, interval, cfg.project.fps);
+        let start = pacing::nearest_beat(&grid, lock.output_secs + lock.seam_in_secs * 0.5)?;
+        let song_end = if play_through {
+            s.final_hit_secs
+                .and_then(|h| pacing::nearest_beat(&grid, h as f64))
+                .map(|hit| (hit, s.sound_end_secs as f64))
+        } else {
+            None
+        };
+        let input = pacing::EndingInput {
+            target_secs: target,
+            outro,
+            song_end,
+            earliest: start + 1,
+            latest: usize::MAX,
+            max_ring_out_secs: 2.0 * cfg.selection.max_clip.as_secs_f64(),
+            musical: snd.musical_ending,
+        };
+        let mut plan = pacing::MusicPlan::new(
+            grid,
+            start,
+            input,
+            pace,
+            interval,
+            (cfg.selection.min_clip.as_secs_f64(), cfg.selection.max_clip.as_secs_f64()),
+            play_through,
+            snd.hero_on_drop,
+            image_secs,
+        )?;
+        plan.intro_card_secs = intro_card_secs;
+        // Played through only to end with the song.
+        (!play_through || plan.ending.kind == pacing::EndingKind::SongEnd).then_some(plan)
+    };
+    // The song's own ending, when it fits the target length.
+    let song_end_fits = snd.musical_ending
+        && s.final_hit_secs.is_some_and(|h| {
+            pacing::song_end_fits(h as f64, s.sound_end_secs as f64, target, outro.map(|o| o.0), 4.0 * interval)
+        });
+    let plan = song_end_fits.then(|| plan_with(true)).flatten().or_else(|| plan_with(false))?;
+    let level = |l: crate::music_structure::Level| format!("{l:?}").to_lowercase();
+    println!(
+        "  bars: {:.3}s, {}-bar phrases, downbeat confidence {:.2}; {} section{} ({}){}",
+        interval * s.beats_per_bar as f64,
+        s.phrase_bars,
+        s.downbeat_confidence,
+        s.sections.len(),
+        plural(s.sections.len()),
+        s.sections.iter().map(|x| level(x.level)).collect::<Vec<_>>().join(" → "),
+        s.drop.map(|i| format!("; drop at {:.2}s", s.sections[i].start_secs)).unwrap_or_default(),
+    );
+    println!(
+        "  music-led plan: {} clip{}, {}–{} beats each (strength {:.2}); {}",
+        plan.clips,
+        plural(plan.clips),
+        plan.min_beats(),
+        plan.max_beats(),
+        pace.strength,
+        describe_ending(&plan.grid, &plan.ending, s.final_hit_secs),
+    );
+    Some(plan)
+}
+
+/// One line about how the edit ends, for the run log.
+fn describe_ending(grid: &[crate::pacing::PaceBeat], e: &crate::pacing::Ending, final_hit: Option<f32>) -> String {
+    use crate::pacing::EndingKind;
+    let t = grid.get(e.last_cut).map_or(0.0, |b| b.t);
+    let what = match e.kind {
+        EndingKind::SongEnd => format!(
+            "ends with the song: last cut on its final hit at {t:.2}s{}",
+            final_hit.map(|h| format!(" (song {h:.2}s)")).unwrap_or_default()
+        ),
+        EndingKind::PhraseEnd => format!("last cut on the phrase start at {t:.2}s"),
+        EndingKind::BarEnd => format!("last cut on the downbeat at {t:.2}s (no phrase start near the target)"),
+        EndingKind::Beat => format!("last cut on the beat at {t:.2}s"),
+    };
+    let card = e.outro_card_secs.map(|c| format!(", outro card {c:.2}s")).unwrap_or_default();
+    format!("{what}, video ends {:.2}s{card}", e.video_end_secs)
+}
+
+/// What music-led pacing made of the ordered cut (see [`pace_segments`]).
+struct Paced {
+    /// Each clip's visible span `(cut in, cut out)`, output seconds.
+    spans: Vec<(f64, f64)>,
+    /// The best moment: its clip and where it went.
+    hero: Option<(usize, crate::pacing::HeroPlacement)>,
+    ending: crate::pacing::Ending,
+}
+
+/// Fit the ordered clips to the music plan: each clip's length from the
+/// song where it plays, its window re-centred on its moment, the best
+/// moment on the drop (an energy arc is re-arranged around it; any other
+/// order keeps its sequence and the drop is only used if the clips before
+/// it can reach it) and the ending. `None` leaves the cut as picked.
+fn pace_segments(
+    m: &crate::pacing::MusicPlan,
+    segments: &mut [Segment],
+    sources: &[crate::selection_planner::Source],
+    energy_arc: bool,
+) -> Option<Paced> {
+    use crate::pacing::{self, ClipInfo};
+    let is_image = |s: &Segment| crate::media_probe::is_image_path(&s.chapter_path);
+    let is_pick = |s: &Segment| !is_image(s) && !s.reason.starts_with(FORCED_RANGE_REASON);
+    let infos = |segs: &[Segment]| -> Vec<ClipInfo> {
+        segs.iter()
+            .map(|s| ClipInfo {
+                source_id: s.source_id.clone(),
+                virtual_start: s.virtual_start_secs,
+                duration: s.duration_secs,
+                in_start: s.in_chapter_start_secs,
+                chapter_secs: (!is_image(s)).then(|| {
+                    sources
+                        .iter()
+                        .flat_map(|src| &src.chapters)
+                        .find(|c| c.path == s.chapter_path)
+                        .map_or(s.in_chapter_start_secs + s.duration_secs, |c| c.duration_secs)
+                }),
+                fixed: !is_pick(s),
+            })
+            .collect()
+    };
+    // Plan with room judged loosely first; if two clips of one source then
+    // overlap, again with each kept clear of its neighbours' moments.
+    let attempt = |segments: &mut [Segment], strict: bool| -> Option<(Vec<(f64, f64)>, Option<(usize, pacing::HeroPlacement)>, pacing::Ending)> {
+        let mut body = pacing::body_for(m, &infos(segments), strict)?;
+        let mut anchors = Vec::new();
+        let mut hero = None;
+        if m.hero_on_drop {
+            let natural = pacing::plan_cuts(&m.grid, body.start, body.end, &body.slots, &[], &m.pace)?;
+            let picks: Vec<bool> = segments.iter().map(is_pick).collect();
+            let score = |i: usize| segments[i].score.unwrap_or(0.0);
+            let top = (0..body.slots.len())
+                .filter(|&i| picks[i])
+                .max_by(|&a, &b| score(a).total_cmp(&score(b)).then(b.cmp(&a)));
+            let placed = top.and_then(|top| {
+                let fixed = (!energy_arc).then_some(top);
+                pacing::place_hero(&m.grid, &body.slots, body.start, body.end, fixed, &picks, &natural)
+            });
+            if let Some(p) = placed {
+                if energy_arc {
+                    arrange_energy_arc_at(segments, p.anchor.slot, &picks);
+                    body = pacing::body_for(m, &infos(segments), strict)?;
+                }
+                if pacing::anchor_fits(&body.slots, body.start, body.end, p.anchor) {
+                    anchors.push(p.anchor);
+                    hero = Some((p.anchor.slot, p));
+                }
+            }
+        }
+        let cuts = match pacing::plan_cuts(&m.grid, body.start, body.end, &body.slots, &anchors, &m.pace) {
+            Some(c) => c,
+            None => {
+                hero = None;
+                pacing::plan_cuts(&m.grid, body.start, body.end, &body.slots, &[], &m.pace)?
+            }
+        };
+        Some((pacing::clip_spans(m, &body, &cuts), hero, body.ending))
+    };
+    let (spans, hero, ending) = match attempt(segments, false) {
+        Some(p) if !pacing::overlapping(&infos(segments), &p.0) => p,
+        _ => {
+            tracing::debug!("pacing: re-planned with every clip clear of its neighbours' moments");
+            attempt(segments, true)?
+        }
+    };
+    if spans.len() != segments.len() {
+        return None;
+    }
+    let before = infos(segments);
+    for ((s, c), &(a, b)) in segments.iter_mut().zip(&before).zip(&spans) {
+        let (in_start, virtual_start) = pacing::rewindow(c, b - a);
+        s.in_chapter_start_secs = in_start;
+        s.virtual_start_secs = virtual_start;
+        s.duration_secs = b - a;
+    }
+    Some(Paced { spans, hero, ending })
+}
+
+/// Run-log summary of the paced cut.
+fn print_pacing(m: &crate::pacing::MusicPlan, p: &Paced, segments: &[Segment]) {
+    // Each clip as "beats@intensity", in output order.
+    let clips: Vec<String> = p
+        .spans
+        .iter()
+        .map(|&(a, b)| format!("{:.0}@{:.2}", (b - a) / m.interval, crate::pacing::mean_intensity(&m.grid, a, b)))
+        .collect();
+    println!(
+        "\nmusic-led pacing: {} clips, beats@song intensity: {}",
+        segments.len(),
+        clips.join(" "),
+    );
+    if let Some((i, h)) = p.hero {
+        println!(
+            "  best moment (clip {}, score {:.3}) starts on {} at {:.2}s",
+            i + 1,
+            segments[i].score.unwrap_or(0.0),
+            match h.spot {
+                crate::pacing::HeroSpot::Drop => "the drop",
+                crate::pacing::HeroSpot::Section => "the biggest section that plays",
+                crate::pacing::HeroSpot::Phrase => "a phrase start",
+            },
+            p.spans[i].0,
+        );
+    }
+    println!("  {}", describe_ending(&m.grid, &p.ending, None));
+}
+
 /// One-line description of a fitted beat grid for the run log.
 fn describe_beat_grid(g: &crate::audio_analysis::BeatGridFit) -> String {
     use crate::audio_analysis::GridOctave;
@@ -4173,6 +4596,7 @@ mod tests {
                 tail_extra_secs: 0.0,
                 seam_out_secs: lock_seam_out(i, n, None, false, false, true),
                 seam_out_without_ramp: None,
+                target_secs: None,
             })
             .collect();
         let locked = lock_cuts(&clips, start, &grid, FPS);
@@ -4622,8 +5046,25 @@ mod plan_render_tests {
         let rendered_obj = rendered_edit.as_object_mut().unwrap();
         assert!(rendered_obj.remove("music").is_some(), "the render records the music layout");
         assert!(rendered_obj.remove("titles").is_some(), "the render records the titles");
-        assert_eq!(rendered_edit, json(&standalone.timeline), "planned timeline = rendered timeline");
-        assert_eq!(m["segments"], json(&standalone.segments));
+        // Frames are integers and must match exactly; seconds may differ in
+        // the last bit (music-led pacing reaches a source window by a
+        // different sum in the two phases).
+        fn same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+            use serde_json::Value as V;
+            match (a, b) {
+                (V::Number(x), V::Number(y)) if x.is_f64() || y.is_f64() => {
+                    (x.as_f64().unwrap() - y.as_f64().unwrap()).abs() < 1e-9
+                }
+                (V::Array(x), V::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same(p, q)),
+                (V::Object(x), V::Object(y)) => {
+                    x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w)))
+                }
+                _ => a == b,
+            }
+        }
+        let planned = json(&standalone.timeline);
+        assert!(same(&rendered_edit, &planned), "planned timeline = rendered timeline\n{rendered_edit}\n{planned}");
+        assert!(same(&m["segments"], &json(&standalone.segments)), "planned segments = rendered segments");
         assert!((standalone.duration_secs - m["timeline"]["duration_secs"].as_f64().unwrap()).abs() < 1e-9);
         // A final's manifest says nothing about quality (as before drafts).
         assert!(m.get("quality").is_none());

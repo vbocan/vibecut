@@ -956,6 +956,7 @@ mod tests {
             beat_sync: None,
             timeline: None,
             quality: None,
+            music: None,
             generator: "test".into(),
         };
         let v = serde_json::to_value(&m).unwrap();

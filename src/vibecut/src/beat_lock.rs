@@ -33,10 +33,18 @@ pub struct LockClip {
     /// Footage read past the clip's own length (a speed-ramp tail).
     pub tail_extra_secs: f64,
     /// Crossfade into the next clip (0 = hard cut). `None` when nothing
-    /// follows: the clip ends the video and keeps its planned length.
+    /// follows: the clip ends the video (at `target_secs` when given, else
+    /// its planned length).
     pub seam_out_secs: Option<f64>,
     /// For a speed-ramped clip: the seam it would have without its ramp.
     pub seam_out_without_ramp: Option<f64>,
+    /// Output time the outgoing cut should land on — a beat the music plan
+    /// chose (see `pacing`) — or, for the clip that ends the video, where
+    /// the video ends. `None`: the beat nearest `incoming cut + planned`.
+    /// An absolute target keeps the plan's bars and phrases even when
+    /// something ahead of the clip (a beat-burst, a nearer beat taken for
+    /// lack of footage) moved its start.
+    pub target_secs: Option<f64>,
 }
 
 /// What [`lock_cuts`] decided for one clip.
@@ -76,21 +84,36 @@ pub fn lock_cuts(clips: &[LockClip], start: LockStart, beats: &[f32], fps: u32) 
 
     for c in clips {
         let planned = frames(c.planned_secs);
+        let min_core = MIN_CORE_FRAMES / fps;
         let Some(seam) = c.seam_out_secs else {
-            out.push(LockedClip {
-                duration_secs: planned,
-                in_start_secs: c.in_start_secs,
-                drop_ramp: false,
-                on_beat: false,
+            // The clip that ends the video: at its target when it has one
+            // and the footage allows, else its planned length.
+            let ending = c.target_secs.and_then(|t| {
+                let d = frames(t - s);
+                if d < w_in + min_core {
+                    return None;
+                }
+                Some((d, fit_window(c.in_start_secs, d + c.tail_extra_secs, c.source_end_secs)?))
             });
-            s += planned;
+            let (d, in_start) = ending.unwrap_or((planned, c.in_start_secs));
+            out.push(LockedClip {
+                duration_secs: d,
+                in_start_secs: in_start,
+                drop_ramp: false,
+                on_beat: ending.is_some(),
+            });
+            s += d;
             w_in = 0.0;
             continue;
         };
         let incoming_cut = s + w_in * 0.5;
-        let desired = incoming_cut + c.planned_secs;
-        let lo = incoming_cut + MIN_SPAN_FRACTION * c.planned_secs;
-        let hi = incoming_cut + MAX_SPAN_FRACTION * c.planned_secs;
+        let desired = c.target_secs.unwrap_or(incoming_cut + c.planned_secs);
+        let mut lo = incoming_cut + MIN_SPAN_FRACTION * c.planned_secs;
+        let mut hi = incoming_cut + MAX_SPAN_FRACTION * c.planned_secs;
+        if let Some(t) = c.target_secs {
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
         let mut candidates: Vec<f64> = beats
             .iter()
             .map(|&b| b as f64)
@@ -107,7 +130,6 @@ pub fn lock_cuts(clips: &[LockClip], start: LockStart, beats: &[f32], fps: u32) 
         if let Some(alt) = c.seam_out_without_ramp {
             attempts.push((alt, 0.0, true));
         }
-        let min_core = MIN_CORE_FRAMES / fps;
         let placed = candidates.iter().find_map(|&b| {
             attempts.iter().find_map(|&(w_out, tail, drop_ramp)| {
                 let d = frames(b - s + w_out * 0.5);
@@ -194,6 +216,7 @@ mod tests {
             tail_extra_secs: 0.0,
             seam_out_secs: seam,
             seam_out_without_ramp: None,
+            target_secs: None,
         }
     }
 
@@ -331,5 +354,68 @@ mod tests {
         let locked = lock_cuts(&[c], LockStart { output_secs: 0.0, seam_in_secs: 0.0 }, &grid, FPS);
         assert!(locked[0].on_beat);
         assert!((locked[0].duration_secs - 3.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn targets_bring_the_cuts_back_to_the_plan() {
+        // Planned: cuts at 2.0, 4.0, 6.0 s. The first clip's chapter is
+        // too short, so its cut comes a beat early (1.5 s); relative
+        // planning would carry that slip to every later cut, the plan's
+        // targets don't.
+        let grid = beats(0.0, 0.5, 40);
+        let mut first = clip(2.0, Some(0.4));
+        first.in_start_secs = 0.0;
+        first.source_end_secs = Some(2.0);
+        first.target_secs = Some(2.0);
+        let mut second = clip(2.0, Some(0.4));
+        second.target_secs = Some(4.0);
+        let mut third = clip(2.0, Some(0.4));
+        third.target_secs = Some(6.0);
+        let start = LockStart { output_secs: 0.0, seam_in_secs: 0.0 };
+        let locked = lock_cuts(&[first, second, third], start, &grid, FPS);
+        let durs: Vec<f32> = locked.iter().map(|l| l.duration_secs as f32).collect();
+        let cuts: Vec<f32> = planned_cuts(&durs, &[0.4, 0.4], false, false, None, FPS)
+            .into_iter()
+            .map(|c| c.output_secs)
+            .collect();
+        assert!((cuts[0] - 1.5).abs() <= HALF_FRAME, "{cuts:?}");
+        assert!((cuts[1] - 4.0).abs() <= HALF_FRAME, "{cuts:?}");
+        assert!(locked.iter().all(|l| l.on_beat), "{locked:?}");
+
+        // Without targets the slip carries on: the second cut at 3.5 s.
+        let untargeted: Vec<LockClip> =
+            [first, second].iter().map(|c| LockClip { target_secs: None, ..*c }).collect();
+        let locked = lock_cuts(&untargeted, start, &grid, FPS);
+        let d: Vec<f32> = locked.iter().map(|l| l.duration_secs as f32).collect();
+        let cuts = planned_cuts(&d, &[0.4], false, false, None, FPS);
+        assert!((cuts[0].output_secs - 1.5).abs() <= HALF_FRAME);
+        // Starts at 1.3 s; 2.4 s long puts its cut (mid-crossfade) at 3.5 s.
+        assert!((locked[1].duration_secs - 2.4).abs() < 1e-9, "{locked:?}");
+    }
+
+    #[test]
+    fn the_last_clip_ends_the_video_on_its_target() {
+        // Video end planned on the downbeat at 6.0 s.
+        let grid = beats(0.0, 0.5, 40);
+        let mut last = clip(2.33, None);
+        last.target_secs = Some(6.0);
+        let locked = lock_cuts(
+            &[clip(2.0, Some(0.4)), clip(2.0, Some(0.4)), last],
+            LockStart { output_secs: 0.0, seam_in_secs: 0.0 },
+            &grid,
+            FPS,
+        );
+        assert!(locked[2].on_beat);
+        // Clips start at 0, 1.8, 3.8 (each overlaps the next by 0.4 s).
+        let end = locked[0].duration_secs - 0.4 + locked[1].duration_secs - 0.4 + locked[2].duration_secs;
+        assert!((end - 6.0).abs() <= 0.5 / FPS as f64 + 1e-9, "video ends at {end}");
+        // A target the footage can't reach falls back to the planned length.
+        let mut short = clip(2.0, None);
+        short.in_start_secs = 0.0;
+        short.source_end_secs = Some(2.1);
+        short.target_secs = Some(3.0);
+        let l = lock_cuts(&[short], LockStart { output_secs: 0.0, seam_in_secs: 0.0 }, &grid, FPS);
+        assert!(!l[0].on_beat);
+        assert!((l[0].duration_secs - 2.0).abs() < 1e-9);
     }
 }

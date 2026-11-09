@@ -463,8 +463,28 @@ pub struct Soundtrack {
     pub files: Vec<Utf8PathBuf>,
     #[serde(default = "default_true")]
     pub beat_align: bool,
+    /// Clip lengths follow the song: short clips where it is loud and busy,
+    /// long holds where it is quiet (needs `beat_align`). See `pacing`.
     #[serde(default = "default_true")]
     pub energy_drives_pacing: bool,
+    /// How far `energy_drives_pacing` bends clip lengths, 0..1: 0 = even
+    /// lengths, 1 = the loudest music cuts ~2.8× faster than average and
+    /// the quietest holds ~2.8× longer (always within `[selection]`
+    /// `min_clip`..`max_clip`). Default 0.6.
+    #[serde(default = "default_pacing_strength")]
+    pub pacing_strength: f32,
+    /// End the edit musically (needs `beat_align`): the last cut on the
+    /// song's final hit when its own ending fits the target length, else
+    /// on the phrase start nearest it, and the music's fade completes at
+    /// the end of a bar. Default true.
+    #[serde(default = "default_true")]
+    pub musical_ending: bool,
+    /// Put the best moment on the downbeat that opens the song's drop (or
+    /// the biggest section that plays in the video), needs `beat_align`.
+    /// `energy_arc` is arranged around it; other orders keep their
+    /// sequence. Default true.
+    #[serde(default = "default_true")]
+    pub hero_on_drop: bool,
     /// Soundtrack volume during a duck (in dB). Default -18 dB.
     #[serde(default = "default_ducking_db")]
     pub ducking_db: f32,
@@ -523,6 +543,10 @@ pub struct Soundtrack {
 
 fn default_vad_speech_weight() -> f32 {
     1.5
+}
+
+fn default_pacing_strength() -> f32 {
+    0.6
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1232,6 +1256,15 @@ impl Config {
             )));
         }
 
+        if let Some(s) = &self.soundtrack {
+            if !(0.0..=1.0).contains(&s.pacing_strength) {
+                return Err(ConfigError::Validation(format!(
+                    "soundtrack.pacing_strength ({}) must be between 0 and 1",
+                    s.pacing_strength
+                )));
+            }
+        }
+
         for r in &self.input.ranges {
             if r.start >= r.end {
                 return Err(ConfigError::Validation(format!(
@@ -1548,6 +1581,26 @@ stabilize = false
         "#;
         let cfg: Config = toml::from_str(many).unwrap();
         assert_eq!(cfg.soundtrack.as_ref().unwrap().files.len(), 3);
+    }
+
+    #[test]
+    fn music_led_pacing_is_on_by_default_and_its_strength_is_checked() {
+        let base = "schema_version = 1\n[project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\n\
+                    [input]\nfolder = \".\"\n[[outputs]]\npath = \"out.mp4\"\nresolution = \"1920x1080\"\n\
+                    [soundtrack]\nfile = \"a.mp3\"\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        cfg.validate().unwrap();
+        let s = cfg.soundtrack.as_ref().unwrap();
+        assert!(s.energy_drives_pacing && s.musical_ending && s.hero_on_drop);
+        assert!((s.pacing_strength - 0.6).abs() < 1e-6);
+        let off: Config = toml::from_str(&format!(
+            "{base}energy_drives_pacing = false\nmusical_ending = false\nhero_on_drop = false\npacing_strength = 1.0\n"
+        ))
+        .unwrap();
+        off.validate().unwrap();
+        let bad: Config = toml::from_str(&format!("{base}pacing_strength = 1.5\n")).unwrap();
+        let e = bad.validate().unwrap_err().to_string();
+        assert!(e.contains("pacing_strength"), "{e}");
     }
 
     /// A minimal config whose outputs are `outputs` (`[[outputs]]` tables), validated.

@@ -80,6 +80,9 @@
       "ducking_db": -20.0,
       "energy_drives_pacing": true,
       "fade_out": "2s",
+      "hero_on_drop": true,
+      "musical_ending": true,
+      "pacing_strength": 0.6000000238418579,
       "vad_speech_weight": 1.5
     },
     "transition": {
@@ -173,6 +176,9 @@
       "ducking_db": -20.0,
       "energy_drives_pacing": true,
       "fade_out": "3s 500ms",
+      "hero_on_drop": true,
+      "musical_ending": true,
+      "pacing_strength": 0.6000000238418579,
       "vad_speech_weight": 2.5
     },
     "transition": {
@@ -266,6 +272,9 @@
       "ducking_db": -18.0,
       "energy_drives_pacing": true,
       "fade_out": "6s",
+      "hero_on_drop": true,
+      "musical_ending": true,
+      "pacing_strength": 0.6000000238418579,
       "vad_speech_weight": 1.5
     },
     "transition": {
@@ -359,6 +368,9 @@
       "ducking_db": -16.0,
       "energy_drives_pacing": true,
       "fade_out": "3s",
+      "hero_on_drop": true,
+      "musical_ending": true,
+      "pacing_strength": 0.6000000238418579,
       "vad_speech_weight": 1.5
     },
     "transition": {
@@ -452,6 +464,9 @@
       "ducking_db": -18.0,
       "energy_drives_pacing": true,
       "fade_out": "3s",
+      "hero_on_drop": true,
+      "musical_ending": true,
+      "pacing_strength": 0.6000000238418579,
       "vad_speech_weight": 1.5
     },
     "transition": {
@@ -545,6 +560,9 @@
       "ducking_db": -18.0,
       "energy_drives_pacing": true,
       "fade_out": "5s",
+      "hero_on_drop": true,
+      "musical_ending": true,
+      "pacing_strength": 0.6000000238418579,
       "vad_speech_weight": 1.5
     },
     "transition": {
