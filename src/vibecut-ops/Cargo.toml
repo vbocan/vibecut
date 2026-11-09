@@ -27,6 +27,9 @@ camino = "1"
 chrono = "0.4"
 regex = "1"
 toml = "0.8"
+# Format-preserving edits of project configs (the Fine-tune page): comments,
+# key order and hand-added keys survive a change. Already in the tree via toml.
+toml_edit = "0.22"
 
 # JSON Schema for FeedbackAction — plain `schemars`, not `rmcp::schemars`.
 # Keeping this crate off rmcp entirely is what lets a future REST/web

@@ -1110,6 +1110,93 @@ class AppState {
 		}
 	}
 
+	// ---------- Fine-tune ----------
+	/** The project's vibe defaults and its changes from them. */
+	tuneDefaults = $state<api.VibeDefaults | null>(null);
+	/** A plan of the edit as the settings stand now (no render). */
+	tunePlan = $state<api.EditPlan | null>(null);
+	tunePlanning = $state(false);
+	tuneSaving = $state(false);
+	tuneError = $state<string | null>(null);
+	private tunePlanSeq = 0;
+	private tunePlanTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** Load what the Fine-tune page shows: the config, its vibe defaults, a plan. */
+	async openFineTune() {
+		if (!this.proposeResult) return;
+		this.tuneError = null;
+		await Promise.all([this.loadStructuredConfig(), this.loadTuneDefaults(), this.refreshConfigText()]);
+		this.planTune(0);
+	}
+
+	private async refreshConfigText() {
+		if (!this.proposeResult) return;
+		try {
+			const r = await api.readConfig(this.proposeResult.config_path);
+			this.configToml = r.config_toml;
+			this.configDirty = false;
+		} catch {
+			/* the TOML view says so when it's opened */
+		}
+	}
+
+	async loadTuneDefaults() {
+		if (!this.proposeResult) return;
+		try {
+			this.tuneDefaults = await api.configDefaults(this.proposeResult.config_path, this.proposeResult.vibe ?? this.effectiveVibe);
+		} catch {
+			this.tuneDefaults = null;
+		}
+	}
+
+	/** Change settings in place; then refresh the views and re-plan. */
+	async tune(changes: api.ConfigChange[]) {
+		if (!this.proposeResult || changes.length === 0) return false;
+		this.tuneSaving = true;
+		this.tuneError = null;
+		try {
+			const r = await api.patchConfig(this.proposeResult.config_path, changes);
+			this.configToml = r.config_toml;
+			this.configDirty = false;
+			this.configChangedSinceRender = true;
+			await Promise.all([this.loadStructuredConfig(), this.loadTuneDefaults()]);
+			this.planTune();
+			return true;
+		} catch (e) {
+			this.tuneError = e instanceof api.ApiError ? e.describe() : String(e);
+			return false;
+		} finally {
+			this.tuneSaving = false;
+		}
+	}
+
+	/** Plan the edit as it stands (debounced): the page's storyboard. */
+	planTune(delay = 500) {
+		if (this.tunePlanTimer) clearTimeout(this.tunePlanTimer);
+		this.tunePlanTimer = setTimeout(async () => {
+			if (!this.proposeResult) return;
+			const seq = ++this.tunePlanSeq;
+			this.tunePlanning = true;
+			try {
+				const p = await api.planEdit(this.proposeResult.config_path);
+				if (seq === this.tunePlanSeq) this.tunePlan = p;
+			} catch {
+				/* the last plan stays; the render is the real answer */
+			} finally {
+				if (seq === this.tunePlanSeq) this.tunePlanning = false;
+			}
+		}, delay);
+	}
+
+	/** Save the TOML view's text, then refresh like any change. */
+	async saveTomlFromTune() {
+		await this.saveConfig();
+		if (!this.configError) {
+			await this.loadTuneDefaults();
+			this.planTune(0);
+		}
+	}
+
 	async quickFeedback(action: FeedbackAction) {
 		if (!this.proposeResult) return;
 		this.feedbackBusy = true;

@@ -2387,6 +2387,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "ts-rs",
  "vibecut",

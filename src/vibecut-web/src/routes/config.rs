@@ -16,6 +16,7 @@ use serde::Deserialize;
 use vibecut_ops::config_io::Config;
 
 use crate::error::ApiError;
+use vibecut_ops::error::OpsError;
 
 #[derive(Debug, Deserialize)]
 pub struct ConfigPathQuery {
@@ -119,3 +120,34 @@ resolution = "1920x1080"
         }
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct PatchBody {
+    pub config_path: String,
+    pub changes: Vec<vibecut_ops::config_io::ConfigChange>,
+}
+
+/// `POST /api/config/patch` — change settings in place (the Fine-tune
+/// page): comments, order and unknown keys are kept; a change that would
+/// make the config invalid is a 400 and nothing is written.
+pub async fn patch_config(Json(body): Json<PatchBody>) -> Result<Json<vibecut_ops::config_io::ConfigText>, ApiError> {
+    if body.changes.is_empty() || body.changes.len() > 64 {
+        return Err(OpsError::invalid("send between 1 and 64 changes").into());
+    }
+    Ok(Json(vibecut_ops::config_io::patch_config(&body.config_path, &body.changes).await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DefaultsQuery {
+    pub config_path: String,
+    pub vibe: Option<String>,
+}
+
+/// `GET /api/config/defaults?config_path=&vibe=` — the project's vibe
+/// defaults and what the project changed from them.
+pub async fn config_defaults(Query(q): Query<DefaultsQuery>) -> Result<Json<vibecut_ops::recipe::VibeDefaults>, ApiError> {
+    let cfg = vibecut_ops::config_io::read_config_structured(&q.config_path).await?;
+    let vibe = q.vibe.as_deref().filter(|v| !v.trim().is_empty());
+    Ok(Json(vibecut_ops::recipe::vibe_defaults(&cfg, vibe)?))
+}
+

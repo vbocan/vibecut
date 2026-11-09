@@ -68,7 +68,7 @@ No LLM client to configure — open a browser instead.
 
    (Set `VIBECUT_FOOTAGE` and `VIBECUT_PROJECTS` env vars first to point at your host paths. Set `ANTHROPIC_API_KEY` too if you want the free-text "Ask AI" box to work — everything else works without it.)
 
-2. Open **http://localhost:8090/**. Pick a trip, tap **Make my video**: the vibe, length and song are picked for you, a storyboard of the edit appears in seconds and a 540p draft plays shortly after. Tweak it in the Studio (shorter, calmer, more energy, new song, drop a moment, undo), then **Finish in full quality**, download, or make a Reels / Shorts / TikTok / WhatsApp version from the Share sheet. The guided editor and raw TOML are one click away under **Pro**.
+2. Open **http://localhost:8090/**. Pick a trip, tap **Make my video**: the vibe, length and song are picked for you, a storyboard of the edit appears in seconds and a 540p draft plays shortly after. Tweak it in the Studio (shorter, calmer, more energy, new song, drop a moment, undo), then **Finish in full quality**, download, or make a Reels / Shorts / TikTok / WhatsApp version from the Share sheet. To go further, **Fine-tune** shows every setting by goal (story, rhythm, music, look, titles, what matters, export) next to the video, with the vibe's default and a Reset for each, and the project's TOML one tab away.
 
 ### Drop a folder, get a video — through Claude Desktop
 
@@ -281,7 +281,7 @@ If you use Vibecut in your research, please cite:
 | File | What's there |
 |---|---|
 | [CONFIG.md](CONFIG.md) | Complete TOML schema reference for hand-authored projects. |
-| [WIZARD.md](WIZARD.md) | Web UI's guided config editor, step by step. No TOML required. |
+| [FINE-TUNE.md](FINE-TUNE.md) | The web UI's Fine-tune page: settings by goal, the vibe's defaults, changes and resets, and the TOML view. |
 | [MUSIC.md](MUSIC.md) | The music library: folders, licence sidecars, credits, the starter-pack layout. |
 | [DOCKER.md](DOCKER.md) | Docker build / run / wire-up guide. Includes the CLI workflow. |
 | [scripts/](scripts/) | PowerShell helpers for CLI, Docker, and web-layer dev workflows. |

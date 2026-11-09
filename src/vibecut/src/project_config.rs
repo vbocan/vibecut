@@ -1194,6 +1194,16 @@ pub enum Encoder {
 // ---------- loading ----------
 
 impl Config {
+    /// The config as pretty TOML, with numbers written the way people
+    /// type them. Settings are `f32`, and `toml` widens them to `f64`, so
+    /// `0.6` would come out as `0.6000000238418579`; a float that is
+    /// exactly an `f32` is written by its shortest `f32` form instead.
+    pub fn to_toml_pretty(&self) -> Result<String, toml::ser::Error> {
+        let mut v = toml::Value::try_from(self)?;
+        tidy_floats(&mut v);
+        toml::to_string_pretty(&v)
+    }
+
     pub fn load(path: &camino::Utf8Path) -> Result<Self, ConfigError> {
         let bytes = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
             path: path.to_path_buf(),
@@ -1383,6 +1393,23 @@ fn sanitize_for_path(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
+}
+
+/// See [`Config::to_toml_pretty`].
+pub fn tidy_floats(v: &mut toml::Value) {
+    match v {
+        toml::Value::Float(f) => {
+            let narrow = *f as f32;
+            if f.is_finite() && narrow as f64 == *f {
+                if let Ok(short) = narrow.to_string().parse::<f64>() {
+                    *f = short;
+                }
+            }
+        }
+        toml::Value::Array(a) => a.iter_mut().for_each(tidy_floats),
+        toml::Value::Table(t) => t.iter_mut().for_each(|(_, v)| tidy_floats(v)),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1826,5 +1853,23 @@ stabilize = false
         assert!(!file_matches("x/camA/100GOPRO/GX010001.MP4", Utf8Path::new("camA/100GOPRO/GX010001.MP4")));
         assert!(!file_matches("", a));
         assert!(!file_matches("/", a));
+    }
+
+    #[test]
+    fn written_configs_have_clean_numbers() {
+        let mut cfg: Config = toml::from_str(
+            "schema_version = 1\n[project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\n\
+             [input]\nfolder = \"f\"\n[scoring]\ngps_speed = 0.4\nmotion_peaks = 0.3\n\
+             [[outputs]]\npath = \"/projects/out/x.mp4\"\nresolution = \"1920x1080\"\n",
+        )
+        .unwrap();
+        cfg.selection.variety = 0.05;
+        let text = cfg.to_toml_pretty().unwrap();
+        assert!(text.contains("gps_speed = 0.4\n"), "{text}");
+        assert!(text.contains("variety = 0.05\n"), "{text}");
+        assert!(!text.contains("0000000"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.scoring.gps_speed, 0.4);
+        assert_eq!(back.selection.variety, 0.05);
     }
 }

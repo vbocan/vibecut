@@ -1301,3 +1301,22 @@ fn keys_added_after_format_1_take_the_current_template() {
         assert!(r.settings.is_empty(), "{key}: {:?}", r.settings);
     }
 }
+
+/// The Fine-tune page's defaults: a fresh proposal has no changes from
+/// its vibe; a changed setting is listed with its value and the default.
+#[test]
+fn vibe_defaults_list_what_a_project_changed() {
+    let mut cfg = proposal("drone_cinematic", "/footage/x", "x", None);
+    let d = vibe_defaults(&cfg, Some("drone_cinematic")).unwrap();
+    assert_eq!(d.vibe, "drone_cinematic");
+    assert_eq!(d.vibe_name, "Drone cinematic");
+    assert!(d.changes.is_empty(), "{:?}", d.changes);
+    let default_max = d.defaults["selection"]["max_clip"].clone();
+    cfg.selection.max_clip = std::time::Duration::from_secs(4);
+    let d = vibe_defaults(&cfg, Some("drone_cinematic")).unwrap();
+    let c = d.changes.iter().find(|c| c.key == "selection.max_clip").expect("max_clip listed");
+    assert_eq!(c.value, serde_json::json!("4s"));
+    assert_eq!(c.default, default_max);
+    // Without a vibe, the closest one is used.
+    assert_eq!(vibe_defaults(&cfg, None).unwrap().vibe, "drone_cinematic");
+}

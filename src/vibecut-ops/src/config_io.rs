@@ -106,7 +106,8 @@ async fn write_config_structured_in(
     let path = resolve_write_target(root, config_path)?;
     cfg.validate()
         .map_err(|e| OpsError::invalid(format!("config does not validate: {e:#}")))?;
-    let toml_text = toml::to_string_pretty(cfg)
+    let toml_text = cfg
+        .to_toml_pretty()
         .map_err(|e| OpsError::internal(format!("could not serialize config: {e}")))?;
 
     write_creating_parent(&path, &toml_text)?;
@@ -114,6 +115,240 @@ async fn write_config_structured_in(
     Ok(cfg.clone())
 }
 
+/// One change to a config, by dotted key (`selection.max_clip`,
+/// `intro.layers.0.content`; a number is an array index). `value: null`
+/// removes the key, so the setting goes back to its built-in default.
+#[derive(Debug, Clone, serde::Deserialize, Serialize)]
+pub struct ConfigChange {
+    pub key: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+}
+
+/// Apply `changes` to the config file in place, keeping everything else
+/// as written: comments, key order, keys this server doesn't know. The
+/// result must still load and validate, or nothing is written.
+pub async fn patch_config(config_path: &str, changes: &[ConfigChange]) -> Result<ConfigText, OpsError> {
+    patch_config_in(&crate::paths::projects_root_for(config_path), config_path, changes).await
+}
+
+async fn patch_config_in(root: &Path, config_path: &str, changes: &[ConfigChange]) -> Result<ConfigText, OpsError> {
+    let path = resolve_write_target(root, config_path)?;
+    let text = read_existing(&path)?;
+    let new_text = patch_text(&text, changes)?;
+    write_creating_parent(&path, &new_text)?;
+    Ok(ConfigText { config_path: path.to_string_lossy().into_owned(), config_toml: new_text })
+}
+
+/// [`patch_config`] on the text alone.
+pub fn patch_text(text: &str, changes: &[ConfigChange]) -> Result<String, OpsError> {
+    use toml_edit::DocumentMut;
+    let mut doc: DocumentMut =
+        text.parse().map_err(|e| OpsError::invalid(format!("the config isn't valid TOML: {e}")))?;
+    for c in changes {
+        let segs: Vec<&str> = c.key.split('.').collect();
+        if c.key.is_empty() || c.key.len() > 200 || segs.iter().any(|s| s.is_empty()) {
+            return Err(OpsError::invalid(format!("not a setting: {:?}", c.key)));
+        }
+        let value = if c.value.is_null() {
+            None
+        } else {
+            Some(json_to_toml(&c.value).ok_or_else(|| OpsError::invalid(format!("{} can't be set to {}", c.key, c.value)))?)
+        };
+        apply(doc.as_table_mut(), false, &segs, value, &c.key)?;
+    }
+    let out = doc.to_string();
+    let cfg: vibecut::project_config::Config =
+        toml::from_str(&out).map_err(|e| OpsError::invalid(format!("that change makes the config invalid: {e}")))?;
+    cfg.validate().map_err(|e| OpsError::invalid(format!("that change makes the config invalid: {e:#}")))?;
+    Ok(out)
+}
+
+/// Set (or with `None` remove) `segs` under `table`. `inline`: the table is
+/// an inline one, so new tables inside it must be inline too.
+fn apply(
+    table: &mut dyn toml_edit::TableLike,
+    inline: bool,
+    segs: &[&str],
+    value: Option<toml_edit::Value>,
+    key: &str,
+) -> Result<(), OpsError> {
+    use toml_edit::{Item, Value};
+    let bad = || OpsError::invalid(format!("not a setting: {key:?}"));
+    let (seg, rest) = segs.split_first().ok_or_else(bad)?;
+    if rest.is_empty() {
+        match value {
+            None => {
+                table.remove(seg);
+            }
+            Some(mut v) => {
+                // Keep the comment and spacing around a value that is replaced.
+                if let Some(old) = table.get(seg).and_then(Item::as_value) {
+                    *v.decor_mut() = old.decor().clone();
+                }
+                table.insert(seg, Item::Value(v));
+            }
+        }
+        return Ok(());
+    }
+    if let Ok(i) = rest[0].parse::<usize>() {
+        let item = table.get_mut(seg).ok_or_else(bad)?;
+        let tail = &rest[1..];
+        return match item {
+            Item::ArrayOfTables(a) => {
+                if tail.is_empty() {
+                    return Err(bad());
+                }
+                let t = a.get_mut(i).ok_or_else(bad)?;
+                apply(t, false, tail, value, key)
+            }
+            Item::Value(Value::Array(arr)) => {
+                if tail.is_empty() {
+                    match value {
+                        Some(v) if i < arr.len() => {
+                            arr.replace(i, v);
+                        }
+                        Some(v) if i == arr.len() => arr.push(v),
+                        None if i < arr.len() => {
+                            arr.remove(i);
+                        }
+                        _ => return Err(bad()),
+                    }
+                    return Ok(());
+                }
+                let el = arr.get_mut(i).and_then(Value::as_inline_table_mut).ok_or_else(bad)?;
+                apply(el, true, tail, value, key)
+            }
+            _ => Err(bad()),
+        };
+    }
+    if table.get(seg).is_none() {
+        if value.is_none() {
+            return Ok(()); // nothing to remove
+        }
+        let fresh = if inline {
+            Item::Value(Value::InlineTable(toml_edit::InlineTable::new()))
+        } else {
+            Item::Table(toml_edit::Table::new())
+        };
+        table.insert(seg, fresh);
+    }
+    let item = table.get_mut(seg).ok_or_else(bad)?;
+    match item {
+        Item::Table(t) => apply(t, false, rest, value, key),
+        Item::Value(Value::InlineTable(t)) => apply(t, true, rest, value, key),
+        _ => Err(bad()),
+    }
+}
+
+/// A JSON value as a TOML value: integers stay integers, floats are
+/// written short, objects become inline tables. `null` inside is refused.
+fn json_to_toml(v: &serde_json::Value) -> Option<toml_edit::Value> {
+    use serde_json::Value as J;
+    Some(match v {
+        J::Bool(b) => (*b).into(),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => i.into(),
+            None => {
+                let f = n.as_f64()?;
+                let short = (f as f32).to_string().parse::<f64>().ok().filter(|s| (s - f).abs() < 1e-9).unwrap_or(f);
+                short.into()
+            }
+        },
+        J::String(s) => s.as_str().into(),
+        J::Array(a) => {
+            let mut arr = toml_edit::Array::new();
+            for x in a {
+                arr.push(json_to_toml(x)?);
+            }
+            toml_edit::Value::Array(arr)
+        }
+        J::Object(m) => {
+            let mut t = toml_edit::InlineTable::new();
+            for (k, x) in m {
+                t.insert(k, json_to_toml(x)?);
+            }
+            toml_edit::Value::InlineTable(t)
+        }
+        J::Null => return None,
+    })
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    const BASE: &str = r#"schema_version = 1
+# my note about this trip
+[project]
+name = "x"
+target_duration = "30s"
+fps = 30
+
+[input]
+folder = "/footage/x"
+
+[selection]
+max_clip = "7s"   # keep shots short-ish
+variety = 0.05
+
+[soundtrack]
+files = ["/projects/music/a.mp3"]
+ducking_db = -16.0
+
+[intro]
+duration = "3s"
+
+[[intro.layers]]
+kind = "text"
+content = "Hello"
+
+[[outputs]]
+path = "/projects/out/x.mp4"
+resolution = "1920x1080"
+"#;
+
+    fn ch(key: &str, value: serde_json::Value) -> ConfigChange {
+        ConfigChange { key: key.into(), value }
+    }
+
+    #[test]
+    fn patches_keep_comments_order_and_formatting() {
+        let out = patch_text(
+            BASE,
+            &[
+                ch("selection.max_clip", serde_json::json!("5s")),
+                ch("soundtrack.ducking_db", serde_json::json!(-10.5)),
+                ch("scoring.landings", serde_json::json!(1.0)),
+                ch("intro.layers.0.content", serde_json::json!("Coastline")),
+                ch("selection.variety", serde_json::Value::Null),
+            ],
+        )
+        .unwrap();
+        assert!(out.contains("# my note about this trip"), "{out}");
+        assert!(out.contains("max_clip = \"5s\"   # keep shots short-ish"), "{out}");
+        assert!(out.contains("ducking_db = -10.5"), "{out}");
+        assert!(out.contains("landings = 1"), "{out}");
+        assert!(out.contains("content = \"Coastline\""), "{out}");
+        assert!(!out.contains("variety"), "{out}");
+        assert!(out.find("[selection]").unwrap() < out.find("[soundtrack]").unwrap(), "order kept");
+    }
+
+    #[test]
+    fn a_change_that_breaks_the_config_is_refused() {
+        for (k, v) in [
+            ("selection.max_clip", serde_json::json!("soon")),
+            ("project.fps", serde_json::json!("fast")),
+            ("intro.layers.5.content", serde_json::json!("x")),
+            ("", serde_json::json!(1)),
+            ("selection..max_clip", serde_json::json!("5s")),
+            ("project.name.first", serde_json::json!("x")),
+            ("selection.nonsense", serde_json::json!(1)),
+        ] {
+            assert!(matches!(patch_text(BASE, &[ch(k, v.clone())]), Err(OpsError::InvalidInput { .. })), "{k} = {v}");
+        }
+    }
+}
 /// Confine a write to the projects root and to `.toml` files, checked
 /// before anything else so a rejected path never costs a parse.
 fn resolve_write_target(root: &Path, config_path: &str) -> Result<PathBuf, OpsError> {

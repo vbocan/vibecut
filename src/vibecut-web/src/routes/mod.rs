@@ -51,6 +51,8 @@ pub fn api_router() -> Router<AppState> {
             "/config/structured",
             get(config::read_config_structured).put(config::write_config_structured),
         )
+        .route("/config/patch", post(config::patch_config))
+        .route("/config/defaults", get(config::config_defaults))
         .route("/feedback", post(feedback::apply_feedback))
         .route("/brief", post(brief::submit_brief))
         .route("/plan", post(plan::plan))

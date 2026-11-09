@@ -7,7 +7,7 @@ arrowing across the footage scans only the folder it stops on, makes a
 video (focus must land at the top of each new screen, not on the page,
 and a click on text must not restart the Tab order there), then in the
 Studio checks the moments radio group, the song list's manual
-selection, the shortcuts dialog, the Share and Pro settings dialogs
+selection, the shortcuts dialog, the Share sheet and the Fine-tune page
 (focus moves in, stays in, Escape closes, focus returns to the opener),
 the Pro tablists, the Undo toast, the versions radio group (manual
 selection: Tab still leaves it in one step), Compare A/B, and that a
@@ -506,30 +506,30 @@ def main() -> int:
         modal("Share", "dialog.sheet[open]", "share")
         close_modal("Share", "dialog.sheet[open]", "share")
 
-        print("Studio: Pro settings drawer and its tablists")
+        print("Studio: Fine-tune page and its tablists")
         focus_top(page)
-        modal("Pro settings", "dialog.drawer[open]", "pro")
+        modal("Fine-tune", "dialog.drawer[open]", "pro")
         view = "Settings view"
-        page.wait_for_selector("[role=tablist][aria-label='Settings steps']")
-        tab_to(page, lambda a: a["group"] == view, "the Guided / Raw tabs")
+        page.wait_for_selector("[role=tablist][aria-label='Settings groups']")
+        tab_to(page, lambda a: a["group"] == view, "the Controls / TOML tabs")
         one_tab_stop(page, view, "pro view tabs")
         a = press(page, "ArrowRight")
         check(
-            checked_name(page, view) == "Raw TOML" and page.is_visible("#raw-toml"),
-            "pro view tabs: ArrowRight selects Raw TOML and shows its panel",
+            checked_name(page, view) == "TOML" and page.is_visible("#raw-toml"),
+            "pro view tabs: ArrowRight selects TOML and shows its panel",
         )
         check(
             page.get_attribute("[role=tabpanel]#pro-panel", "aria-labelledby") == "pro-tab-raw",
             "pro view tabs: the panel is labelled by the selected tab",
         )
         press(page, "ArrowRight")
-        check(checked_name(page, view) == "Guided", "pro view tabs: ArrowRight wraps to Guided")
+        check(checked_name(page, view) == "Controls", "pro view tabs: ArrowRight wraps to Controls")
         a = press(page, "ArrowDown")
-        check(checked_name(page, view) == "Guided", "pro view tabs: up / down arrows are left alone in a horizontal tablist")
-        steps = "Settings steps"
-        tab_to(page, lambda a: a["group"] == steps, "the wizard steps")
-        arrows_cycle(page, steps, "wizard steps", vertical=False)
-        close_modal("Pro settings", "dialog.drawer[open]", "pro")
+        check(checked_name(page, view) == "Controls", "pro view tabs: up / down arrows are left alone in a horizontal tablist")
+        steps = "Settings groups"
+        tab_to(page, lambda a: a["group"] == steps, "the settings groups")
+        arrows_cycle(page, steps, "settings groups", vertical=False)
+        close_modal("Fine-tune", "dialog.drawer[open]", "pro")
 
         print("Studio: song list (manual selection) and the global shortcuts")
         tab_to(page, lambda a: a["name"].startswith("Song"), "the Song disclosure")

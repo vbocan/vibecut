@@ -49,7 +49,7 @@
 		['Del', 'Drop the selected moment'],
 		['Ctrl Z', 'Undo the last change'],
 		['Ctrl K', 'Tell it'],
-		['D', 'Pro settings'],
+		['D', 'Fine-tune'],
 		['?', 'This list']
 	];
 

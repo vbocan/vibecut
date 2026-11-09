@@ -9,7 +9,7 @@
   timeline (the draft badge gone);
 - a tweak renders a draft again; Download on it finishes it in full
   quality first, then downloads the final;
-- Pro settings has the "Fast previews" switch, on by default.
+- the top bar has the "Fast previews" switch, on by default.
 
     python test/draft_journey.py --url http://localhost:8090
 
@@ -201,8 +201,7 @@ def main() -> int:
         v = wait_video(page, lambda v: not is_draft(v["src"]), 30)
         check(v is not None and not is_draft(v["src"]) and (v["w"], v["h"]) == (1920, 1080), "…which is what the Studio shows")
 
-        print("Pro settings: Fast previews")
-        page.keyboard.press("d")
+        print("Top bar: Fast previews")
         sw = page.get_by_role("switch", name="Fast previews")
         check(sw.count() == 1 and sw.is_checked(), "a Fast previews switch, on by default")
         sw.click()

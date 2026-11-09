@@ -212,6 +212,31 @@ export function writeConfig(configPath: string, configToml: string): Promise<Con
 
 export type { Config };
 
+/** One setting change by dotted key; `value: null` removes the key. */
+export interface ConfigChange {
+	key: string;
+	value: unknown;
+}
+
+/** `POST /config/patch`: change settings in place, keeping comments and order. */
+export function patchConfig(configPath: string, changes: ConfigChange[]): Promise<ConfigText> {
+	return sendJson('/config/patch', { config_path: configPath, changes });
+}
+
+/** A project's vibe defaults and what it changed from them. */
+export interface VibeDefaults {
+	vibe: string;
+	vibe_name: string;
+	defaults: Record<string, unknown>;
+	changes: { key: string; value: unknown; default: unknown }[];
+}
+
+export function configDefaults(configPath: string, vibe?: string | null): Promise<VibeDefaults> {
+	const q = new URLSearchParams({ config_path: configPath });
+	if (vibe) q.set('vibe', vibe);
+	return getJson(`/config/defaults?${q}`);
+}
+
 export function readConfigStructured(configPath: string): Promise<Config> {
 	return getJson(`/config/structured?config_path=${encodeURIComponent(configPath)}`);
 }

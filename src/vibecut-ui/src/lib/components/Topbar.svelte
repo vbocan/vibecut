@@ -56,6 +56,18 @@
 				<span class="spark" aria-hidden="true"></span> AI on
 			</span>
 		{/if}
+		<button
+			class="watch-switch"
+			class:on={s.fastPreviews}
+			type="button"
+			role="switch"
+			aria-checked={s.fastPreviews}
+			title="First cuts and tweaks render a quick 540p draft in seconds; “Finish in full quality”, Download and Share render the final."
+			onclick={() => s.setFastPreviews(!s.fastPreviews)}
+		>
+			<span class="track" aria-hidden="true"><span class="knob"></span></span>
+			Fast previews
+		</button>
 		{#if hasProject}
 			<button class="btn ghost" type="button" aria-haspopup="dialog" onclick={onOpenPro}>
 				<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
@@ -64,7 +76,7 @@
 						d="M4 7h10v2H4V7zm12 0h4v2h-4V7zM4 15h4v2H4v-2zm6 0h10v2H10v-2zM14 5h2v6h-2V5zM8 13h2v6H8v-6z"
 					/></svg
 				>
-				Pro settings
+				Fine-tune
 			</button>
 			{#if !rendering}<button class="btn" type="button" onclick={onNew}>New video</button>{/if}
 		{/if}

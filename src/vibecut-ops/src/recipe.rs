@@ -1211,6 +1211,57 @@ pub fn recipe_from_config(cfg: &Config, vibe: Option<&str>, music: Music) -> Res
     Ok(best.expect("at least one vibe").1)
 }
 
+/// One setting a project changed from its vibe: dotted key (as
+/// [`path_string`] writes it), the project's value, and the vibe's
+/// (`null`: the vibe doesn't set it).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangedSetting {
+    pub key: String,
+    pub value: Value,
+    pub default: Value,
+}
+
+/// A project's vibe and how the project differs from it: what the
+/// Fine-tune page shows as defaults, "Changes from <vibe>" and Reset.
+#[derive(Debug, Clone, Serialize)]
+pub struct VibeDefaults {
+    pub vibe: String,
+    pub vibe_name: String,
+    /// The vibe's style, in the shape of the config's own sections.
+    pub defaults: Value,
+    pub changes: Vec<ChangedSetting>,
+}
+
+/// The value at `path` in `v`, if there is one.
+fn value_at<'a>(v: &'a Value, path: &[Seg]) -> Option<&'a Value> {
+    path.iter().try_fold(v, |v, seg| match seg {
+        Seg::Key(k) => v.get(k),
+        Seg::Index(i) => v.get(*i),
+    })
+}
+
+/// [`VibeDefaults`] for `cfg`. `vibe`: the one it was made from, when
+/// known; otherwise the closest (as for a style code).
+pub fn vibe_defaults(cfg: &Config, vibe: Option<&str>) -> Result<VibeDefaults, OpsError> {
+    let recipe = recipe_from_config(cfg, vibe, Music::Auto)?;
+    let with_music = cfg.soundtrack.is_some();
+    let defaults = frozen_baseline(&recipe.vibe, with_music)?;
+    let style = style_of(cfg)?;
+    let changes = diff_styles(&defaults, &style)
+        .into_iter()
+        .filter(|s| !matches!(s.op, Op::Count(_)))
+        .map(|s| {
+            ChangedSetting {
+                key: path_string(&s.path),
+                value: value_at(&style, &s.path).cloned().unwrap_or(Value::Null),
+                default: value_at(&defaults, &s.path).cloned().unwrap_or(Value::Null),
+            }
+        })
+        .collect();
+    let vibe_name = propose::get_vibe(&recipe.vibe).map(|v| v.name.to_string()).unwrap_or_else(|_| recipe.vibe.clone());
+    Ok(VibeDefaults { vibe: recipe.vibe, vibe_name, defaults, changes })
+}
+
 /// Where a recipe is applied.
 #[derive(Debug, Clone, Copy)]
 pub struct Destination<'a> {

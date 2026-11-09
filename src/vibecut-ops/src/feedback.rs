@@ -902,7 +902,8 @@ async fn apply_feedback_to_file_in(
     cfg.validate()
         .map_err(|e| OpsError::invalid(format!("mutation produced invalid config: {e:#}")))?;
 
-    let new_toml = toml::to_string_pretty(&cfg)
+    let new_toml = cfg
+        .to_toml_pretty()
         .map_err(|e| OpsError::internal(format!("could not serialise mutated config: {e}")))?;
     std::fs::write(&cfg_path, &new_toml)
         .map_err(|e| OpsError::internal(format!("could not write {}: {e}", cfg_path.display())))?;
