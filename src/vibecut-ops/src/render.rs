@@ -241,7 +241,7 @@ impl RenderStop {
         if token.is_cancelled() || vibecut::cancel::is_cancelled(e) {
             RenderStop::Cancelled
         } else {
-            RenderStop::Failed(format!("{e:#}"))
+            RenderStop::Failed(crate::error::without_source_text(&format!("{e:#}")))
         }
     }
 }

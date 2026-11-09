@@ -164,7 +164,7 @@ pub async fn plan(config_path: &str) -> Result<serde_json::Value, OpsError> {
             })
             .await
             .map_err(|e| OpsError::internal(format!("plan task panicked: {e}")))?
-            .map_err(|e| OpsError::invalid(format!("{e:#}")))?;
+            .map_err(|e| OpsError::invalid(crate::error::without_source_text(&format!("{e:#}"))))?;
             let plan = serde_json::to_value(&summary)
                 .map_err(|e| OpsError::internal(format!("serializing the plan: {e}")))?;
             // Later requests for the same text reuse it — unless a render

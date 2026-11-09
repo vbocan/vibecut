@@ -827,7 +827,9 @@ pub async fn apply_feedback_to_file(
         .map_err(|_| OpsError::invalid(format!("non-UTF-8 config path: {}", cfg_path.display())))?;
 
     let mut cfg = Config::load(&cfg_camino)
-        .map_err(|e| OpsError::internal(format!("could not load config: {e:#}")))?;
+        .map_err(|e| {
+            OpsError::internal(crate::error::without_source_text(&format!("could not load config: {e:#}")))
+        })?;
 
     // An action that refused its input with an `OpsError` (a soundtrack
     // outside the library is invalid, a missing one not found) keeps that

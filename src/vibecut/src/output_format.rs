@@ -1179,12 +1179,20 @@ fn reformat_video_with(
         std::fs::create_dir_all(parent).ok();
     }
     const ATTEMPTS: usize = 2;
+    // Progress never goes back: a second attempt (the input changed under
+    // the first) runs over what is left of the bar.
+    let mut shown = 0.0_f32;
     for attempt in 1..=ATTEMPTS {
         let started_from = file_identity(input)?;
         let src = probe_source(input)?;
         let plan = plan_reformat(&src, opts);
         let staged = crate::staging::StagedOutputs::new([output]);
-        let outcome = write_reformat(input, staged.path(0), &src, plan, opts, on_progress)?;
+        let base = shown;
+        let mut report = |f: f32| {
+            shown = shown.max(base + (1.0 - base) * f.clamp(0.0, 1.0));
+            on_progress(shown);
+        };
+        let outcome = write_reformat(input, staged.path(0), &src, plan, opts, &mut report)?;
         before_commit();
         // Last chance to stop: past this point the version replaces the old one.
         crate::cancel::check()?;
@@ -2102,7 +2110,8 @@ mod reformat_job_tests {
         let (d2, next_render) = render_clip("replaced_next", 2);
         let target = d.join("coast.whatsapp.mp4");
         let mut passes = 0;
-        reformat_video_with(&clip, &target, &opts(OutputPreset::Whatsapp), &mut |_| {}, &mut || {
+        let mut progress: Vec<f32> = Vec::new();
+        reformat_video_with(&clip, &target, &opts(OutputPreset::Whatsapp), &mut |f| progress.push(f), &mut || {
             passes += 1;
             if passes == 1 {
                 // The render commits its new cut by rename, mid-pass.
@@ -2112,6 +2121,9 @@ mod reformat_job_tests {
         })
         .expect("reformat");
         assert_eq!(passes, 2, "the pass over the old cut was committed");
+        // The second pass carries on from where the bar was, never back to 0.
+        assert!(progress.windows(2).all(|w| w[1] >= w[0]), "progress went back: {progress:?}");
+        assert!(progress.last().is_some_and(|&f| f <= 1.0), "{progress:?}");
         let made = probe_source(&target).unwrap();
         assert!((made.duration_secs - 2.0).abs() < 0.2, "the version shows the old cut ({} s)", made.duration_secs);
         assert!(staged_files(&target).is_empty());

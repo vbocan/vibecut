@@ -8,6 +8,19 @@
 
 use std::fmt;
 
+/// An error message without the source text a parse error quotes. A
+/// TOML parse error shows the offending line in a `N | …` gutter; over
+/// the API that would hand back a line of whatever file a path named,
+/// so the gutter lines go and the position and reason stay.
+pub fn without_source_text(msg: &str) -> String {
+    let gutter = |l: &str| {
+        let t = l.trim_start().trim_start_matches(|c: char| c.is_ascii_digit()).trim_start();
+        t.starts_with('|')
+    };
+    let kept: Vec<&str> = msg.lines().filter(|l| !gutter(l)).collect();
+    kept.join("\n")
+}
+
 #[derive(Debug)]
 pub enum OpsError {
     /// The caller pointed at something that doesn't exist: a footage
@@ -86,3 +99,22 @@ impl fmt::Display for OpsError {
 }
 
 impl std::error::Error for OpsError {}
+
+#[cfg(test)]
+mod source_text_tests {
+    use super::without_source_text;
+
+    /// A TOML parse error of a file that isn't a config (a path to any
+    /// file) says where and why, never what the file says.
+    #[test]
+    fn toml_parse_errors_lose_the_quoted_line() {
+        let secret = "root:x:0:0:secret-line";
+        let e = toml::from_str::<vibecut::project_config::Config>(secret).unwrap_err();
+        let full = format!("failed to parse TOML: {e}");
+        assert!(full.contains("secret-line"), "toml stopped quoting the line; {full}");
+        let msg = without_source_text(&full);
+        assert!(!msg.contains("secret-line") && !msg.contains("root:x"), "{msg}");
+        assert!(msg.contains("line 1"), "{msg}");
+        assert_eq!(without_source_text("plain error\nsecond line"), "plain error\nsecond line");
+    }
+}
