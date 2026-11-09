@@ -4,6 +4,7 @@
 pub mod brief;
 pub mod config;
 pub mod discover;
+pub mod export;
 pub mod feedback;
 pub mod frames;
 pub mod jobs;
@@ -49,6 +50,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/frames/output", get(frames::inspect_output))
         .route("/frames/at", get(frames::inspect_at))
         .route("/output", get(output::serve_output))
+        .route("/export", get(export::export_timeline))
         .route("/reformat", post(reformat::reformat))
         .route("/music", get(music::list_music))
         .route("/music/file", get(music::serve_music_file))

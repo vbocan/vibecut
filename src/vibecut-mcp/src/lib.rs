@@ -139,6 +139,19 @@ pub struct ReformatArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExportTimelineArgs {
+    /// Path to a rendered mp4 (the `output_path` of a `render`), one of
+    /// its platform versions, or its `.manifest.json`.
+    pub output_path: String,
+    /// `fcpxml` (Final Cut Pro, DaVinci Resolve) or `otio` (OpenTimelineIO).
+    pub format: String,
+    /// Sequence frame rate, e.g. `29.97`, `25`, `30000/1001`. Default: the
+    /// render's own.
+    #[serde(default)]
+    pub fps: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ApplyFeedbackArgs {
     /// Path to the TOML config to mutate (typically the
     /// `config_path` returned by the most recent `propose_vibe` or
@@ -401,6 +414,26 @@ impl VibecutMcpServer {
                 Err(e) => ops_error_to_string_result(e),
             };
         self.log_string_call("reformat", args_json, &result, started);
+        result
+    }
+
+    /// The edit as a timeline file for another editor, written next to
+    /// the render.
+    #[tool(description = "Export a finished render's edit as a timeline another editor opens, to finish it there: format fcpxml (Final Cut Pro, DaVinci Resolve) or otio (OpenTimelineIO). The timeline references the original footage frame-exactly, with cross dissolves, speed ramps, title cards as gaps, the music on its own lane and beat markers. Writes <stem>.fcpxml / <stem>.otio next to the render and returns its path and a summary.")]
+    async fn export_timeline(&self, Parameters(args): Parameters<ExportTimelineArgs>) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result = match vibecut_ops::timeline_export::export_timeline_to_file(
+            &args.output_path,
+            &args.format,
+            args.fps.as_deref(),
+        )
+        .await
+        {
+            Ok(body) => Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())),
+            Err(e) => ops_error_to_string_result(e),
+        };
+        self.log_string_call("export_timeline", args_json, &result, started);
         result
     }
 

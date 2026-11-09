@@ -6,6 +6,7 @@
 import type { FeedbackAction } from './types/generated/FeedbackAction';
 import type { ChangeNote } from './types/generated/ChangeNote';
 import type { Config } from './types/generated/Config';
+import { fileNameFromDisposition } from './download';
 
 const BASE = '/api';
 
@@ -358,6 +359,28 @@ export function outputFileUrl(path: string): string {
 export function inspectAt(videoPath: string, times: number[]): Promise<FrameSummary> {
 	const t = times.map((x) => x.toFixed(2)).join(',');
 	return getJson(`/frames/at?output_path=${encodeURIComponent(videoPath)}&t=${t}`);
+}
+
+// ---------- timeline export (open in an editor) ----------
+
+/** `fcpxml`: Final Cut Pro and DaVinci Resolve; `otio`: OpenTimelineIO. */
+export type TimelineFormat = 'fcpxml' | 'otio';
+
+/** `GET /export` for a render (or one of its versions). */
+export function timelineExportUrl(path: string, format: TimelineFormat, fps?: string): string {
+	const rate = fps ? `&fps=${encodeURIComponent(fps)}` : '';
+	return `${BASE}/export?output_path=${encodeURIComponent(path)}&format=${format}${rate}`;
+}
+
+/** The render's timeline as a file, with the name the server gives it. */
+export async function exportTimeline(
+	path: string,
+	format: TimelineFormat
+): Promise<{ blob: Blob; fileName: string }> {
+	const res = await fetch(timelineExportUrl(path, format));
+	if (!res.ok) throw await toApiError(res);
+	const fileName = fileNameFromDisposition(res.headers.get('content-disposition'), `timeline.${format}`);
+	return { blob: await res.blob(), fileName };
 }
 
 // ---------- reformat (platform versions) ----------

@@ -1971,6 +1971,22 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
         _ => None,
     };
 
+    // What a timeline export (OTIO / FCPXML) needs beyond the clips: where
+    // the music plays, exactly as the mux laid it, and the titles' text.
+    let mut timeline = timeline;
+    timeline.music = match (&audio, &cfg.soundtrack, soundtrack_layout) {
+        (Some(a), Some(snd), Some((plan, body_secs))) => Some(crate::output_timeline::TimelineMusic::from_loop_plan(
+            &plan,
+            body_secs,
+            a.duration_secs,
+            &a.beats,
+            crate::output_timeline::music_files(&snd.files, a.duration_secs),
+            snd.fade_out.as_secs_f64(),
+        )),
+        _ => None,
+    };
+    timeline.titles = crate::output_timeline::timeline_titles(cfg.intro.as_ref(), cfg.outro.as_ref(), &card_windows);
+
     // 8. Manifest.
     let manifest_path = manifest_path_for(primary_output);
     let manifest = Manifest {

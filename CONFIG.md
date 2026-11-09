@@ -246,6 +246,74 @@ the Renders list), stopped the same way (`POST /api/jobs/{id}/cancel`,
 which keeps the last good version); asking again for a version that is
 still being made joins that job instead of starting a second pass.
 
+### Open in another editor (timeline export)
+
+A finished render can also leave as an *edit*: a timeline of the original
+clips to finish, grade or re-time in Final Cut Pro, DaVinci Resolve or any
+OpenTimelineIO tool. The web UI's Share sheet has **Open in an editor**
+(Final Cut / Resolve → `.fcpxml`, OpenTimelineIO → `.otio`) for the
+version on screen. Behind it:
+
+```text
+GET /api/export?output_path=out/coastline.mp4&format=fcpxml   (or otio)
+                [&fps=29.97]
+```
+
+`output_path` is a render (`output_path` or `version_path`), one of its
+platform versions or its manifest, under `/projects`. The answer is a
+download (`Content-Disposition: attachment`, named after the video:
+`coastline.fcpxml`); 400 for a path outside `/projects`, an unknown
+`format` or `fps`, or a render without a `timeline`; 404 when there is no
+manifest. The MCP `export_timeline` tool (`output_path`, `format`, `fps`)
+writes the file next to the render's manifest instead and returns its path.
+
+It is built from the manifest's `timeline`, so it is the cut you watched:
+
+- **Frame-exact.** The sequence runs at the render's `fps` (`fps=29.97`,
+  `25` or `30000/1001` picks another; NTSC rates are exact fractions, so
+  FCPXML times read `17017/30000s`). Cards and clips run cut to cut and add
+  up to the sequence length exactly. Source times sit on the source's own
+  frames (probed with ffprobe, so 29.97 GoPro footage stays on its 29.97
+  grid) after its timecode; music times on its samples.
+- **Cuts and dissolves.** The render cuts mid-crossfade, often half-way
+  through a frame; the export puts each cut on whichever of the two frames
+  either side is nearer the beat, and centres an SMPTE / Cross Dissolve on
+  it inside the frames the render blended (so no dissolve needs media the
+  render didn't read). Beat-burst cuts stay hard cuts.
+- **Speed ramps** become the clip at normal speed plus its sped-up tail
+  (FCPXML: a constant-speed `timeMap`; OTIO: `LinearTimeWarp`).
+- **Title cards** become gaps named after the card's text, with a marker
+  carrying it (title generators differ per editor; a gap imports
+  everywhere). Overlay titles become range markers.
+- **Music** follows the layout the mux used: loop copies (crossfaded in
+  OTIO, spliced at the crossfade's middle in FCPXML), and several joined
+  `files` split back into their own files. OTIO puts it on a `Music` audio
+  track; FCPXML connects it below the storyline on lane −1 (role `music`).
+  Every beat is a marker on the music; the duck windows are range markers
+  ("Clip sound up"), and in FCPXML only the ducked moments keep their
+  camera sound (the rest at −96 dB, as in the render). The fade-out is a
+  marker too.
+- **Not carried over:** the card design (colour, fonts), LUT and
+  stabilisation, the speed-ramp flash, the project fade in/out and the
+  ducking levels — the editor's own tools do those.
+
+FCPXML is version 1.10 (Final Cut Pro 10.6 or later; DaVinci Resolve imports it too): one
+`asset` per file with a percent-encoded `file://` `media-rep`, a `format`
+per frame size and rate. OTIO uses the schema versions every OTIO reader
+accepts (`Timeline.1`, `Track.1`, `Clip.1` with an `ExternalReference.1`,
+`Gap.1`, `Transition.1`, `Marker.1`); cuts are red markers on the video
+track, beats green and duck windows cyan on the music track.
+
+**Paths.** Clips point at the files the render read. In Docker those are
+container paths (`/footage/…`, `/projects/music/…`): set
+`VIBECUT_HOST_FOOTAGE` and `VIBECUT_HOST_PROJECTS` to the absolute host
+folders mounted there (`compose.yml` passes `VIBECUT_FOOTAGE` /
+`VIBECUT_PROJECTS` through) and the export points at the host files;
+otherwise relink in the editor. A manifest from before the music layout was
+recorded exports with the music from the start of the track (the summary
+notes it); one from before the `timeline` existed can't be exported —
+render it again.
+
 ---
 
 ## `[soundtrack]` (optional)
@@ -944,4 +1012,10 @@ or building tooling on top of it:
   its output start/end frame and seconds, the visible cut in and out
   (mid-crossfade), the source file and window read, the speed-ramp tail,
   and the crossfade in and out. Ducking, the beat-sync check and the
-  "drop this moment" feedback all read the same layout.
+  "drop this moment" feedback all read the same layout. With a soundtrack
+  the timeline also holds `music` — the files (several play as one joined
+  track), one span per copy of the track as the mux laid it (output start
+  and end, track time), the loop crossfade, the fade-out and every beat in
+  output time — and with titles, `titles` (each card's text and span,
+  card or overlay): what the [timeline export](#open-in-another-editor-timeline-export)
+  needs to rebuild the edit elsewhere.

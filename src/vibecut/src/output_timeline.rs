@@ -199,6 +199,16 @@ pub struct OutputTimeline {
     /// Every clip in output order. A folded beat-burst contributes one entry
     /// per burst cut, all with the burst's `segment_index`.
     pub clips: Vec<TimelineClip>,
+    /// Where the soundtrack plays: the loop layout the mux used and the
+    /// beats as they fall in the output. Absent without music (and in
+    /// manifests written before it existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub music: Option<TimelineMusic>,
+    /// The intro/outro titles' text and where they show. Empty without
+    /// titles (and in manifests written before it existed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub titles: Vec<TimelineTitle>,
 }
 
 /// An intro or outro card's place in the output.
@@ -266,6 +276,157 @@ pub struct TimelineRamp {
     pub factor: f32,
 }
 
+/// The soundtrack as the mux laid it under the picture — what a timeline
+/// export needs to rebuild the music track in another editor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct TimelineMusic {
+    /// The soundtrack files in play order. Several files play as one
+    /// track, joined end to end; `spans` are in that joined track's time.
+    pub files: Vec<TimelineMusicFile>,
+    /// One entry per copy of the track you hear, in output order: output
+    /// time `t` in `[output_start_secs, output_end_secs)` plays track time
+    /// `source_start_secs + (t − output_start_secs)`.
+    pub spans: Vec<TimelineMusicSpan>,
+    /// Crossfade between consecutive copies (the smart loop's seam),
+    /// centred on the boundary between their spans; 0 = straight splice.
+    pub crossfade_secs: f64,
+    /// The soundtrack's fade-out at the very end.
+    pub fade_out_secs: f64,
+    /// The track's beats as they play in the output.
+    pub beats_secs: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct TimelineMusicFile {
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+    pub path: Utf8PathBuf,
+    pub duration_secs: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct TimelineMusicSpan {
+    pub output_start_secs: f64,
+    pub output_end_secs: f64,
+    pub source_start_secs: f64,
+}
+
+/// An intro or outro title: its text and where it shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct TimelineTitle {
+    /// `intro` or `outro`.
+    pub role: String,
+    /// Drawn over the footage (`mode = "overlay"`) rather than on its own card.
+    pub overlay: bool,
+    pub output_start_secs: f64,
+    pub output_end_secs: f64,
+    /// The card's text layers in declaration order (image layers left out).
+    pub lines: Vec<String>,
+}
+
+/// To the microsecond: the loop plan is f32, whose noise (0.3 →
+/// 0.30000001192…) would otherwise leak into the manifest.
+fn micros(x: f32) -> f64 {
+    (x as f64 * 1e6).round() / 1e6
+}
+
+impl TimelineMusic {
+    /// The layout `mux_with_ducking` used: `plan` laid under `body_secs` of
+    /// picture, for a track of `track_secs` whose beats (track time) are
+    /// `beats`.
+    pub fn from_loop_plan(
+        plan: &crate::video_renderer::SoundtrackLoopPlan,
+        body_secs: f32,
+        track_secs: f32,
+        beats: &[f32],
+        files: Vec<TimelineMusicFile>,
+        fade_out_secs: f64,
+    ) -> Self {
+        let spans = plan.spans(body_secs, track_secs);
+        let smart = plan.loop_secs > 0.0 && plan.first_play_end_secs > 0.0;
+        TimelineMusic {
+            files,
+            spans: spans
+                .iter()
+                .map(|s| TimelineMusicSpan {
+                    output_start_secs: micros(s.output_start),
+                    output_end_secs: micros(s.output_end),
+                    source_start_secs: micros(s.source_start),
+                })
+                .collect(),
+            crossfade_secs: if smart && spans.len() > 1 { micros(plan.crossfade_secs()) } else { 0.0 },
+            fade_out_secs,
+            beats_secs: crate::beat_sync::beats_in_output(beats, &spans).into_iter().map(micros).collect(),
+        }
+    }
+}
+
+/// The soundtrack files with their lengths. One file is the analysed
+/// track itself (`track_secs`); several are probed one by one.
+pub fn music_files(files: &[Utf8PathBuf], track_secs: f32) -> Vec<TimelineMusicFile> {
+    if let [only] = files {
+        return vec![TimelineMusicFile { path: only.clone(), duration_secs: micros(track_secs) }];
+    }
+    files
+        .iter()
+        .map(|f| TimelineMusicFile {
+            path: f.clone(),
+            duration_secs: crate::media_probe::probe_metadata(f)
+                .ok()
+                .and_then(|p| p.media)
+                .map_or(0.0, |m| m.duration_secs),
+        })
+        .collect()
+}
+
+/// The titles of `intro` / `outro` placed on the output's title spans
+/// (`card_windows`: the intro's first, then the outro's, as
+/// `output_format::card_windows` builds them).
+pub fn timeline_titles(
+    intro: Option<&crate::project_config::TextCard>,
+    outro: Option<&crate::project_config::TextCard>,
+    card_windows: &[[f64; 2]],
+) -> Vec<TimelineTitle> {
+    use crate::project_config::{CardLayer, CardMode};
+    let (intro_w, outro_w) = match (intro.is_some(), outro.is_some(), card_windows) {
+        (true, true, [a, b, ..]) => (Some(*a), Some(*b)),
+        (true, true, [w]) if w[0] <= 0.0 => (Some(*w), None),
+        (true, true, [w]) => (None, Some(*w)),
+        (true, false, [w, ..]) => (Some(*w), None),
+        (false, true, [.., w]) => (None, Some(*w)),
+        _ => (None, None),
+    };
+    let title = |role: &str, card: &crate::project_config::TextCard, w: [f64; 2]| TimelineTitle {
+        role: role.into(),
+        overlay: matches!(card.mode, CardMode::Overlay),
+        output_start_secs: w[0],
+        output_end_secs: w[1],
+        lines: card
+            .layers
+            .iter()
+            .filter_map(|l| match l {
+                CardLayer::Text(t) => Some(t.content.trim().to_string()).filter(|s| !s.is_empty()),
+                CardLayer::Image(_) => None,
+            })
+            .collect(),
+    };
+    let mut out = Vec::new();
+    if let (Some(card), Some(w)) = (intro, intro_w) {
+        out.push(title("intro", card, w));
+    }
+    if let (Some(card), Some(w)) = (outro, outro_w) {
+        out.push(title("outro", card, w));
+    }
+    out
+}
+
 /// What a clip reads, for [`OutputTimeline::build`].
 #[derive(Debug, Clone)]
 pub struct ClipSource {
@@ -308,6 +469,8 @@ impl OutputTimeline {
             intro: None,
             outro: None,
             clips: Vec::new(),
+            music: None,
+            titles: Vec::new(),
         };
         let card = |k: usize, cut_secs: f64, transition_secs: f64| TimelineCard {
             start_frame: layout.start_frames[k],
@@ -684,5 +847,96 @@ mod tests {
         // No intro card (overlay mode): the footage starts at 0.
         let p = predict_layout(None, &[2.0, 2.0], None, 0.4, true, 30);
         assert!(approx(p.body_start, 0.0) && approx(p.clip_spans[1].0, 2.0));
+    }
+
+    #[test]
+    fn music_layout_records_loop_copies_and_output_beats() {
+        use crate::video_renderer::SoundtrackLoopPlan;
+        // Smart loop: intro once to 20 s, then the loud 10–20 s region
+        // again, crossfaded over a whole number of beats (0.5 s beats).
+        let plan = SoundtrackLoopPlan {
+            first_play_end_secs: 20.0,
+            loop_start_secs: 10.0,
+            loop_secs: 10.0,
+            beat_interval_secs: 0.5,
+        };
+        let beats: Vec<f32> = (0..50).map(|i| i as f32 * 0.5).collect();
+        let files = music_files(&["/m/song.mp3".into()], 25.0);
+        assert_eq!(files[0].duration_secs, 25.0);
+        let m = TimelineMusic::from_loop_plan(&plan, 30.0, 25.0, &beats, files, 1.5);
+        assert!(m.spans.len() >= 2, "{m:?}");
+        let x = m.crossfade_secs;
+        assert!(x > 0.0 && (x / 0.5 - (x / 0.5).round()).abs() < 1e-6, "whole beats: {x}");
+        // Copy 2 starts x before the intro ends; the span boundary is the
+        // crossfade's middle, and it plays the loop from that point.
+        let s1 = m.spans[1];
+        assert!(approx(s1.output_start_secs, 20.0 - x * 0.5), "{s1:?}");
+        assert!(approx(s1.source_start_secs, 10.0 + x * 0.5), "{s1:?}");
+        assert!(approx(m.spans.last().unwrap().output_end_secs, 30.0));
+        for w in m.spans.windows(2) {
+            assert!(approx(w[0].output_end_secs, w[1].output_start_secs));
+        }
+        // Beats in output time, in order, every half second inside a copy.
+        assert!(m.beats_secs.windows(2).all(|w| w[0] < w[1]));
+        assert!(m.beats_secs.iter().all(|&b| (0.0..30.0).contains(&b)));
+        assert!(approx(m.beats_secs[1], 0.5));
+
+        // A track longer than the picture: one copy, no crossfade.
+        let plain = SoundtrackLoopPlan { first_play_end_secs: 0.0, loop_start_secs: 0.0, loop_secs: 60.0, beat_interval_secs: 0.5 };
+        let m = TimelineMusic::from_loop_plan(&plain, 30.0, 60.0, &beats, vec![], 0.0);
+        assert_eq!(m.spans.len(), 1);
+        assert_eq!(m.crossfade_secs, 0.0);
+        assert!(approx(m.spans[0].output_end_secs, 30.0) && approx(m.spans[0].source_start_secs, 0.0));
+    }
+
+    #[test]
+    fn titles_take_the_card_text_and_window() {
+        use crate::project_config::{CardLayer, CardMode, TextCard};
+        let card = |mode: CardMode, text: &[&str]| -> TextCard {
+            let layers: Vec<CardLayer> = text
+                .iter()
+                .map(|t| serde_json::from_value(serde_json::json!({ "kind": "text", "content": t })).unwrap())
+                .collect();
+            TextCard {
+                duration: std::time::Duration::from_secs(3),
+                fade_in: std::time::Duration::ZERO,
+                fade_out: std::time::Duration::ZERO,
+                mode,
+                bg_color: "#000000".into(),
+                layers,
+            }
+        };
+        let intro = card(CardMode::Card, &["Coast & <Sea>", "  ", "2026"]);
+        let outro = card(CardMode::Overlay, &["The end"]);
+        let t = timeline_titles(Some(&intro), Some(&outro), &[[0.0, 2.8], [27.0, 30.0]]);
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[0].role.as_str(), t[0].overlay), ("intro", false));
+        assert_eq!(t[0].lines, vec!["Coast & <Sea>".to_string(), "2026".to_string()]);
+        assert_eq!((t[1].role.as_str(), t[1].overlay, t[1].output_start_secs), ("outro", true, 27.0));
+        // Only an outro: its window is the last one.
+        let t = timeline_titles(None, Some(&outro), &[[27.0, 30.0]]);
+        assert_eq!((t.len(), t[0].role.as_str()), (1, "outro"));
+        assert!(timeline_titles(None, None, &[]).is_empty());
+    }
+
+    #[test]
+    fn music_and_titles_are_optional_in_the_manifest() {
+        let layout = ChainLayout::new(&[2.0, 2.0], &[0.0], 30);
+        let t = OutputTimeline::build(&layout, &[ChainItem::Clip(src(0, 2.0)), ChainItem::Clip(src(1, 2.0))]);
+        let v = serde_json::to_value(&t).unwrap();
+        assert!(v.get("music").is_none() && v.get("titles").is_none(), "{v}");
+        // Timelines written before the fields existed still load.
+        let back: OutputTimeline = serde_json::from_value(v).unwrap();
+        assert!(back.music.is_none() && back.titles.is_empty());
+    }
+
+    /// The pipeline has no unit-test harness, so guard the lines that fill
+    /// the export fields: a merge that drops them would leave this green.
+    #[test]
+    fn pipeline_records_music_and_titles_in_the_timeline() {
+        let src = include_str!("run_pipeline.rs");
+        let before_manifest = &src[..src.find("let manifest = Manifest {").expect("pipeline builds a Manifest")];
+        assert!(before_manifest.contains("timeline.music = "), "run_pipeline must record the music layout");
+        assert!(before_manifest.contains("timeline.titles = "), "run_pipeline must record the titles");
     }
 }
