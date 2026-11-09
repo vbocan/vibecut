@@ -123,6 +123,17 @@ pub struct InspectAtArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReformatArgs {
+    /// Path to a rendered mp4 (the `output_path` of a `render`).
+    pub output_path: String,
+    /// `youtube`, `reels`, `tiktok`, `shorts`, `square` or `whatsapp`.
+    pub preset: String,
+    /// `blur` (default), `crop` or `pad`.
+    #[serde(default)]
+    pub fit: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ApplyFeedbackArgs {
     /// Path to the TOML config to mutate (typically the
     /// `config_path` returned by the most recent `propose_vibe` or
@@ -367,6 +378,21 @@ impl VibecutMcpServer {
             .await
             .map_err(ops_error_to_error_data)?;
         Ok(rmcp::model::CallToolResult::success(build_frame_content(result)))
+    }
+
+    /// A platform version of a finished render (vertical Reel, square,
+    /// WhatsApp) in one fast ffmpeg pass — no re-render.
+    #[tool(description = "Make a platform version of a finished render in one fast pass (seconds, no re-render): preset youtube (16:9 1920x1080), reels / tiktok / shorts (9:16 1080x1920), square (1080x1080) or whatsapp (9:16 720x1280, size-capped). A different aspect gets a blurred fill of the same frame behind it (fit: blur, default), a centre crop (crop) or black bars (pad). Writes <stem>.<preset>.mp4 next to the render and returns its path.")]
+    async fn reformat(&self, Parameters(args): Parameters<ReformatArgs>) -> Result<String, ErrorData> {
+        let started = std::time::Instant::now();
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        let result =
+            match vibecut_ops::reformat::reformat_sync(&args.output_path, &args.preset, args.fit.as_deref()).await {
+                Ok(body) => Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())),
+                Err(e) => ops_error_to_string_result(e),
+            };
+        self.log_string_call("reformat", args_json, &result, started);
+        result
     }
 
     /// Mutate a TOML config in response to user feedback, then save it

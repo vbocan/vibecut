@@ -113,7 +113,7 @@
 	}
 
 	/** Shared by every optional-string field below (image timestamp,
-	 *  output preset): empty input means "unset", not "set to empty
+	 *  output encoder preset and audio bitrate): empty input means "unset", not "set to empty
 	 *  string" — the two are different values to a Rust `Option<T>`. */
 	function optionalString(value: string): string | null {
 		return value.trim() === '' ? null : value;
@@ -158,14 +158,60 @@
 		if (!outs) return;
 		const last = outs[outs.length - 1];
 		const path = last ? last.path.replace(/(\.[a-zA-Z0-9]+)?$/, `_${outs.length + 1}$1`) : `out/output_${outs.length + 1}.mp4`;
-		outs.push({
-			path,
-			resolution: last?.resolution ?? '1920x1080',
-			encoder: last?.encoder ?? 'auto',
-			crf: last?.crf ?? 20,
-			preset: null,
-			audio_bitrate: last?.audio_bitrate ?? '192k'
-		});
+		// A clone copies every key as it is, unset ones included: a platform
+		// row leaves resolution / crf / audio unset so its preset decides
+		// them, and an explicit default there would beat the preset.
+		outs.push(
+			last
+				? { ...$state.snapshot(last), path }
+				: { path, resolution: '1920x1080', encoder: 'auto', crf: 20, preset: null, audio_bitrate: '192k' }
+		);
+	}
+
+	type OutputRow = NonNullable<typeof s.configStructured>['outputs'][number];
+	// Encoder preset names `preset` held before it named platforms; the
+	// engine still reads one there as the encoder preset
+	// (output_format::is_encoder_preset_name).
+	const LEGACY_ENCODER_PRESETS = new Set([
+		'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow', 'placebo',
+		'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'default', 'hp', 'hq', 'bd', 'll', 'llhq', 'llhp', 'lossless',
+		'losslesshp', 'speed', 'balanced', 'quality'
+	]);
+	/** The encoder preset an older config keeps in `preset`, if any. */
+	function legacyEncoderPreset(out: OutputRow): string | null {
+		const p = out.preset?.trim().toLowerCase();
+		return p && LEGACY_ENCODER_PRESETS.has(p) ? p : null;
+	}
+	/** The Platform option a row's `preset` reads as: the engine treats
+	 *  tiktok / shorts as reels, `master` (and a legacy encoder preset) as
+	 *  the master. */
+	function platformValue(out: OutputRow): string {
+		const p = out.preset?.trim().toLowerCase() ?? '';
+		if (p === 'tiktok' || p === 'shorts') return 'reels';
+		if (p === 'master' || legacyEncoderPreset(out)) return '';
+		return p;
+	}
+	/** Edit the encoder preset; a legacy one in `preset` moves out of the way. */
+	function setEncoderPreset(out: OutputRow, value: string) {
+		if (legacyEncoderPreset(out)) out.preset = null;
+		out.encoder_preset = optionalString(value) ?? undefined;
+	}
+	/** Pick a platform preset (`''` = the master). A platform decides its
+	 *  own size, quality and audio unless a key is set explicitly, so
+	 *  choosing one clears those keys; back on the master, an output needs
+	 *  a resolution again. A legacy encoder preset in `preset` moves to
+	 *  `encoder_preset` first, so it isn't lost. */
+	function setPlatform(out: OutputRow, value: string) {
+		const legacy = legacyEncoderPreset(out);
+		if (legacy && out.encoder_preset === undefined) out.encoder_preset = legacy;
+		out.preset = value || null;
+		if (out.preset) {
+			out.resolution = null;
+			out.crf = null;
+			out.audio_bitrate = null;
+		} else if (!out.resolution) {
+			out.resolution = '1920x1080';
+		}
 	}
 	function removeOutput(i: number) {
 		const outs = s.configStructured?.outputs;
@@ -390,8 +436,9 @@
 
 				<h3>Outputs</h3>
 				<p class="dim">
-					The body renders once at the highest resolution among these, then transcodes to each one's own
-					resolution/encoder — a second output is typically the same cut at a different delivery size.
+					The body renders once at the largest master-shaped size among these, then transcodes to each one's own
+					resolution/encoder — a second output is typically the same cut at a different delivery size, or a
+					platform version (Reels, Square, WhatsApp) reframed with a blurred fill, a crop or black bars.
 				</p>
 				{#each cfg.outputs as out, i (i)}
 					<div class="output-card">
@@ -405,11 +452,36 @@
 						</div>
 						<div class="field-grid">
 							<label class="field narrow">
+								<span>Platform</span>
+								<select
+									class="text-input"
+									value={platformValue(out)}
+									onchange={(e) => setPlatform(out, (e.currentTarget as HTMLSelectElement).value)}
+								>
+									<option value="">Master</option>
+									<option value="youtube">YouTube 16:9</option>
+									<option value="reels">Reels / TikTok / Shorts 9:16</option>
+									<option value="square">Square 1:1</option>
+									<option value="whatsapp">WhatsApp 9:16 small</option>
+								</select>
+							</label>
+							<label class="field narrow">
+								<span>Fit</span>
+								<select class="text-input" bind:value={out.fit}>
+									<option value={undefined}>Blur fill</option>
+									<option value="crop">Crop</option>
+									<option value="pad">Black bars</option>
+								</select>
+							</label>
+							<label class="field narrow">
 								<span>Resolution</span>
 								<select class="text-input" bind:value={out.resolution}>
+									<option value={null}>From platform</option>
 									<option value="1920x1080">1920×1080</option>
 									<option value="3840x2160">3840×2160 (4K)</option>
 									<option value="1280x720">1280×720</option>
+									<option value="1080x1920">1080×1920 (vertical)</option>
+									<option value="1080x1080">1080×1080 (square)</option>
 								</select>
 							</label>
 							<label class="field narrow">
@@ -425,19 +497,31 @@
 							</label>
 							<label class="field narrow">
 								<span>Quality (CRF)</span>
-								<input class="text-input mono" type="number" min="0" max="51" bind:value={out.crf} />
+								<input
+									class="text-input mono"
+									type="number"
+									min="0"
+									max="51"
+									placeholder="auto"
+									bind:value={out.crf}
+								/>
 							</label>
 							<label class="field narrow">
 								<span>Audio bitrate</span>
-								<input class="text-input mono" placeholder="e.g. 192k" bind:value={out.audio_bitrate} />
+								<input
+									class="text-input mono"
+									placeholder="auto"
+									value={out.audio_bitrate ?? ''}
+									oninput={(e) => (out.audio_bitrate = optionalString((e.target as HTMLInputElement).value))}
+								/>
 							</label>
 							<label class="field narrow">
 								<span>Encoder preset</span>
 								<input
 									class="text-input mono"
 									placeholder="auto"
-									value={out.preset ?? ''}
-									oninput={(e) => (out.preset = optionalString((e.target as HTMLInputElement).value))}
+									value={out.encoder_preset ?? legacyEncoderPreset(out) ?? ''}
+									oninput={(e) => setEncoderPreset(out, (e.target as HTMLInputElement).value)}
 								/>
 							</label>
 						</div>

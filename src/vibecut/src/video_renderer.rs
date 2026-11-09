@@ -1925,39 +1925,24 @@ pub fn concat_re_encode(
     runner.run(&refs)
 }
 
-/// Transcode the muxed body (with soundtrack) to one final output: scale to
-/// `width × height`, re-encode video at `crf` with the encoder configured by
-/// `hw`, and re-encode audio as AAC at `audio_bitrate`. Letterboxes if the
-/// aspect ratios differ.
+/// Transcode the muxed body (with soundtrack) to one final output: bring
+/// the picture to the output's shape with `graph` (a filter graph from
+/// `[0:v]` to `[v]`, see [`crate::output_format::reframe_graph`]),
+/// re-encode video with `video_args` (see
+/// [`crate::output_format::output_encode_args`]), and re-encode audio as
+/// AAC at `audio_bitrate`.
 pub fn transcode_output(
     runner: &dyn FfmpegRunner,
     input: &Utf8Path,
     output: &Utf8Path,
-    width: u32,
-    height: u32,
-    crf: u32,
+    graph: &str,
+    video_args: &[String],
     audio_bitrate: &str,
-    hw: &HwConfig,
 ) -> Result<()> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let vf = format!("{lb},setsar=1", lb = letterbox_filter(width, height));
-    let mut cmd: Vec<String> = vec![
-        arg("-y"), arg("-hide_banner"), arg("-loglevel"), arg("error"),
-        arg("-i"), input.to_string(),
-        arg("-vf"), vf,
-        arg("-pix_fmt"), arg("yuv420p"),
-    ];
-    cmd.extend(hw.encode_args(crf));
-    cmd.extend([
-        arg("-c:a"), arg("aac"),
-        arg("-b:a"), audio_bitrate.to_string(),
-        arg("-ar"), AUDIO_SAMPLE_RATE.to_string(),
-        arg("-ac"), arg("2"),
-        arg("-movflags"), arg("+faststart"),
-        output.to_string(),
-    ]);
+    let cmd = crate::output_format::transcode_args(input, output, graph, video_args, audio_bitrate);
     let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
     runner.run(&refs)
 }

@@ -24,6 +24,7 @@ pub mod media_probe;
 pub mod ml_engine;
 pub mod multi_angle;
 pub mod output_timeline;
+pub mod output_format;
 pub mod progress;
 pub mod project_config;
 pub mod selection_planner;

@@ -324,6 +324,51 @@ export function inspectAt(videoPath: string, times: number[]): Promise<FrameSumm
 	return getJson(`/frames/at?output_path=${encodeURIComponent(videoPath)}&t=${t}`);
 }
 
+// ---------- reformat (platform versions) ----------
+
+/** Platform presets `POST /reformat` (and `[[outputs]].preset`) accept. */
+export type PlatformPreset = 'youtube' | 'reels' | 'tiktok' | 'shorts' | 'square' | 'whatsapp' | 'master';
+
+export interface ReformatResult {
+	ok: boolean;
+	source_path: string;
+	/** The version, `<stem>.<preset>.mp4` next to the source. */
+	output_path: string;
+	preset: PlatformPreset;
+	width: number;
+	height: number;
+	/** `null` when the source already has the preset's aspect. */
+	fit: 'blur' | 'crop' | 'pad' | null;
+	/** Stream-copied: the source already was this shape. */
+	copied: boolean;
+	/** An up-to-date version already existed. */
+	cached: boolean;
+	encoder: string | null;
+	duration_secs: number;
+	source_duration_secs: number;
+	size_bytes: number;
+}
+
+/** Start a platform version of a finished render; poll `reformatStatus`. */
+export function reformat(
+	outputPath: string,
+	preset: PlatformPreset,
+	fit?: 'blur' | 'crop' | 'pad'
+): Promise<{ job_id: string; state: string; preset: PlatformPreset; output_path: string }> {
+	return sendJson('/reformat', { output_path: outputPath, preset, ...(fit ? { fit } : {}) });
+}
+
+export type ReformatStatus =
+	| { job_id: string; state: 'queued' }
+	| { job_id: string; state: 'running'; started_at: string; progress: RenderProgress | null }
+	| ({ job_id: string; state: 'done'; elapsed_ms: number } & ReformatResult)
+	| { job_id: string; state: 'failed'; error: string };
+
+/** Reformats run as jobs in the same registry as renders. */
+export function reformatStatus(jobId: string): Promise<ReformatStatus> {
+	return getJson(`/render/${encodeURIComponent(jobId)}`);
+}
+
 // ---------- music library ----------
 
 export interface Track {

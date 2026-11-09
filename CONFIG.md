@@ -92,10 +92,12 @@ end   = "1m30s"
 
 ## `[[outputs]]` (required, ≥ 1 entry)
 
-One or more target files. The body is rendered once at the **highest**
-resolution among all entries, then transcoded to each output's resolution +
-encoder + CRF settings — so adding a 1080p alongside a 4K render only adds
-a fast resize pass.
+One or more target files. The body is rendered once in the **master
+shape** — the largest entry that isn't a vertical or square platform
+preset — then transcoded to each output's resolution + encoder + CRF
+settings, so adding a 1080p alongside a 4K render only adds a fast resize
+pass. An output whose aspect differs from the body's (a 9:16 Reel next to
+a 16:9 master) is reframed in that same pass; see `fit` below.
 
 Each `path` is written as `<name>.partial.<ext>` next to it while the render
 runs and only renamed into place once the whole render has succeeded, so a
@@ -105,22 +107,96 @@ exactly as they were.
 
 ```toml
 [[outputs]]
-path          = "out/edit_4k.mp4"
-resolution    = "3840x2160"               # WIDTHxHEIGHT
-encoder       = "auto"                    # auto | libx264 | libx265 | nvenc | amf | qsv
-crf           = 20                        # quality factor (-crf libx264, -cq NVENC, etc.); lower = better
-preset        = "p5"                      # optional; encoder-specific (libx264: "veryfast", NVENC: "p5", …)
-audio_bitrate = "192k"                    # AAC bitrate; default "192k"
+path           = "out/edit_4k.mp4"
+resolution     = "3840x2160"              # WIDTHxHEIGHT; optional when `preset` sets it
+encoder        = "auto"                   # auto | libx264 | libx265 | nvenc | amf | qsv
+crf            = 20                       # quality factor (-crf libx264, -cq NVENC, etc.); lower = better. Default: the preset's, else 20
+encoder_preset = "slow"                   # optional; for this output's own encode pass, see below
+audio_bitrate  = "192k"                   # AAC bitrate. Default: the preset's, else "192k"
 
 # A second output at 1080p alongside the 4K above:
 [[outputs]]
 path          = "out/edit_1080.mp4"
 resolution    = "1920x1080"
 crf           = 22
+
+# The same cut, vertical, for Reels / TikTok / Shorts:
+[[outputs]]
+path   = "out/edit.reels.mp4"
+preset = "reels"                          # platform preset, see the table below
+fit    = "blur"                           # blur (default) | crop | pad; only used when the aspect differs
 ```
 
 `encoder = "auto"` picks the best available hardware encoder
 (NVENC > AMF > QSV > libx264) at runtime.
+
+`encoder_preset` names a preset of the encoder that actually runs:
+libx264 / libx265 `ultrafast` … `veryslow` (`placebo`), NVENC `p1` … `p7`
+(and its older `slow`, `medium`, `fast`, `hq`, …), AMF `speed`, `balanced`
+or `quality`, QSV `veryfast` … `veryslow`. Since `encoder = "auto"` only
+settles the encoder at render time, a name that encoder doesn't take (`p5`
+on a machine without NVENC, as in the Docker image) is skipped with a
+warning and the encoder keeps its default (libx264 `veryfast`, NVENC `p5`,
+AMF `balanced`, QSV `medium`). It applies to an output's own encode pass;
+a single output written straight from the body uses the default.
+
+### Platform presets (`preset`)
+
+A `preset` fills in every key the output leaves unset; keys you set
+yourself (`resolution`, `crf`, `audio_bitrate`, `max_bitrate`) always win.
+
+| `preset`                    | Shape         | Resolution | CRF | Audio | Video bitrate cap |
+|-----------------------------|---------------|------------|-----|-------|-------------------|
+| `master`                    | as configured | 1920x1080  | 20  | 192k  | none              |
+| `youtube`                   | 16:9          | 1920x1080  | 18  | 192k  | none              |
+| `reels`, `tiktok`, `shorts` | 9:16          | 1080x1920  | 20  | 192k  | none              |
+| `square`                    | 1:1           | 1080x1080  | 20  | 192k  | none              |
+| `whatsapp`                  | 9:16          | 720x1280   | 23  | 128k  | 3M peak: 30 s stays at or under ~12 MB, inside WhatsApp's 16 MB |
+
+Vertical and square presets never set the body's shape. The body is the
+largest `master` / `youtube` / no-preset output; when every output is
+vertical or square, it is a 16:9 master as tall as the largest output's
+short side, and at least 1920x1080 (so 1920x1080 for `reels` and for
+`whatsapp`, 3840x2160 for a `reels` output at `resolution = "2160x3840"`):
+card text `size`s are pixels of a 1080p frame, and a smaller body would cut
+a long title off before the reframe. An explicit
+`resolution` with no platform preset sets the body as before, vertical or
+not.
+
+`max_bitrate = "3M"` (or `"2500k"`) caps any output's peak video bitrate;
+`"none"` drops a preset's cap. A capped output always gets its own encode
+pass. Before platform presets, `preset` held the encoder preset: a value
+like `"p5"` or `"veryfast"` there still works and is read as
+`encoder_preset` (with a warning), under the same rule — skipped when the
+encoder that runs doesn't take it.
+
+**`fit`** — how a frame fills an output of a different aspect:
+
+- `blur` (default): the whole frame, fitted, over a blurred and darkened
+  fill made from the same frame — no black bars, nothing cut off.
+- `crop`: a centre crop that fills the output (a 9:16 crop of a 16:9
+  frame keeps its middle third).
+- `pad`: the whole frame with black bars.
+
+**Titles in vertical outputs.** Intro/outro cards are rendered once, at
+the body's resolution (their `size` and offsets are master pixels), and
+reach other shapes through the reframe. In a portrait output narrower
+than the master, the frame is shown at 76 % of its fitted width during
+the intro and outro — so a title as wide as the master frame stays inside
+the 9:16 safe area, clear of the platform's side buttons — and eases back
+to full width over 0.4 s after the title. A `crop` output shows the blur
+fit during those spans instead, so a title is never cut. The spans are
+recorded in the manifest as `card_windows`.
+
+**A platform version of a finished render**, without re-rendering: `vibecut
+reformat out/edit.mp4 --preset reels` (optionally `--fit crop|pad`, `--out
+<path>`) writes `out/edit.reels.mp4` in one ffmpeg pass with the same
+reframe, reading `card_windows` from the render's manifest. The web UI's
+Share sheet (`POST /api/reformat`) and the MCP `reformat` tool do the same.
+Given a version instead (`out/edit.square.mp4`), it works from the render
+next to it (`out/edit.mp4`), so a vertical version of the square one is
+still one reframe of the master; if the render is gone, the result keeps
+the version's whole name (`out/edit.square.reels.mp4`).
 
 ---
 
@@ -704,7 +780,9 @@ or building tooling on top of it:
 - **Manifest output.** Each render writes `<output>.manifest.json`
   alongside the mp4 with the resolved segment list, sources, and
   effective settings — plus, with a soundtrack, the `beat_sync` report
-  (see [Beat-sync report](#beat-sync-report)). Useful for postprocessing,
+  (see [Beat-sync report](#beat-sync-report)), and with an intro or outro,
+  the `card_windows` title spans a platform version keeps safe (see
+  [Platform presets](#platform-presets-preset)). Useful for postprocessing,
   audits, or driving external tooling. Its `timeline` records exactly
   where everything plays, frame for frame, as the concat stage built it:
   the intro/outro card spans, and per clip (one entry per beat-burst cut)

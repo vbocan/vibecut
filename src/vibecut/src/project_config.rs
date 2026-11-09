@@ -138,9 +138,10 @@ fn default_models_dir() -> Utf8PathBuf {
     Utf8PathBuf::from("models")
 }
 
-/// One target output file. The body is rendered once at the highest
-/// resolution across all outputs, then transcoded to each output's
-/// resolution + encoder settings.
+/// One target output file. The body is rendered once in the master shape
+/// (see [`Config::body_resolution`]), then transcoded to each output's
+/// resolution + encoder settings, reframed when its aspect differs.
+/// [`RenderOutput::resolve`] applies the platform `preset`'s defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -148,24 +149,46 @@ fn default_models_dir() -> Utf8PathBuf {
 pub struct RenderOutput {
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub path: Utf8PathBuf,
-    /// `WIDTHxHEIGHT`, e.g. `"3840x2160"` or `"1920x1080"`.
-    pub resolution: String,
+    /// `WIDTHxHEIGHT`, e.g. `"3840x2160"` or `"1920x1080"`. Required unless
+    /// `preset` supplies it; overrides the preset's when both are set.
+    #[serde(default)]
+    pub resolution: Option<String>,
     #[serde(default)]
     pub encoder: Encoder,
     /// Quality factor: `-crf` for libx264/265, `-cq` for NVENC, etc.
-    #[serde(default = "default_crf")]
-    pub crf: u32,
-    /// Encoder-specific preset, e.g. `"p5"` (NVENC), `"veryfast"` (libx264).
-    /// `None` → use the encoder's default preset (`p5` / `veryfast`).
+    /// Default: the preset's, else 20.
+    #[serde(default)]
+    pub crf: Option<u32>,
+    /// Platform preset: `master`, `youtube`, `reels`, `tiktok`, `shorts`,
+    /// `square` or `whatsapp` (see [`crate::output_format::OutputPreset`]).
+    /// An encoder preset name here (`"p5"`, `"veryfast"`) is still read as
+    /// `encoder_preset`, for configs written before platform presets.
     #[serde(default)]
     pub preset: Option<String>,
-    /// AAC bitrate string, e.g. `"192k"`. Default `"192k"`.
-    #[serde(default = "default_audio_bitrate")]
-    pub audio_bitrate: String,
+    /// AAC bitrate string, e.g. `"192k"`. Default: the preset's, else `"192k"`.
+    #[serde(default)]
+    pub audio_bitrate: Option<String>,
+    /// How a frame fills this output when its aspect differs from the
+    /// body's: `blur` (default), `crop` or `pad`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub fit: Option<crate::output_format::Fit>,
+    /// Encoder-specific preset, e.g. `"p5"` (NVENC), `"veryfast"` (libx264),
+    /// for this output's own encode pass. `None` → the encoder's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub encoder_preset: Option<String>,
+    /// Peak video bitrate, e.g. `"3M"`; `"none"` drops a preset's cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub max_bitrate: Option<String>,
 }
 
-fn default_audio_bitrate() -> String {
-    "192k".into()
+impl RenderOutput {
+    /// Apply the preset's defaults to every key this output leaves unset.
+    pub fn resolve(&self) -> Result<crate::output_format::ResolvedOutput, String> {
+        crate::output_format::resolve_output(self)
+    }
 }
 
 /// Accept either `file = "x"` (single string) or `files = ["x", "y"]`
@@ -1005,10 +1028,6 @@ pub struct Grading {
     pub stabilize: bool,
 }
 
-fn default_crf() -> u32 {
-    20
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -1050,11 +1069,10 @@ impl Config {
             ));
         }
         for (i, o) in self.outputs.iter().enumerate() {
-            if !o.resolution.contains('x') {
-                return Err(ConfigError::Validation(format!(
-                    "outputs[{i}].resolution must look like \"WIDTHxHEIGHT\", got {:?}",
-                    o.resolution
-                )));
+            if let Err(e) = o.resolve() {
+                // Key errors read "outputs[0].resolution must …".
+                let sep = if e.starts_with("needs") { " " } else { "." };
+                return Err(ConfigError::Validation(format!("outputs[{i}]{sep}{e}")));
             }
             if o.path.as_str().is_empty() {
                 return Err(ConfigError::Validation(format!(
@@ -1104,21 +1122,18 @@ impl Config {
         Ok(())
     }
 
-    /// Pick the body's render resolution: the maximum width × height across
-    /// all configured outputs. Each output is then transcoded from this body.
+    /// Pick the body's render resolution: the largest master-shaped output
+    /// (a vertical or square platform preset never sets it), or a 16:9
+    /// master when every output is one. Each output is then transcoded
+    /// from this body. See [`crate::output_format::body_resolution`].
     pub fn body_resolution(&self) -> (u32, u32) {
-        let mut best = (0u32, 0u32);
-        let mut best_pixels = 0u64;
-        for o in &self.outputs {
-            if let Ok((w, h)) = parse_res_pair(&o.resolution) {
-                let p = w as u64 * h as u64;
-                if p > best_pixels {
-                    best_pixels = p;
-                    best = (w, h);
-                }
-            }
-        }
-        best
+        crate::output_format::body_resolution(&self.resolved_outputs())
+    }
+
+    /// Every output with its preset applied. Outputs that don't resolve
+    /// are skipped — [`Config::validate`] rejects those.
+    pub fn resolved_outputs(&self) -> Vec<crate::output_format::ResolvedOutput> {
+        self.outputs.iter().filter_map(|o| o.resolve().ok()).collect()
     }
 
     /// First output's path — used for manifest naming, cache directory anchor,
@@ -1145,13 +1160,6 @@ fn sanitize_for_path(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
-}
-
-fn parse_res_pair(s: &str) -> Result<(u32, u32), String> {
-    let (w, h) = s.split_once('x').ok_or_else(|| format!("expected WIDTHxHEIGHT, got {s:?}"))?;
-    let w: u32 = w.trim().parse().map_err(|e| format!("bad width: {e}"))?;
-    let h: u32 = h.trim().parse().map_err(|e| format!("bad height: {e}"))?;
-    Ok((w, h))
 }
 
 #[cfg(test)]
@@ -1339,5 +1347,70 @@ stabilize = false
         "#;
         let cfg: Config = toml::from_str(many).unwrap();
         assert_eq!(cfg.soundtrack.as_ref().unwrap().files.len(), 3);
+    }
+
+    /// A minimal config whose outputs are `outputs` (`[[outputs]]` tables), validated.
+    fn with_outputs(outputs: &str) -> Result<Config, ConfigError> {
+        let cfg: Config = toml::from_str(&format!(
+            "schema_version = 1\n\
+             [project]\nname = \"x\"\ntarget_duration = \"10s\"\nfps = 30\n\
+             [input]\nfolder = \".\"\n\
+             {outputs}"
+        ))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn outputs_take_platform_presets() {
+        let cfg = with_outputs(
+            "[[outputs]]\npath = \"out/a.mp4\"\nresolution = \"1920x1080\"\n\
+             [[outputs]]\npath = \"out/a.reels.mp4\"\npreset = \"reels\"\n",
+        )
+        .unwrap();
+        // The vertical preset needs no resolution and never makes the body vertical.
+        assert_eq!(cfg.body_resolution(), (1920, 1080));
+        let outs = cfg.resolved_outputs();
+        assert_eq!((outs[1].width, outs[1].height), (1080, 1920));
+        assert_eq!(outs[0].crf, 20);
+        // Unset keys stay unset when written back, so the preset keeps deciding them.
+        let s = toml::to_string(&cfg).unwrap();
+        assert!(!s.contains("crf") && !s.contains("fit"), "{s}");
+        // Only a vertical preset: the body is a 16:9 master.
+        let cfg = with_outputs("[[outputs]]\npath = \"out/a.mp4\"\npreset = \"reels\"\n").unwrap();
+        assert_eq!(cfg.body_resolution(), (1920, 1080));
+    }
+
+    #[test]
+    fn configs_from_before_platform_presets_still_load() {
+        // `preset` used to hold the encoder preset.
+        let cfg = with_outputs(
+            "[[outputs]]\npath = \"out/a.mp4\"\nresolution = \"1920x1080\"\nencoder = \"nvenc\"\n\
+             crf = 22\npreset = \"p5\"\naudio_bitrate = \"160k\"\n",
+        )
+        .unwrap();
+        let o = &cfg.resolved_outputs()[0];
+        assert_eq!((o.width, o.height, o.crf), (1920, 1080, 22));
+        assert_eq!((o.preset, o.encoder_preset.as_deref()), (None, Some("p5")));
+        assert_eq!(o.audio_bitrate, "160k");
+    }
+
+    #[test]
+    fn output_errors_name_the_output() {
+        let e = with_outputs(
+            "[[outputs]]\npath = \"a.mp4\"\nresolution = \"1920x1080\"\n\
+             [[outputs]]\npath = \"b.mp4\"\nresolution = \"1080\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("outputs[1].resolution must look like"), "{e}");
+        let e = with_outputs("[[outputs]]\npath = \"a.mp4\"\n").unwrap_err().to_string();
+        assert!(e.contains("outputs[0] needs a `resolution`"), "{e}");
+        let e = with_outputs("[[outputs]]\npath = \"a.mp4\"\npreset = \"vine\"\n").unwrap_err().to_string();
+        assert!(e.contains("outputs[0].preset \"vine\""), "{e}");
+        let e = with_outputs("[[outputs]]\npath = \"a.mp4\"\npreset = \"reels\"\nfit = \"zoom\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("zoom"), "{e}");
     }
 }

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
-	import { outputFileUrl } from '$lib/api';
+	import { ApiError, outputFileUrl, reformat, reformatStatus } from '$lib/api';
+	import type { PlatformPreset, ReformatResult } from '$lib/api';
 	import { clock } from '$lib/vibes';
 
 	// Decision 2: get the video out. Download, the phone's own share sheet
@@ -51,12 +52,12 @@
 		}
 	}
 
-	async function shareFile() {
+	async function shareFile(fileUrl: string, name: string) {
 		sharing = true;
 		shareError = null;
 		try {
-			const blob = await (await fetch(url)).blob();
-			const file = new File([blob], fileName, { type: 'video/mp4' });
+			const blob = await (await fetch(fileUrl)).blob();
+			const file = new File([blob], name, { type: 'video/mp4' });
 			await navigator.share({ files: [file], title, text: caption });
 		} catch (e) {
 			if (!(e instanceof DOMException && e.name === 'AbortError')) {
@@ -65,6 +66,61 @@
 		} finally {
 			sharing = false;
 		}
+	}
+
+	// Platform versions: one fast server-side pass over this render
+	// (POST /api/reformat), reframed to the platform's shape — a blurred
+	// fill of the same frame behind it when the aspect differs.
+	const PLATFORMS: { preset: PlatformPreset; label: string; shape: string; w: number; h: number }[] = [
+		{ preset: 'youtube', label: 'YouTube', shape: '16:9', w: 16, h: 9 },
+		{ preset: 'reels', label: 'Reels / TikTok / Shorts', shape: '9:16', w: 9, h: 16 },
+		{ preset: 'square', label: 'Square', shape: '1:1', w: 1, h: 1 },
+		{ preset: 'whatsapp', label: 'WhatsApp', shape: '9:16 · small', w: 9, h: 16 }
+	];
+	type Version =
+		| { state: 'working'; progress: number }
+		| { state: 'done'; result: ReformatResult }
+		| { state: 'failed'; error: string };
+	/** Keyed by render + preset, so a new render starts with no versions. */
+	let versions = $state<Record<string, Version>>({});
+	let chosen = $state<PlatformPreset | null>(null);
+	const versionKey = (source: string, preset: PlatformPreset) => `${source}|${preset}`;
+	const chosenPlatform = $derived(PLATFORMS.find((p) => p.preset === chosen) ?? null);
+	const current = $derived(chosen && s.outputPath ? versions[versionKey(s.outputPath, chosen)] : undefined);
+	const versionFileName = $derived(chosen ? `${fileName.replace(/\.mp4$/i, '')}.${chosen}.mp4` : fileName);
+
+	async function makeVersion(preset: PlatformPreset) {
+		const source = s.outputPath;
+		if (!source) return;
+		chosen = preset;
+		const key = versionKey(source, preset);
+		const existing = versions[key];
+		if (existing && existing.state !== 'failed') return;
+		versions[key] = { state: 'working', progress: 0 };
+		try {
+			const job = await reformat(source, preset);
+			for (;;) {
+				const st = await reformatStatus(job.job_id);
+				if (st.state === 'done') {
+					versions[key] = { state: 'done', result: st };
+					return;
+				}
+				if (st.state === 'failed') {
+					versions[key] = { state: 'failed', error: st.error };
+					return;
+				}
+				if (st.state === 'running' && st.progress) {
+					versions[key] = { state: 'working', progress: st.progress.overall };
+				}
+				await new Promise((r) => setTimeout(r, 400));
+			}
+		} catch (e) {
+			versions[key] = { state: 'failed', error: e instanceof ApiError ? e.describe() : String(e) };
+		}
+	}
+
+	function megabytes(bytes: number): string {
+		return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
 	}
 </script>
 
@@ -96,12 +152,74 @@
 			Save video
 		</a>
 		{#if canShareFiles}
-			<button class="btn big" type="button" disabled={sharing} onclick={shareFile}>
+			<button class="btn big" type="button" disabled={sharing} onclick={() => shareFile(url, fileName)}>
 				{sharing ? 'Preparing…' : 'Share…'}
 			</button>
 		{/if}
 	</div>
 	{#if shareError}<p class="error">{shareError}</p>{/if}
+
+	<section class="formats" aria-labelledby="formats-h">
+		<span class="eyebrow" id="formats-h">Make a version for</span>
+		<div class="platforms" role="group" aria-labelledby="formats-h">
+			{#each PLATFORMS as p (p.preset)}
+				<button
+					type="button"
+					class="platform"
+					aria-pressed={chosen === p.preset}
+					disabled={!s.outputPath}
+					onclick={() => makeVersion(p.preset)}
+				>
+					<span class="frame-icon" style:aspect-ratio="{p.w} / {p.h}" aria-hidden="true"></span>
+					<span class="p-name">{p.label}</span>
+					<span class="p-shape mono">{p.shape}</span>
+				</button>
+			{/each}
+		</div>
+		{#if chosenPlatform && current}
+			<div class="version" aria-live="polite">
+				{#if current.state === 'working'}
+					{@const pct = Math.round(current.progress * 100)}
+					<div
+						class="bar"
+						role="progressbar"
+						aria-label="Making the {chosenPlatform.label} version"
+						aria-valuemin={0}
+						aria-valuemax={100}
+						aria-valuenow={pct}
+					>
+						<span style:width="{Math.max(pct, 3)}%"></span>
+					</div>
+					<p class="v-note">Making the {chosenPlatform.label} version… {pct}%</p>
+				{:else if current.state === 'done'}
+					{@const r = current.result}
+					<p class="v-note">
+						<strong>{chosenPlatform.label}</strong>{' version ready '}<span class="mono"
+							>· {r.width}×{r.height} · {clock(r.duration_secs)} · {megabytes(r.size_bytes)}</span
+						>
+					</p>
+					<div class="v-actions">
+						<a class="btn primary" href={outputFileUrl(r.output_path)} download={versionFileName}
+							>Save {chosenPlatform.label} version</a
+						>
+						{#if canShareFiles}
+							<button
+								class="btn"
+								type="button"
+								disabled={sharing}
+								onclick={() => shareFile(outputFileUrl(r.output_path), versionFileName)}
+							>
+								{sharing ? 'Preparing…' : 'Share…'}
+							</button>
+						{/if}
+					</div>
+				{:else}
+					<p class="error inline">Couldn’t make the {chosenPlatform.label} version: {current.error}</p>
+					<button class="btn small" type="button" onclick={() => chosen && makeVersion(chosen)}>Try again</button>
+				{/if}
+			</div>
+		{/if}
+	</section>
 
 	<div class="caption">
 		<div class="cap-head">
@@ -233,6 +351,110 @@
 		font-family: var(--ui);
 		font-size: var(--fs-sm);
 		color: var(--text-dim);
+	}
+
+	.formats {
+		margin: 14px 22px 0;
+	}
+
+	.platforms {
+		display: grid;
+		grid-template-columns: repeat(4, minmax(0, 1fr));
+		gap: 8px;
+		margin-top: 8px;
+	}
+
+	.platform {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 4px;
+		padding: 10px 6px;
+		border-radius: var(--r-md);
+		border: 1px solid var(--line);
+		background: rgba(255, 255, 255, 0.03);
+		color: var(--text);
+		font: inherit;
+		font-size: var(--fs-xs);
+		line-height: 1.2;
+		text-align: center;
+		cursor: pointer;
+	}
+
+	.platform:hover:not(:disabled) {
+		border-color: var(--line-strong);
+		background: rgba(255, 255, 255, 0.07);
+	}
+
+	.platform[aria-pressed='true'] {
+		border-color: var(--accent);
+		background: rgba(255, 122, 69, 0.1);
+	}
+
+	.platform:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+
+	.frame-icon {
+		height: 22px;
+		max-width: 40px;
+		border: 2px solid currentColor;
+		border-radius: 4px;
+		opacity: 0.8;
+	}
+
+	.p-name {
+		font-weight: 600;
+	}
+
+	.p-shape {
+		color: var(--text-faint);
+	}
+
+	.version {
+		margin-top: 10px;
+	}
+
+	.bar {
+		height: 6px;
+		border-radius: 3px;
+		background: rgba(255, 255, 255, 0.08);
+		overflow: hidden;
+	}
+
+	.bar span {
+		display: block;
+		height: 100%;
+		background: var(--grad-brand);
+		transition: width var(--dur-2) var(--ease-out);
+	}
+
+	.v-note {
+		margin: 6px 0 0;
+		font-size: var(--fs-sm);
+		color: var(--text-dim);
+	}
+
+	.v-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		margin-top: 8px;
+	}
+
+	.v-actions .btn {
+		text-decoration: none;
+	}
+
+	.error.inline {
+		margin: 0 0 6px;
+	}
+
+	@media (max-width: 480px) {
+		.platforms {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
 	}
 
 	.privacy {
