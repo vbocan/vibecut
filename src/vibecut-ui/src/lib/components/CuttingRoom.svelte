@@ -88,7 +88,7 @@
 		>
 			<span class="eq" class:on={s.musicOn} aria-hidden="true"><i></i><i></i><i></i></span>
 			<span class="serif">♪ {s.effectiveTrack.title}</span>
-			<span class="state">{s.musicOn ? 'Music on' : 'Music off'}</span>
+			<span class="state" aria-hidden="true">{s.musicOn ? 'Music on' : 'Music off'}</span>
 		</button>
 	{/if}
 
@@ -114,7 +114,7 @@
 				<div class="rings" aria-hidden="true">
 					<span></span><span></span><span></span>
 				</div>
-				<div class="pct mono" aria-label="{pct} percent"><span class="num">{pct}</span><small>%</small></div>
+				<div class="pct mono" aria-hidden="true"><span class="num">{pct}</span><small>%</small></div>
 			</div>
 
 			<div
@@ -131,7 +131,7 @@
 			<ol class="stages">
 				{#each stages as st (st.key)}
 					{@const idx = STAGES.findIndex((x) => x.key === st.key)}
-					<li class:done={stageIndex > idx} class:active={stageIndex === idx}>
+					<li class:done={stageIndex > idx} class:active={stageIndex === idx} aria-current={stageIndex === idx ? 'step' : undefined}>
 						<span class="tick" aria-hidden="true">{stageIndex > idx ? '✓' : ''}</span>
 						{st.label}
 					</li>

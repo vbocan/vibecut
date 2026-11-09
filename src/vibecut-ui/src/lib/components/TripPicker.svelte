@@ -2,6 +2,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { prettyBytes } from '$lib/vibes';
 	import { sourceColor } from '$lib/colors';
+	import { radiogroup } from '$lib/radiogroup';
 
 	let manual = $state('');
 	let showManual = $state(false);
@@ -23,13 +24,25 @@
 
 	const sourceIds = $derived(s.discoverResult?.sources.map((x) => x.source_id) ?? []);
 	const totalMin = $derived(((s.discoverResult?.total_secs ?? 0) / 60).toFixed(1));
+	// One short announcement per scan, not the whole clip strip.
+	const scanStatus = $derived(
+		!s.folder
+			? ''
+			: s.discovering
+				? 'Looking through your clips…'
+				: s.discoverError
+					? s.discoverError
+					: s.discoverResult
+						? `${s.discoverResult.n_sources} clip${s.discoverResult.n_sources === 1 ? '' : 's'}, ${totalMin} min of footage.`
+						: ''
+	);
 </script>
 
 <section class="act" aria-labelledby="trip-h">
 	<div class="act-head">
 		<span class="num" aria-hidden="true">1</span>
 		<h2 id="trip-h">Pick your footage</h2>
-		<button class="btn ghost small" type="button" onclick={() => (showManual = !showManual)}>
+		<button class="btn ghost small" type="button" aria-expanded={showManual} onclick={() => (showManual = !showManual)}>
 			{showManual ? 'Hide' : 'Type a folder'}
 		</button>
 	</div>
@@ -62,12 +75,13 @@
 			>
 		</div>
 	{:else}
-		<div class="trips" role="group" aria-label="Footage folders">
+		<div class="trips" role="radiogroup" aria-labelledby="trip-h" use:radiogroup>
 			{#each s.footage as f, i (f.folder)}
 				{@const poster = s.folderPosters[f.folder]}
 				<button
 					type="button"
-					aria-pressed={s.folder === f.folder}
+					role="radio"
+					aria-checked={s.folder === f.folder}
 					class="trip"
 					class:selected={s.folder === f.folder}
 					style="--i: {i}"
@@ -91,8 +105,9 @@
 		</div>
 	{/if}
 
+	<p class="sr-only" role="status">{scanStatus}</p>
 	{#if s.folder && (s.discovering || s.discoverResult || s.discoverError)}
-		<div class="sources" aria-live="polite">
+		<div class="sources">
 			{#if s.discovering}
 				<p class="hint"><span class="spinner" aria-hidden="true"></span> Looking through your clips…</p>
 			{:else if s.discoverError}

@@ -2,6 +2,7 @@
 	import { onDestroy } from 'svelte';
 	import { appState as s } from '$lib/state.svelte';
 	import { outputFileUrl } from '$lib/api';
+	import { prefersReducedMotion } from '$lib/motion';
 
 	// The rendered video with an "ambilight": a tiny canvas copy of the
 	// current frame, blurred and scaled behind the player so the screen
@@ -66,6 +67,7 @@
 		<!-- svelte-ignore a11y_media_has_caption -- auto-generated highlight reel; no caption source exists -->
 		<video
 			bind:this={video}
+			aria-label="Your video"
 			{src}
 			{poster}
 			controls
@@ -75,10 +77,10 @@
 				s.videoDuration = video?.duration ?? null;
 				setTimeout(paint, 300);
 				// The reveal: the music that played during the cut hands over
-				// to the finished reel.
+				// to the finished reel (unless the viewer asked for less motion).
 				if (s.autoplayReveal) {
 					s.autoplayReveal = false;
-					void video?.play().catch(() => {});
+					if (!prefersReducedMotion()) void video?.play().catch(() => {});
 				}
 			}}
 			onseeked={paint}

@@ -123,7 +123,17 @@ class AppState {
 	discoveredFolder = $state<string | null>(null);
 
 	selectFolder(folder: string) {
-		if (this.discoveredFolder === folder && this.discoverResult) return;
+		if (this.discoveredFolder === folder && this.discoverResult) {
+			// Its clips are already here: make it the selection again (a
+			// quick A → B → A must land on A) and drop B's scan.
+			if (this.folder !== folder) {
+				this.folder = folder;
+				this.discoverSeq++;
+				this.discovering = false;
+				this.discoverError = null;
+			}
+			return;
+		}
 		this.folder = folder;
 		void this.discover();
 	}
@@ -418,18 +428,27 @@ class AppState {
 	discoverResult = $state<api.DiscoverResult | null>(null);
 	discoverError = $state<string | null>(null);
 
+	/** Bumped per discover() call: only the latest call's answer lands,
+	 *  so arrowing across the footage radios can't leave the clips of
+	 *  one folder showing under another. */
+	private discoverSeq = 0;
+
 	async discover() {
+		const seq = ++this.discoverSeq;
 		this.discovering = true;
 		this.discoverError = null;
 		try {
 			const folder = this.folder;
-			this.discoverResult = await api.discoverSources(folder);
+			const result = await api.discoverSources(folder);
+			if (seq !== this.discoverSeq) return;
+			this.discoverResult = result;
 			this.discoveredFolder = folder;
 			void this.loadSourceThumbs();
 		} catch (e) {
+			if (seq !== this.discoverSeq) return;
 			this.discoverError = e instanceof api.ApiError ? e.describe() : String(e);
 		} finally {
-			this.discovering = false;
+			if (seq === this.discoverSeq) this.discovering = false;
 		}
 	}
 

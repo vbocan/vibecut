@@ -3,6 +3,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { musicFileUrl, type Track } from '$lib/api';
 	import { clock } from '$lib/vibes';
+	import { radiogroup } from '$lib/radiogroup';
 	import EnergyBars from './EnergyBars.svelte';
 
 	let { compact = false }: { compact?: boolean } = $props();
@@ -122,7 +123,7 @@
 			</span>
 		</button>
 
-		<div class="moods" role="radiogroup" aria-label="Filter by mood">
+		<div class="moods" role="radiogroup" aria-label="Filter by mood" use:radiogroup>
 			{#each MOODS as m (m.key)}
 				<button
 					type="button"
@@ -135,11 +136,13 @@
 			{/each}
 		</div>
 
-		<ul class="list" aria-label="Songs">
+		<!-- In the Studio a pick re-renders, so arrows only move focus there
+		     and Space / Enter picks. -->
+		<ul class="list" role="radiogroup" aria-label="Song" use:radiogroup={{ selectOnMove: !inStudio }}>
 			{#each shown as t, i (t.path)}
 				{@const isOn = s.selectedTrackPath === t.path}
 				{@const isPlaying = playing === t.path}
-				<li class="row" class:on={isOn} class:playing={isPlaying} style="--i: {i}">
+				<li class="row" role="none" class:on={isOn} class:playing={isPlaying} style="--i: {i}">
 					<button
 						type="button"
 						class="play"
@@ -163,7 +166,7 @@
 							>
 						{/if}
 					</button>
-					<button type="button" class="pick" aria-pressed={isOn} onclick={() => choose(t.path)}>
+					<button type="button" class="pick" role="radio" aria-checked={isOn} onclick={() => choose(t.path)}>
 						<span class="title">{t.title}</span>
 						<span class="facts">
 							<span class="mood {t.mood}">{t.mood}</span>

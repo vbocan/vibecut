@@ -51,7 +51,10 @@
 	</div>
 
 	<div class="make-dock" class:ready>
-		<div class="summary" aria-live="polite">
+		<!-- Not live: it repeats each choice, which the focused control has
+		     already announced. Only becoming ready is news. -->
+		<p class="sr-only" role="status">{ready ? 'Ready to make your video.' : ''}</p>
+		<div class="summary">
 			{#if ready}
 				<span class="eyebrow">Ready</span>
 				<span class="line">

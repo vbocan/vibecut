@@ -35,6 +35,7 @@
 	import type { CardLayer } from '$lib/types/generated/CardLayer';
 	import type { AngleGroupCfg } from '$lib/types/generated/AngleGroupCfg';
 	import type { Soundtrack } from '$lib/types/generated/Soundtrack';
+	import { radiogroup } from '$lib/radiogroup';
 
 	const STEPS = [
 		{ label: 'Basics' },
@@ -345,16 +346,25 @@
 {#if s.configStructured}
 	{@const cfg = s.configStructured}
 	<div class="wizard">
-		<div class="step-tabs">
+		<div class="step-tabs" role="tablist" aria-label="Settings steps" use:radiogroup>
 			{#each STEPS as st, i (st.label)}
-				<button type="button" class="step-tab" class:active={step === i} onclick={() => (step = i)}>
-					<span class="step-num">{i + 1}</span>
+				<button
+					type="button"
+					class="step-tab"
+					role="tab"
+					id="wizard-tab-{i}"
+					aria-controls="wizard-panel"
+					aria-selected={step === i}
+					class:active={step === i}
+					onclick={() => (step = i)}
+				>
+					<span class="step-num" aria-hidden="true">{i + 1}</span>
 					{st.label}
 				</button>
 			{/each}
 		</div>
 
-		<div class="step-body">
+		<div class="step-body" role="tabpanel" id="wizard-panel" aria-labelledby="wizard-tab-{step}">
 			{#if step === 0}
 				<div class="field-grid">
 					<label class="field">

@@ -7,6 +7,7 @@
 	import StudioScreen from '$lib/components/StudioScreen.svelte';
 	import ProDrawer from '$lib/components/ProDrawer.svelte';
 	import UndoToast from '$lib/components/UndoToast.svelte';
+	import { prefersReducedMotion } from '$lib/motion';
 
 	let proOpen = $state(false);
 	// A render that finishes while the tab is in the background flags the
@@ -51,6 +52,22 @@
 		hasVideo ? 'studio' : busy || s.makeStep === 'failed' ? 'cutting' : 'create'
 	);
 
+	// Changing screens removes the control that had the keyboard focus
+	// ("Make my video", the cutting room's buttons): start the new
+	// screen's reading order at its top instead of dropping focus on the
+	// page. Only once someone has used the page, so restoring a session
+	// on load doesn't move anything.
+	let mainEl: HTMLElement | undefined = $state();
+	let interacted = false;
+	let lastScreen: string | null = null;
+	$effect(() => {
+		const now = screen;
+		const at = document.activeElement;
+		if (interacted && lastScreen !== null && lastScreen !== now && (!at || at === document.body))
+			mainEl?.focus({ preventScroll: true });
+		lastScreen = now;
+	});
+
 	// The whole UI breathes at the chosen song's tempo.
 	$effect(() => {
 		const beat = s.effectiveTrack?.beat_interval_secs;
@@ -66,7 +83,7 @@
 			return;
 		s.startOver();
 		proOpen = false;
-		window.scrollTo({ top: 0, behavior: 'smooth' });
+		window.scrollTo({ top: 0, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
 	}
 
 	function backFromFailure() {
@@ -92,7 +109,9 @@
 
 <Topbar onOpenPro={() => (proOpen = true)} onNew={newVideo} />
 
-<main id="main">
+<svelte:window onkeydown={() => (interacted = true)} onpointerdown={() => (interacted = true)} />
+
+<main id="main" tabindex="-1" bind:this={mainEl}>
 	{#key screen}
 		<div class="screen">
 			{#if screen === 'create'}
@@ -112,6 +131,11 @@
 <UndoToast />
 
 <style>
+	/* Focused only as a reading position (skip link, screen changes). */
+	main:focus {
+		outline: none;
+	}
+
 	.screen {
 		animation: enter 700ms var(--ease-out) both;
 	}

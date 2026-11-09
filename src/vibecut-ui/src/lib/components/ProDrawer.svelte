@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
 	import ConfigWizard from './ConfigWizard.svelte';
+	import { radiogroup } from '$lib/radiogroup';
 
 	let { open = $bindable(false) }: { open?: boolean } = $props();
 	let dialog: HTMLDialogElement | undefined = $state();
@@ -36,15 +37,17 @@
 			<p class="eyebrow">Advanced</p>
 			<h2 id="pro-h">Pro settings</h2>
 		</div>
-		<button class="btn ghost" type="button" aria-label="Close" onclick={() => (open = false)}>✕</button>
+		<button class="btn ghost" type="button" aria-label="Close Pro settings" onclick={() => (open = false)}>✕</button>
 	</header>
 
 	{#if s.proposeResult}
 		<p class="path mono">{s.proposeResult.config_path}</p>
-		<div class="tabs" role="tablist">
+		<div class="tabs" role="tablist" aria-label="Settings view" use:radiogroup>
 			<button
 				type="button"
 				role="tab"
+				id="pro-tab-guided"
+				aria-controls="pro-panel"
 				aria-selected={s.configMode === 'guided'}
 				class:active={s.configMode === 'guided'}
 				onclick={() => (s.configMode = 'guided')}>Guided</button
@@ -52,13 +55,15 @@
 			<button
 				type="button"
 				role="tab"
+				id="pro-tab-raw"
+				aria-controls="pro-panel"
 				aria-selected={s.configMode === 'raw'}
 				class:active={s.configMode === 'raw'}
 				onclick={() => (s.configMode = 'raw')}>Raw TOML</button
 			>
 		</div>
 
-		<div class="body">
+		<div class="body" role="tabpanel" id="pro-panel" aria-labelledby="pro-tab-{s.configMode}">
 			{#if s.configMode === 'guided'}
 				<ConfigWizard />
 			{:else}
@@ -70,7 +75,7 @@
 					oninput={(e) => s.setConfigToml((e.target as HTMLTextAreaElement).value)}
 					spellcheck="false"
 				></textarea>
-				{#if s.configError}<p class="error">{s.configError}</p>{/if}
+				{#if s.configError}<p class="error" role="alert">{s.configError}</p>{/if}
 			{/if}
 		</div>
 

@@ -40,7 +40,7 @@
 			</span>
 		{/if}
 		{#if hasProject}
-			<button class="btn ghost" type="button" onclick={onOpenPro}>
+			<button class="btn ghost" type="button" aria-haspopup="dialog" onclick={onOpenPro}>
 				<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
 					><path
 						fill="currentColor"

@@ -101,12 +101,13 @@
 			</button>
 		{/if}
 	</div>
-	{#if shareError}<p class="error">{shareError}</p>{/if}
+	{#if shareError}<p class="error" role="alert">{shareError}</p>{/if}
 
 	<div class="caption">
 		<div class="cap-head">
 			<span class="eyebrow">Caption</span>
 			<button class="btn ghost small" type="button" onclick={copyCaption}>{copied ? 'Copied ✓' : 'Copy'}</button>
+			<span class="sr-only" role="status">{copied ? 'Caption copied' : ''}</span>
 		</div>
 		<pre>{caption}</pre>
 	</div>

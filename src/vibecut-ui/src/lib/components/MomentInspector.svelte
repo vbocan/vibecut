@@ -28,6 +28,14 @@
 		return 'Picked to keep the story moving between the big moments.';
 	}
 
+	/** Close, handing the keyboard focus back to the moment's block on
+	 *  the timeline rather than dropping it on the page. */
+	function close() {
+		const i = s.selectedSegmentIndex;
+		s.selectedSegmentIndex = null;
+		if (i !== null) document.querySelectorAll<HTMLElement>('.timeline .seg')[i]?.focus();
+	}
+
 	async function act(kind: 'more' | 'less' | 'drop') {
 		const g = sel;
 		if (!g) return;
@@ -44,22 +52,29 @@
 {#if sel}
 	<aside class="inspector glass" aria-label="Selected moment">
 		<div class="top">
-			<span class="swatch" style="--c: {sourceColor(sourceId, sourceIds)}"></span>
+			<span class="swatch" style="--c: {sourceColor(sourceId, sourceIds)}" aria-hidden="true"></span>
 			<div class="title">
 				<strong>{burst ? 'Beat burst' : `Moment ${sel.index + 1}`}</strong>
 				<span class="mono">
 					{clock(sel.startSecs, true)}–{clock(sel.endSecs, true)} · clip {sourceId}
 				</span>
 			</div>
-			<button class="btn ghost close" type="button" aria-label="Close" onclick={() => (s.selectedSegmentIndex = null)}
-				>✕</button
-			>
+			<button class="btn ghost close" type="button" aria-label="Close moment details" onclick={close}>✕</button>
 		</div>
 		<p class="why serif">{why(sel.segment.reason, sel.segment.score)}</p>
 		{#if sel.segment.score !== null && !burst}
+			{@const strength = Math.round(Math.min(100, ((sel.segment.score ?? 0) / maxScore) * 100))}
 			<div class="score" title="How strongly the picker rated this moment">
-				<span class="eyebrow">Moment strength</span>
-				<span class="meter"><span style="width: {Math.min(100, ((sel.segment.score ?? 0) / maxScore) * 100)}%"></span></span>
+				<span class="eyebrow" id="strength-h">Moment strength</span>
+				<span
+					class="meter"
+					role="meter"
+					aria-labelledby="strength-h"
+					aria-valuemin="0"
+					aria-valuemax="100"
+					aria-valuenow={strength}
+					aria-valuetext="{strength}% of the strongest moment"><span style="width: {strength}%"></span></span
+				>
 			</div>
 		{/if}
 		<div class="actions">

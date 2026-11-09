@@ -106,7 +106,8 @@
 		id="cmd-input"
 		placeholder={studio ? `Tell it — e.g. “${examples[1]}”` : `Or just say it — e.g. “${examples[0]}”`}
 		bind:value={s.briefText}
-		disabled={s.briefBusy}
+		readonly={s.briefBusy}
+		aria-keyshortcuts="Control+K"
 		autocomplete="off"
 	/>
 	<kbd class="hint" aria-hidden="true">Ctrl K</kbd>
@@ -114,16 +115,18 @@
 		{s.briefBusy ? 'Thinking…' : studio ? 'Apply' : 'Make it'}
 	</button>
 </form>
+<!-- One live region for the whole reply; a role="alert" inside it would
+     read the error twice. -->
 <div class="feedback" aria-live="polite">
 	{#if s.briefError}
-		<p class="error" role="alert">{s.briefError}</p>
+		<p class="error">{s.briefError}</p>
 	{:else if note}
 		<p class="why">{note}</p>
 	{:else if s.briefRationale}
 		<p class="why"><span class="serif">“{s.briefRationale}”</span></p>
 	{/if}
 </div>
-<div class="examples" aria-label="Examples">
+<div class="examples" role="group" aria-label="Examples">
 	{#each examples as ex (ex)}
 		<button type="button" class="ex" onclick={() => (s.briefText = ex)}>{ex}</button>
 	{/each}

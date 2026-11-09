@@ -2,6 +2,7 @@
 	import { appState as s } from '$lib/state.svelte';
 	import { outputFileUrl } from '$lib/api';
 	import { clock } from '$lib/vibes';
+	import { radiogroup } from '$lib/radiogroup';
 
 	let comparing = $state(false);
 	let wipe = $state(50);
@@ -32,7 +33,13 @@
 	<div class="head">
 		<p class="eyebrow">Versions</p>
 		{#if s.renderHistory.length >= 2}
-			<button class="btn ghost small" type="button" aria-pressed={comparing} onclick={toggleCompare}>
+			<button
+				class="btn ghost small"
+				type="button"
+				aria-expanded={comparing}
+				aria-controls={comparing ? 'compare-ab' : undefined}
+				onclick={toggleCompare}
+			>
 				{comparing ? 'Done comparing' : 'Compare A/B'}
 			</button>
 		{/if}
@@ -41,14 +48,17 @@
 	{#if s.renderHistory.length === 0}
 		<p class="dim">Each change you make keeps a version here.</p>
 	{:else}
-		<ol class="strip">
+		<!-- One tab stop. Opening a version reloads the player and the
+		     timeline, so arrows only move focus and Space / Enter opens. -->
+		<ol class="strip" role="radiogroup" aria-label="Versions" use:radiogroup={{ selectOnMove: false }}>
 			{#each s.renderHistory as v, i (v.output_path)}
-				<li>
+				<li role="none">
 					<button
 						type="button"
 						class="ver"
+						role="radio"
 						class:on={v.output_path === current}
-						aria-current={v.output_path === current ? 'true' : undefined}
+						aria-checked={v.output_path === current}
 						onclick={() => s.openVersion(i)}
 					>
 						<span class="label">{v.label}</span>
@@ -62,26 +72,27 @@
 	{/if}
 
 	{#if comparing && A && B}
-		<div class="compare">
+		<div class="compare" id="compare-ab">
 			<div class="pickers">
 				<label
-					>A <select bind:value={s.compareA}>
+					>A <select bind:value={s.compareA} aria-label="Version A">
 						{#each s.renderHistory as r, i (i)}<option value={i}>{r.label}</option>{/each}
 					</select></label
 				>
 				<label
-					>B <select bind:value={s.compareB}>
+					>B <select bind:value={s.compareB} aria-label="Version B">
 						{#each s.renderHistory as r, i (i)}<option value={i}>{r.label}</option>{/each}
 					</select></label
 				>
 			</div>
 			<div class="stage">
 				<!-- svelte-ignore a11y_media_has_caption -->
-				<video bind:this={b} src={outputFileUrl(B.output_path)} muted playsinline></video>
+				<video bind:this={b} src={outputFileUrl(B.output_path)} muted playsinline aria-hidden="true"></video>
 				<!-- svelte-ignore a11y_media_has_caption -->
 				<video
 					bind:this={a}
 					class="top"
+					aria-label="Version A over version B"
 					src={outputFileUrl(A.output_path)}
 					controls
 					playsinline
@@ -158,6 +169,11 @@
 
 	.ver:hover {
 		background: rgba(255, 255, 255, 0.06);
+	}
+
+	/* The list scrolls, which would clip an outside focus ring. */
+	.ver:focus-visible {
+		outline-offset: -2px;
 	}
 
 	.ver.on {

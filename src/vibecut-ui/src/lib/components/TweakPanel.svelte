@@ -58,8 +58,8 @@
 	}
 </script>
 
-<div class="tweaks">
-	<p class="eyebrow">Make it…</p>
+<div class="tweaks" role="group" aria-labelledby="tweaks-h">
+	<p class="eyebrow" id="tweaks-h">Make it…</p>
 	<button class="mix" type="button" disabled={busy} onclick={() => s.anotherMix()}>
 		<span class="mix-icon" aria-hidden="true">⤨</span>
 		<span><strong>Try another mix</strong><small>A different vibe with its own best song</small></span>

@@ -160,6 +160,8 @@ input:focus-visible,
 textarea:focus-visible,
 select:focus-visible,
 a:focus-visible,
+summary:focus-visible,
+video:focus-visible,
 [tabindex]:focus-visible {
 	outline: 2px solid var(--cyan);
 	outline-offset: 3px;

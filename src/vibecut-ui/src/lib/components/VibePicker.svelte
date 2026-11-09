@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { appState as s } from '$lib/state.svelte';
 	import { vibeLook, prettyDuration } from '$lib/vibes';
+	import { radiogroup } from '$lib/radiogroup';
 
 	function pick(key: string) {
 		s.selectedVibe = key;
@@ -32,13 +33,17 @@
 		<p class="error">{s.vibesError}</p>
 	{/if}
 
-	<div class="vibes" role="radiogroup" aria-label="Vibe">
+	<div class="vibes" role="radiogroup" aria-labelledby="vibe-h" use:radiogroup>
 		{#each s.vibes as v, i (v.key)}
 			{@const look = vibeLook(v.key)}
+			{@const isAuto = !s.selectedVibe && s.autoVibe === v.key}
+			<!-- Named by the vibe alone; the rest of the card is its description. -->
 			<button
 				type="button"
 				role="radio"
 				aria-checked={s.effectiveVibe === v.key}
+				aria-labelledby="vibe-{v.key}-name"
+				aria-describedby="{isAuto ? `vibe-${v.key}-auto ` : ''}vibe-{v.key}-len vibe-{v.key}-tag vibe-{v.key}-best"
 				class="vibe {look.motion}"
 				class:selected={s.effectiveVibe === v.key}
 				style="--a: {look.colors[0]}; --b: {look.colors[1]}; --c: {look.colors[2]}; --i: {i}"
@@ -50,16 +55,16 @@
 					<span class="blob b3"></span>
 					<span class="lines"></span>
 				</span>
-				{#if !s.selectedVibe && s.autoVibe === v.key}
-					<span class="auto-badge">✦ Picked for your footage</span>
+				{#if isAuto}
+					<span class="auto-badge" id="vibe-{v.key}-auto"><span aria-hidden="true">✦</span> Picked for your footage</span>
 				{/if}
 				<span class="body">
 					<span class="row">
-						<span class="name">{v.name}</span>
-						<span class="len">{prettyDuration(v.default_target_duration)}</span>
+						<span class="name" id="vibe-{v.key}-name">{v.name}</span>
+						<span class="len" id="vibe-{v.key}-len">{prettyDuration(v.default_target_duration)}</span>
 					</span>
-					<span class="tagline">{look.tagline}</span>
-					<span class="best">
+					<span class="tagline" id="vibe-{v.key}-tag">{look.tagline}</span>
+					<span class="best" id="vibe-{v.key}-best">
 						{#each look.best as b (b)}<span>{b}</span>{/each}
 					</span>
 				</span>
@@ -68,8 +73,8 @@
 	</div>
 
 	{#if selected}
-		<div class="lengths" role="radiogroup" aria-label="Length">
-			<span class="eyebrow">Length</span>
+		<div class="lengths" role="radiogroup" aria-labelledby="length-h" use:radiogroup>
+			<span class="eyebrow" id="length-h">Length</span>
 			{#each lengths as l (l.label)}
 				<button
 					type="button"
