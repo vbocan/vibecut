@@ -274,7 +274,13 @@ It is built from the manifest's `timeline`, so it is the cut you watched:
   FCPXML times read `17017/30000s`). Cards and clips run cut to cut and add
   up to the sequence length exactly. Source times sit on the source's own
   frames (probed with ffprobe, so 29.97 GoPro footage stays on its 29.97
-  grid) after its timecode; music times on its samples.
+  grid) after its timecode; music times on its samples. No clip reads
+  outside its file, dissolve handles included: where the two frame grids
+  (or the last frame the render held at the end of a chapter) would run a
+  clip past the end, its in point slips back by that fraction of a frame;
+  a music piece ends on the frame before. A file shorter than that (not
+  the one the render read) is declared as long as the edit needs and
+  noted in the summary.
 - **Cuts and dissolves.** The render cuts mid-crossfade, often half-way
   through a frame; the export puts each cut on whichever of the two frames
   either side is nearer the beat, and centres an SMPTE / Cross Dissolve on
@@ -290,8 +296,11 @@ It is built from the manifest's `timeline`, so it is the cut you watched:
   `files` split back into their own files. OTIO puts it on a `Music` audio
   track; FCPXML connects it below the storyline on lane −1 (role `music`).
   Every beat is a marker on the music; the duck windows are range markers
-  ("Clip sound up"), and in FCPXML only the ducked moments keep their
-  camera sound (the rest at −96 dB, as in the render). The fade-out is a
+  ("Clip sound up"). In FCPXML the clips' camera sound follows the
+  render's mix, which goes by time rather than by clip: −96 dB outside the
+  duck windows, full inside them, and volume keyframes where a window
+  ramps in or out within a clip — including the neighbours a window runs
+  into. Beat-burst cuts stay silent, as in the render. The fade-out is a
   marker too.
 - **Not carried over:** the card design (colour, fonts), LUT and
   stabilisation, the speed-ramp flash, the project fade in/out and the

@@ -13,7 +13,10 @@
 //!   the sequence rate (the render's `fps` unless asked otherwise; NTSC
 //!   rates such as 30000/1001 are exact fractions), and every source time
 //!   a whole frame of the source's own rate (probed), offset by its
-//!   timecode — or a whole sample, for music.
+//!   timecode — or a whole sample, for music. No clip reads outside its
+//!   file: where frame rounding (or the last frame the render held) would
+//!   run one past the end, its in point slips back by that fraction of a
+//!   frame; a music piece ends on the frame before.
 //! - **Cuts.** The render cuts mid-crossfade, often half-way through a
 //!   frame. Each cut lands on whichever of the two frames either side is
 //!   closer to the music's beat, with its dissolve centred on it (as
@@ -32,9 +35,11 @@
 //!   files joined into one track are split back into their own files), on
 //!   its own audio track (OTIO) or connected below the storyline on lane
 //!   −1 (FCPXML). Beats become markers on the music, the render's duck
-//!   windows (where the music dips under a clip's own sound) range
-//!   markers; in FCPXML only the ducked moments keep their camera sound
-//!   up, as in the render.
+//!   windows (where the music dips under the footage's own sound) range
+//!   markers. In FCPXML each clip's camera sound follows the render's
+//!   mix, which goes by time, not by clip: off outside the windows, up
+//!   inside them, volume-keyframed where a window ramps in or out within
+//!   the clip; beat-bursts stay silent.
 //!
 //! Paths are written as `file://` URLs of the paths the render read. In
 //! Docker those are container paths (`/footage/…`); set
@@ -302,6 +307,105 @@ impl Media {
     fn units_at(&self, secs: f64) -> i64 {
         self.start_units + (secs.max(0.0) * self.grid.fps()).round() as i64
     }
+
+    /// End of the range to declare, in `grid` units: the probed length,
+    /// or what the edit reads when that is unknown or longer (a file
+    /// shorter than the render read it, which the notes report).
+    fn declared_end(&self) -> i64 {
+        self.duration_units.unwrap_or(self.used_end_units).max(self.used_end_units)
+    }
+}
+
+/// Source units `frames` sequence frames read at `speed`, rounded up.
+fn read_units(frames: i64, speed: Speed, seq: Rate, grid: Rate) -> i64 {
+    let num = frames.max(0) as i128 * speed.p as i128 * seq.den as i128 * grid.num as i128;
+    let den = (speed.q as i128 * seq.num as i128 * grid.den as i128).max(1);
+    ((num + den - 1) / den) as i64
+}
+
+/// Whole sequence frames that `units` source units hold at normal speed:
+/// the most `k` with `read_units(k) <= units`.
+fn frames_within(units: i64, seq: Rate, grid: Rate) -> i64 {
+    let num = units.max(0) as i128 * seq.num as i128 * grid.den as i128;
+    let den = (seq.den as i128 * grid.num as i128).max(1);
+    (num / den) as i64
+}
+
+/// The furthest a clip's in point slips to stay inside its file, in source
+/// frames. The render holds a clip's last frame when beat-lock runs it to
+/// the end of its chapter (up to two frames), and the export puts the in
+/// point and the length on two different frame grids (up to a frame more);
+/// a file shorter than that is not the one the render read.
+const MAX_SLIP_FRAMES: i64 = 4;
+
+/// Where a clip's in point goes so it reads only media its file has: a
+/// read of `[start − lead, start + run]` source units in a file holding
+/// `[first, end]` (`end` unknown when it wasn't probed). The in point
+/// never reads before the first frame, and slips back by up to `max_slip`
+/// units when the read runs past the end. A read further past stays where
+/// the render had it (the notes say so).
+fn fit_read(start: i64, lead: i64, run: i64, first: i64, end: Option<i64>, max_slip: i64) -> i64 {
+    let floor = first + lead;
+    let s = start.max(floor);
+    match end {
+        Some(end) if (1..=max_slip).contains(&(s + run - end)) => (end - run).max(floor),
+        _ => s,
+    }
+}
+
+/// The render's duck mask at output time `t`: how loud the footage's own
+/// sound plays (0 = silent, 1 = full). One trapezoid per `(start, end,
+/// ramp)` window, rising over `ramp` up to `start` and falling over `ramp`
+/// after `end` — the curve `mux_with_ducking` gives the source audio,
+/// whichever clip is playing. Rounded to a thousandth (under 0.01 dB), so
+/// the manifest's f32 window times (`29.4` is 29.3999996) don't turn a
+/// clip that is up throughout into a keyed one.
+pub fn duck_gain(windows: &[(f64, f64, f64)], t: f64) -> f64 {
+    let g: f64 = windows
+        .iter()
+        .map(|&(a, b, r)| {
+            let r = r.max(1e-3);
+            ((t - (a - r)) / r).clamp(0.0, 1.0) - ((t - b) / r).clamp(0.0, 1.0)
+        })
+        .sum();
+    (g.clamp(0.0, 1.0) * 1e3).round() / 1e3
+}
+
+/// A clip's camera sound over sequence frames `[lo, hi]` (its dissolves
+/// included): the duck mask at both ends and where it turns inside (each
+/// ramp's ends and middle), flat stretches reduced to their ends.
+fn camera_sound(windows: &[(f64, f64, f64)], lo: i64, hi: i64, rate: Rate) -> CameraSound {
+    let mut frames = vec![lo, hi];
+    for &(a, b, r) in windows {
+        let r = r.max(1e-3);
+        for t in [a - r, a - r / 2.0, a, b, b + r / 2.0, b + r] {
+            let f = rate.frames(t);
+            if f > lo && f < hi {
+                frames.push(f);
+            }
+        }
+    }
+    frames.sort_unstable();
+    frames.dedup();
+    let pts: Vec<(i64, f64)> = frames.into_iter().map(|f| (f, duck_gain(windows, rate.secs(f)))).collect();
+    if pts.iter().all(|p| p.1 == 0.0) {
+        return CameraSound::Off;
+    }
+    if pts.iter().all(|p| p.1 == 1.0) {
+        return CameraSound::Up;
+    }
+    let flat = |i: usize| i > 0 && i + 1 < pts.len() && pts[i - 1].1 == pts[i].1 && pts[i + 1].1 == pts[i].1;
+    CameraSound::Keyed((0..pts.len()).filter(|&i| !flat(i)).map(|i| pts[i]).collect())
+}
+
+/// FCPXML volume for a linear gain: `0dB`, `-6dB`, down to `-96dB`.
+fn volume_db(gain: f64) -> String {
+    let db = if gain > 0.0 { (20.0 * gain.log10()).max(-96.0) } else { -96.0 };
+    if db > -0.05 {
+        return "0dB".into();
+    }
+    let s = format!("{db:.1}");
+    format!("{}dB", s.strip_suffix(".0").unwrap_or(&s))
 }
 
 // ---------- The edit ----------
@@ -355,8 +459,30 @@ pub struct VideoClip {
     pub source_id: String,
     /// Why the moment was picked (the manifest segment's `reason`).
     pub why: String,
-    /// The render let this moment's own sound through (a duck window).
-    pub camera_sound: bool,
+    /// How much of its own sound the render let through (the duck windows).
+    pub camera_sound: CameraSound,
+}
+
+/// How loud a clip's own sound plays in the render.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CameraSound {
+    /// Silent throughout: the music plays alone.
+    Off,
+    /// At full level throughout (inside a duck window).
+    Up,
+    /// Following the render's duck mask: `(sequence frame, gain 0–1)`
+    /// points, linear in between.
+    Keyed(Vec<(i64, f64)>),
+}
+
+impl CameraSound {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CameraSound::Off => "off",
+            CameraSound::Up => "up",
+            CameraSound::Keyed(_) => "keyed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -524,8 +650,10 @@ pub fn build_edit(m: &Manifest, media: &HashMap<String, MediaFacts>, opts: &Expo
         halves[j] = h.max(0);
     }
 
-    // Camera sound stays up only where the render ducked the music for it.
-    let ducked: Vec<usize> = m.duck_windows.iter().map(|w| w.segment_index).collect();
+    // The render brings the footage's own sound up inside each duck window
+    // — by time, whichever clip plays there — and keeps it off elsewhere.
+    let windows: Vec<(f64, f64, f64)> =
+        m.duck_windows.iter().map(|w| (w.start_secs as f64, w.end_secs as f64, w.ramp_secs as f64)).collect();
 
     let mut video = Vec::new();
     for (j, (piece, ..)) in pieces.iter().enumerate() {
@@ -554,11 +682,18 @@ pub fn build_edit(m: &Manifest, media: &HashMap<String, MediaFacts>, opts: &Expo
                 for part in clip_parts(c, ci, co, rate) {
                     let mi = reg.footage(c.source_path.as_str());
                     let med = &reg.media[mi];
-                    let start_units = med.units_at(media_secs(c, rate.secs(part.lo)));
-                    // Furthest source read, the dissolve out included.
-                    let last = if part.hi == co { co + handle_out } else { part.hi };
-                    let end_units = med.units_at(media_secs(c, rate.secs(last)));
-                    reg.media[mi].used_end_units = reg.media[mi].used_end_units.max(end_units);
+                    // What the part reads: the dissolve in before its in
+                    // point, then its length and the dissolve out — counted
+                    // in sequence frames, so on a source whose frames don't
+                    // line up with the sequence's (29.97 footage in a 30 fps
+                    // edit) its end isn't where the render's was.
+                    let before = if part.lo == ci { halves[j] } else { 0 };
+                    let after = if part.hi == co { handle_out } else { 0 };
+                    let lead = read_units(before, part.speed, rate, med.grid);
+                    let run = read_units(part.hi - part.lo + after, part.speed, rate, med.grid);
+                    let wanted = med.units_at(media_secs(c, rate.secs(part.lo)));
+                    let start_units = fit_read(wanted, lead, run, med.start_units, med.duration_units, MAX_SLIP_FRAMES);
+                    reg.media[mi].used_end_units = reg.media[mi].used_end_units.max(start_units + run);
                     let stem = reg.media[mi].name.clone();
                     let name = match (c.burst_part, part.tail) {
                         (_, true) => format!("{stem} · {}× ramp", trim_float(part.speed.value())),
@@ -577,7 +712,12 @@ pub fn build_edit(m: &Manifest, media: &HashMap<String, MediaFacts>, opts: &Expo
                         ramp_tail: part.tail,
                         source_id: c.source_id.clone(),
                         why: why.clone(),
-                        camera_sound: ducked.contains(&c.segment_index),
+                        // A beat-burst plays silent under the music.
+                        camera_sound: if c.burst_part.is_some() {
+                            CameraSound::Off
+                        } else {
+                            camera_sound(&windows, part.lo - before, part.hi + after, rate)
+                        },
                     }));
                 }
             }
@@ -593,10 +733,10 @@ pub fn build_edit(m: &Manifest, media: &HashMap<String, MediaFacts>, opts: &Expo
                 // from its start, which is what plays unless it looped.
                 let mi = reg.music(credit.file.as_str());
                 let med = &reg.media[mi];
-                let track = med.duration_units.map(|u| rate.frames((u - med.start_units) as f64 / med.grid.fps()));
+                let track = med.duration_units.map(|u| frames_within(u - med.start_units, rate, med.grid));
                 let duration = track.unwrap_or(total).min(total).max(1);
                 let start_units = med.start_units;
-                let end_units = med.units_at(rate.secs(duration));
+                let end_units = start_units + read_units(duration, Speed::NORMAL, rate, med.grid);
                 reg.media[mi].used_end_units = reg.media[mi].used_end_units.max(end_units);
                 notes.push(
                     "music placed from the start of the track: this render predates the recorded music layout (render again for loops)".into(),
@@ -656,6 +796,14 @@ pub fn build_edit(m: &Manifest, media: &HashMap<String, MediaFacts>, opts: &Expo
         if !med.probed {
             notes.push(format!("{}: not found when exporting; its format was assumed", med.path));
         }
+        if let Some(end) = med.duration_units.filter(|&end| med.used_end_units > end) {
+            let over = med.used_end_units - end;
+            let unit = if med.is_music { "samples" } else { "frames" };
+            notes.push(format!(
+                "{}: the edit reads {over} {unit} past the end of the file, which is shorter than when it was rendered",
+                med.path
+            ));
+        }
     }
 
     Ok(Edit {
@@ -685,6 +833,8 @@ fn music_clips(mu: &TimelineMusic, m: &Manifest, rate: Rate, total: i64, reg: &m
     }
     let half_x = rate.frames(mu.crossfade_secs * 0.5);
     let mut out: Vec<MusicClip> = Vec::new();
+    // A piece cut a frame short (below): (its rounded end, where it ends).
+    let mut moved: Option<(i64, i64)> = None;
     for (si, span) in mu.spans.iter().enumerate() {
         let len = span.output_end_secs - span.output_start_secs;
         // Track times where this copy changes file, as output times.
@@ -698,15 +848,29 @@ fn music_clips(mu: &TimelineMusic, m: &Manifest, rate: Rate, total: i64, reg: &m
             }
         }
         for (pi, (file, local, oa, ob)) in pieces.into_iter().enumerate() {
-            let (fa, fb) = (rate.frames(oa).max(0), rate.frames(ob).min(total));
+            let (mut fa, mut fb) = (rate.frames(oa).max(0), rate.frames(ob).min(total));
+            if let Some((was, now)) = moved.take() {
+                if fa == was {
+                    fa = now;
+                }
+            }
             if fb <= fa {
                 continue;
             }
             let mi = reg.music(file.path.as_str());
             let med = &reg.media[mi];
             let start_units = med.units_at(local);
-            let end_units = med.units_at(local + rate.secs(fb - fa) + mu.crossfade_secs * 0.5);
-            reg.media[mi].used_end_units = reg.media[mi].used_end_units.max(end_units);
+            // A file that ends between two frames (the first of two joined
+            // files, a track shorter than the reel) would run up to a frame
+            // past its end on the rounded frame: end it on the frame before,
+            // and let the next piece start there.
+            if let Some(end) = med.duration_units {
+                let fit = frames_within(end - start_units, rate, med.grid);
+                if fit > 0 && fit < fb - fa && fit + 1 >= fb - fa {
+                    moved = Some((fb, fa + fit));
+                    fb = fa + fit;
+                }
+            }
             let title = m
                 .soundtrack
                 .iter()
@@ -717,13 +881,33 @@ fn music_clips(mu: &TimelineMusic, m: &Manifest, rate: Rate, total: i64, reg: &m
             out.push(MusicClip { name: title, media: mi, offset: fa, duration: fb - fa, start_units, crossfade_half });
         }
     }
-    // A crossfade fits inside both neighbours.
+    // A crossfade fits inside both neighbours, and inside both files: the
+    // incoming copy reads before its in point, the outgoing one past its
+    // out point (a frame-rounded half can ask for a hair more than the
+    // render's crossfade read).
     for i in 0..out.len() {
         if out[i].crossfade_half > 0 {
             let prev = if i > 0 { out[i - 1].duration } else { 0 };
-            let max = (prev / 2).min(out[i].duration / 2);
+            let mut max = (prev / 2).min(out[i].duration / 2);
+            let inc = &reg.media[out[i].media];
+            max = max.min(frames_within(out[i].start_units - inc.start_units, rate, inc.grid));
+            if let Some(p) = i.checked_sub(1).map(|k| &out[k]) {
+                let pm = &reg.media[p.media];
+                if let Some(end) = pm.duration_units {
+                    let read = p.start_units + read_units(p.duration, Speed::NORMAL, rate, pm.grid);
+                    max = max.min(frames_within(end - read, rate, pm.grid));
+                }
+            }
             out[i].crossfade_half = out[i].crossfade_half.min(max);
         }
+    }
+    // What each clip reads: to its end, and on into the crossfade to the
+    // next copy where there is one.
+    for (i, mc) in out.iter().enumerate() {
+        let after = out.get(i + 1).filter(|n| n.offset == mc.offset + mc.duration).map_or(0, |n| n.crossfade_half);
+        let med = &mut reg.media[mc.media];
+        let end = mc.start_units + read_units(mc.duration + after, Speed::NORMAL, rate, med.grid);
+        med.used_end_units = med.used_end_units.max(end);
     }
     out
 }
@@ -918,9 +1102,9 @@ fn otio_marker(name: &str, color: &str, start: i64, duration: i64, rate: Rate, m
 }
 
 fn otio_reference(med: &Media) -> Value {
-    let available = med
-        .duration_units
-        .map(|end| otio_range(otio_time(med.start_units, med.grid), otio_time(end - med.start_units, med.grid)));
+    let available = med.duration_units.map(|_| {
+        otio_range(otio_time(med.start_units, med.grid), otio_time(med.declared_end() - med.start_units, med.grid))
+    });
     json!({
         "OTIO_SCHEMA": "ExternalReference.1",
         "name": med.name,
@@ -962,17 +1146,23 @@ pub fn to_otio(e: &Edit) -> Value {
                         "time_scalar": c.speed.value(),
                     })]
                 };
+                let mut meta = json!({
+                    "segment_index": c.segment_index,
+                    "burst_part": c.burst_part,
+                    "source_id": c.source_id,
+                    "ramp_tail": c.ramp_tail,
+                    "camera_sound": c.camera_sound.label(),
+                    "why": c.why,
+                });
+                if let CameraSound::Keyed(pts) = &c.camera_sound {
+                    // No camera-sound track here: the level the render gave
+                    // it, as (sequence frame, gain) points.
+                    meta["camera_gain"] = json!(pts.iter().map(|&(f, g)| json!([f, g])).collect::<Vec<_>>());
+                }
                 json!({
                     "OTIO_SCHEMA": "Clip.1",
                     "name": c.name,
-                    "metadata": { "vibecut": {
-                        "segment_index": c.segment_index,
-                        "burst_part": c.burst_part,
-                        "source_id": c.source_id,
-                        "ramp_tail": c.ramp_tail,
-                        "camera_sound": c.camera_sound,
-                        "why": c.why,
-                    }},
+                    "metadata": { "vibecut": meta },
                     // Source time in the file's own frames; length in the
                     // sequence's (a clip plays in real time).
                     "source_range": otio_range(otio_time(c.start_units, med.grid), otio_time(c.duration, rate)),
@@ -1223,7 +1413,7 @@ pub fn to_fcpxml(e: &Edit) -> String {
             None => None,
         };
         let aid = id();
-        let end = med.duration_units.unwrap_or(med.used_end_units).max(med.used_end_units);
+        let end = med.declared_end();
         let mut attrs = vec![
             ("id", aid.clone()),
             ("name", med.name.clone()),
@@ -1408,10 +1598,26 @@ pub fn to_fcpxml(e: &Edit) -> String {
                     );
                     x.close("timeMap");
                 }
-                if !c.camera_sound && (med.audio.is_some() || !med.probed) {
-                    // The render keeps camera sound only where it ducked
-                    // the music for it.
-                    x.empty("adjust-volume", &[("amount", "-96dB".into())]);
+                // Camera sound as the render mixed it: off but for the duck
+                // windows, keyed in the clip's own time where one starts or
+                // ends inside it (dissolves included).
+                if med.audio.is_some() || !med.probed {
+                    match &c.camera_sound {
+                        CameraSound::Up => {}
+                        CameraSound::Off => x.empty("adjust-volume", &[("amount", "-96dB".into())]),
+                        CameraSound::Keyed(pts) => {
+                            x.open("adjust-volume", &[]);
+                            x.open("param", &[("name", "amount".into())]);
+                            x.open("keyframeAnimation", &[]);
+                            for &(f, g) in pts {
+                                let t = local_start.add(Rt::units(f - c.offset, rate));
+                                x.empty("keyframe", &[("time", t.fcpxml()), ("value", volume_db(g))]);
+                            }
+                            x.close("keyframeAnimation");
+                            x.close("param");
+                            x.close("adjust-volume");
+                        }
+                    }
                 }
                 children(&mut x, i, c.offset, local_start);
                 x.close("asset-clip");

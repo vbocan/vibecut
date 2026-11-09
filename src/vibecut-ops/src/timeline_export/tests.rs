@@ -708,15 +708,279 @@ fn fcpxml_dissolves_speed_cards_and_music() {
     let beats: Vec<&Node> = music[0].children.iter().filter(|c| c.name == "marker").collect();
     assert!(beats.iter().any(|b| b.attr("value") == Some("Beat 2") && b.attr("start") == Some("15/30s")));
 
-    // Camera sound: only the ducked moment (segment 2) keeps it.
-    let muted = doc.find_all("asset-clip").into_iter().filter(|c| c.child("adjust-volume").is_some()).count();
-    let footage = clips(&e).len();
-    assert_eq!(muted, footage - 1);
+    // Camera sound: the duck window (6.0–8.5 s) ramps in during B and out
+    // during C, so those two are keyed; the rest are muted.
+    let volumes: Vec<&Node> = doc.find_all("adjust-volume");
+    let muted = volumes.iter().filter(|v| v.attr("amount") == Some("-96dB")).count();
+    let keyed = volumes.iter().filter(|v| v.child("param").is_some()).count();
+    assert_eq!((muted, keyed), (clips(&e).len() - 2, 2));
     // Assets point at percent-encoded file URLs.
     let reps: Vec<&str> = doc.find_all("media-rep").iter().filter_map(|r| r.attr("src")).collect();
     assert!(reps.contains(&"file:///footage/%C3%89t%C3%A9%20%26%20%3CSea%3E/GX010042.MP4"), "{reps:?}");
     // The project carries the reel's (escaped) name.
     assert_eq!(doc.find_all("project")[0].attr("name"), Some("Coast & <Sea> · Été"));
+}
+
+// ---------- Reads stay inside the media ----------
+
+/// Every clip in the FCPXML and the OTIO reads only media its file has:
+/// from its in point (less the dissolve before it) to its out point (plus
+/// the dissolve after it), at its speed, inside its asset's declared range
+/// (FCPXML) and its reference's available range (OTIO).
+fn assert_reads_inside_media(e: &Edit) {
+    let secs = |s: &str| {
+        let (n, d) = rt(s);
+        n as f64 / d as f64
+    };
+    let doc = parse_xml(&to_fcpxml(e)).unwrap();
+    let assets: HashMap<String, (f64, f64)> = doc
+        .find_all("asset")
+        .iter()
+        .map(|a| {
+            let s = secs(a.attr("start").unwrap());
+            (a.attr("id").unwrap().to_string(), (s, s + secs(a.attr("duration").unwrap())))
+        })
+        .collect();
+    let check = |c: &Node, before: f64, after: f64| {
+        let (lo, hi) = assets[c.attr("ref").unwrap()];
+        let speed = c.child("timeMap").map_or(1.0, |tm| {
+            let p = &tm.children[1];
+            secs(p.attr("value").unwrap()) / secs(p.attr("time").unwrap())
+        });
+        let start = secs(c.attr("start").unwrap()) * speed;
+        let dur = secs(c.attr("duration").unwrap());
+        let (a, b) = (start - before * speed, start + (dur + after) * speed);
+        assert!(
+            a >= lo - 1e-9 && b <= hi + 1e-9,
+            "fcpxml {} at {}: reads [{a:.4}, {b:.4}] of [{lo:.4}, {hi:.4}] ({})",
+            c.attr("name").unwrap(),
+            e.rate.label(),
+            c.attr("offset").unwrap(),
+        );
+    };
+    let spine = &doc.find_all("spine")[0].children;
+    let half = |k: Option<usize>| {
+        k.and_then(|k| spine.get(k)).filter(|t| t.name == "transition").map_or(0.0, |t| secs(t.attr("duration").unwrap()) / 2.0)
+    };
+    for (i, item) in spine.iter().enumerate().filter(|(_, n)| n.name == "asset-clip") {
+        check(item, half(i.checked_sub(1)), half(Some(i + 1)));
+    }
+    for m in doc.find_all("asset-clip").into_iter().filter(|c| c.attr("lane") == Some("-1")) {
+        check(m, 0.0, 0.0);
+    }
+
+    let v = to_otio(e);
+    let t = |x: &Value| x["value"].as_f64().unwrap() / x["rate"].as_f64().unwrap();
+    for track in v["tracks"]["children"].as_array().unwrap() {
+        let kids = track["children"].as_array().unwrap();
+        for (i, k) in kids.iter().enumerate().filter(|(_, k)| k["OTIO_SCHEMA"] == "Clip.1") {
+            let is_t = |x: &&Value| x["OTIO_SCHEMA"] == "Transition.1";
+            // A transition takes `in_offset` before the cut from the clip
+            // after it, `out_offset` after the cut from the clip before.
+            let before = i.checked_sub(1).map(|p| &kids[p]).filter(is_t).map_or(0.0, |p| t(&p["in_offset"]));
+            let after = kids.get(i + 1).filter(is_t).map_or(0.0, |p| t(&p["out_offset"]));
+            let speed = k["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["OTIO_SCHEMA"] == "LinearTimeWarp.1")
+                .map_or(1.0, |f| f["time_scalar"].as_f64().unwrap());
+            let sr = &k["source_range"];
+            let start = t(&sr["start_time"]);
+            let (a, b) = (start - before * speed, start + (t(&sr["duration"]) + after) * speed);
+            let av = &k["media_reference"]["available_range"];
+            let (lo, hi) = (t(&av["start_time"]), t(&av["start_time"]) + t(&av["duration"]));
+            assert!(
+                a >= lo - 1e-9 && b <= hi + 1e-9,
+                "otio {} at {}: reads [{a:.4}, {b:.4}] of [{lo:.4}, {hi:.4}]",
+                k["name"],
+                e.rate.label(),
+            );
+        }
+    }
+}
+
+/// Each footage file ends on the last whole frame before the render's
+/// furthest read of it (the render held that last frame for the rest, as
+/// it does when beat-lock runs a clip to the end of its chapter); C is
+/// 29.97 like A, so every pairing of 30 and 29.97 sources and sequences
+/// shows up.
+fn tight_facts(m: &Manifest) -> HashMap<String, MediaFacts> {
+    let tl = m.timeline.as_ref().unwrap();
+    let mut f = facts();
+    f.get_mut(C).unwrap().video.as_mut().unwrap().rate = Rate::new(30000, 1001);
+    for (path, fact) in f.iter_mut() {
+        let Some(v) = fact.video else { continue };
+        let end = tl.clips.iter().filter(|c| c.source_path.as_str() == path).map(|c| c.source_out_secs).reduce(f64::max);
+        if let Some(end) = end {
+            fact.duration_secs = Some((end * v.rate.fps()).floor() / v.rate.fps());
+        }
+    }
+    f
+}
+
+#[test]
+fn clips_never_read_past_the_end_of_their_media() {
+    let m = fixture();
+    let tight = tight_facts(&m);
+    for rate in [None, Some(Rate::new(30000, 1001))] {
+        for facts in [facts(), tight.clone()] {
+            let e = build_edit(&m, &facts, &ExportOptions { rate, path_map: vec![] }).unwrap();
+            assert_reads_inside_media(&e);
+            // Every asset is declared as long as its file: the reads fit.
+            for med in &e.media {
+                let probed = facts[&med.path].duration_secs.unwrap();
+                assert_eq!(med.duration_units, Some(med.start_units + (probed * med.grid.fps()).round() as i64));
+                assert!(med.used_end_units <= med.duration_units.unwrap(), "{} reads past its end", med.path);
+            }
+            assert!(!e.notes.iter().any(|n| n.contains("past the end")), "{:?}", e.notes);
+            // The music still runs back to back, top to tail.
+            let mut at = 0;
+            for mc in &e.music {
+                assert_eq!(mc.offset, at);
+                at += mc.duration;
+            }
+            assert_eq!(at, e.frames, "at {}", e.rate.label());
+        }
+    }
+}
+
+#[test]
+fn an_in_point_slips_back_only_as_far_as_rounding_explains() {
+    // Read [start − 4, start + 77] of a file holding [0, 600].
+    assert_eq!(fit_read(523, 4, 77, 0, Some(600), 4), 523, "fits as is");
+    assert_eq!(fit_read(524, 4, 77, 0, Some(600), 4), 523, "a frame over slips back");
+    assert_eq!(fit_read(527, 4, 77, 0, Some(600), 4), 523, "four over, still rounding");
+    assert_eq!(fit_read(520, 4, 77, 0, None, 4), 520, "no known end");
+    // Never before the file's first frame (its timecode), handle included.
+    assert_eq!(fit_read(302, 4, 77, 300, Some(1000), 4), 304);
+    // Further past the end than rounding explains: left where the render
+    // had it (17 frames over, which the notes report).
+    assert_eq!(fit_read(540, 4, 77, 0, Some(600), 4), 540);
+    // A file too short for the read: from its first frame.
+    assert_eq!(fit_read(10, 4, 77, 0, Some(70), 20), 4);
+    // Lengths in source units round up, at the clip's speed.
+    let (ntsc, thirty) = (Rate::new(30000, 1001), Rate::new(30, 1));
+    assert_eq!(read_units(77, Speed::NORMAL, ntsc, thirty), 78, "77 NTSC frames are 77.08 frames of 30");
+    assert_eq!(read_units(90, Speed::NORMAL, thirty, ntsc), 90, "89.91 → 90");
+    assert_eq!(read_units(10, Speed { p: 3, q: 1 }, thirty, thirty), 30);
+    assert_eq!(read_units(180, Speed::NORMAL, ntsc, Rate::new(44100, 1)), 264_865);
+    assert_eq!(frames_within(264_600, ntsc, Rate::new(44100, 1)), 179, "a 6 s file holds 179 NTSC frames");
+    assert_eq!(frames_within(264_600, thirty, Rate::new(44100, 1)), 180);
+}
+
+#[test]
+fn a_file_shorter_than_the_render_read_is_noted_not_slipped() {
+    let m = fixture();
+    let mut f = facts();
+    // C (read from 1.0 s to ~3.3 s) now holds 2 s: a different file.
+    f.get_mut(C).unwrap().duration_secs = Some(2.0);
+    let e = build_edit(&m, &f, &ExportOptions::default()).unwrap();
+    let c = clips(&e).into_iter().find(|c| c.segment_index == 3).unwrap();
+    let med = &e.media[c.media];
+    // In point where the render had it, not a second earlier.
+    let normal = edit_at(None);
+    let want = clips(&normal).into_iter().find(|c| c.segment_index == 3).unwrap().start_units;
+    assert_eq!(c.start_units, want);
+    assert_eq!(want, 34, "1.0 s into C, plus the 7.633 s cut less its 7.5 s start, at 30 fps");
+    assert!(med.used_end_units > med.duration_units.unwrap());
+    let note = e.notes.iter().find(|n| n.contains("past the end")).expect("a note");
+    assert!(note.starts_with(C) && note.contains("frames"), "{note}");
+    // The file stays consistent: the asset is declared as long as it's read.
+    assert_eq!(med.declared_end(), med.used_end_units);
+    assert_reads_inside_media(&e);
+}
+
+#[test]
+fn camera_sound_follows_the_duck_windows_in_time() {
+    // The fixture's window (6.0–8.5 s, 0.3 s ramps) is picked for segment
+    // 2 (clip B, cut 5.95–7.65 s) but runs on into clip C until 8.8 s; the
+    // render plays C's own sound there too.
+    let e = edit_at(None);
+    let r = e.rate;
+    let cs = clips(&e);
+    let b = cs.iter().find(|c| c.segment_index == 2).unwrap();
+    let c = cs.iter().find(|c| c.segment_index == 3).unwrap();
+    // B comes up through the ramp (its dissolve in starts mid-ramp)…
+    let CameraSound::Keyed(bk) = &b.camera_sound else { panic!("{:?}", b.camera_sound) };
+    assert!(bk[0].1 > 0.0 && bk[0].1 < 1.0, "{bk:?}");
+    assert!(bk.contains(&(r.frames(6.0), 1.0)) && bk.last().unwrap().1 == 1.0, "{bk:?}");
+    // …and C, not in the window's segment, is up from its start until the
+    // window ramps out.
+    let CameraSound::Keyed(ck) = &c.camera_sound else { panic!("{:?}", c.camera_sound) };
+    assert_eq!(ck[0].1, 1.0, "{ck:?}");
+    assert!(ck.contains(&(r.frames(8.5), 1.0)) && ck.contains(&(r.frames(8.8), 0.0)), "{ck:?}");
+    assert_eq!(ck.last().unwrap().1, 0.0);
+    // The rest are silent — the burst too: the render mutes it, window or not.
+    for x in cs.iter().filter(|x| x.segment_index < 2) {
+        assert_eq!(x.camera_sound, CameraSound::Off, "{}", x.name);
+    }
+
+    // FCPXML: volume keyframes in C's own (source) time.
+    let doc = parse_xml(&to_fcpxml(&e)).unwrap();
+    let node = doc.find_all("asset-clip").into_iter().find(|n| n.attr("name") == Some("GX010044")).unwrap();
+    let av = node.child("adjust-volume").unwrap();
+    assert_eq!(av.attr("amount"), None);
+    let param = av.child("param").unwrap();
+    assert_eq!(param.attr("name"), Some("amount"));
+    let keys: Vec<(i64, &str)> = param
+        .child("keyframeAnimation")
+        .unwrap()
+        .children
+        .iter()
+        .map(|k| {
+            // Back to sequence frames: start + (f − offset)/30 s.
+            let (n, d) = rt(k.attr("time").unwrap());
+            let local = n as i128 * 30 / d as i128;
+            ((local - c.start_units as i128) as i64 + c.offset, k.attr("value").unwrap())
+        })
+        .collect();
+    assert!(keys.contains(&(255, "0dB")) && keys.contains(&(264, "-96dB")), "{keys:?}");
+    assert!(keys.iter().any(|k| k.1 != "0dB" && k.1 != "-96dB"), "the ramp's middle: {keys:?}");
+    // OTIO, which has no camera-sound track, carries it as metadata.
+    let v = to_otio(&e);
+    let oc = v["tracks"]["children"][0]["children"].as_array().unwrap().iter().find(|k| k["name"] == "GX010044").unwrap();
+    assert_eq!(oc["metadata"]["vibecut"]["camera_sound"], "keyed");
+    assert_eq!(oc["metadata"]["vibecut"]["camera_gain"].as_array().unwrap().len(), ck.len());
+
+    // A window wide enough to hold all of B (dissolves too): B plays at full
+    // level, no volume change at all.
+    let mut m = fixture();
+    m.duck_windows[0].start_secs = 5.0;
+    m.duck_windows[0].end_secs = 9.0;
+    let e = build_edit(&m, &facts(), &ExportOptions::default()).unwrap();
+    let b = clips(&e).into_iter().find(|c| c.segment_index == 2).unwrap();
+    assert_eq!(b.camera_sound, CameraSound::Up);
+    let doc = parse_xml(&to_fcpxml(&e)).unwrap();
+    let node = doc.find_all("asset-clip").into_iter().find(|n| n.attr("offset") == Some(frames_str(b.offset).as_str())).unwrap();
+    assert!(node.child("adjust-volume").is_none());
+    // No windows: everything muted, as the render plays the music alone.
+    m.duck_windows.clear();
+    let e = build_edit(&m, &facts(), &ExportOptions::default()).unwrap();
+    assert!(clips(&e).iter().all(|c| c.camera_sound == CameraSound::Off));
+}
+
+#[test]
+fn the_duck_mask_matches_the_mix() {
+    let w = [(6.0, 8.5, 0.3)];
+    for (t, g) in [(5.0, 0.0), (5.7, 0.0), (5.85, 0.5), (6.0, 1.0), (7.0, 1.0), (8.5, 1.0), (8.65, 0.5), (8.8, 0.0), (9.0, 0.0)] {
+        assert_eq!(duck_gain(&w, t), g, "at {t}");
+    }
+    // Two windows add up; never over full.
+    assert_eq!(duck_gain(&[(1.0, 2.0, 0.5), (3.0, 4.0, 0.5)], 2.5), 0.0);
+    assert_eq!(duck_gain(&[(1.0, 2.0, 0.5), (1.5, 4.0, 0.5)], 1.75), 1.0);
+    // The manifest's times are f32: a window to the end of a 29.4 s reel
+    // ends at 29.3999996 s. A clip up to that end is up, not keyed.
+    let to_the_end = [(25.4f32 as f64, 29.4f32 as f64, 0.3f32 as f64)];
+    assert_eq!(duck_gain(&to_the_end, 882.0 / 30.0), 1.0);
+    assert_eq!(camera_sound(&to_the_end, 801, 882, Rate::new(30, 1)), CameraSound::Up);
+    assert_eq!((volume_db(1.0), volume_db(0.5), volume_db(0.0), volume_db(1e-9)), ("0dB".into(), "-6dB".into(), "-96dB".into(), "-96dB".into()));
+    assert_eq!(volume_db(0.25), "-12dB");
+    assert_eq!(volume_db(0.3), "-10.5dB");
+}
+
+fn frames_str(f: i64) -> String {
+    Rt::units(f, Rate::new(30, 1)).fcpxml()
 }
 
 // ---------- OTIO ----------
