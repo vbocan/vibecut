@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 
 use crate::project_config::{AngleGroupCfg, MultiAngle, SyncMethod};
-use crate::selection_planner::{Source, SourceTelemetry};
+use crate::selection_planner::{same_source_id, Source, SourceTelemetry};
 use crate::selection_scoring::ScoreCurve;
 
 /// One discovered (or manually configured) angle group.
@@ -105,11 +105,13 @@ pub fn discover_groups(
 
 /// Build groups straight from the TOML config. Members not found in `sources`
 /// are silently dropped with a warning. A group with fewer than two existing
-/// members is dropped entirely (it's not multi-camera).
+/// members is dropped entirely (it's not multi-camera). Configured ids match
+/// source ids ignoring letter case ([`same_source_id`]); the group records
+/// the sources' own ids, which everything downstream compares exactly.
 fn groups_from_config(sources: &[Source], cfgs: &[AngleGroupCfg]) -> Vec<AngleGroup> {
     let mut out = Vec::new();
     for c in cfgs {
-        let Some(master) = sources.iter().find(|s| s.id == c.master) else {
+        let Some(master) = sources.iter().find(|s| same_source_id(&c.master, &s.id)) else {
             tracing::warn!(master = %c.master, "configured master not found among sources");
             continue;
         };
@@ -121,12 +123,14 @@ fn groups_from_config(sources: &[Source], cfgs: &[AngleGroupCfg]) -> Vec<AngleGr
             offset_source: OffsetSource::Self_,
         }];
         for mid in &c.members {
-            if mid == &c.master {
+            if same_source_id(mid, &master.id) {
                 continue;
             }
-            match sources.iter().find(|s| &s.id == mid) {
-                Some(_) => members.push(AngleMember {
-                    source_id: mid.clone(),
+            match sources.iter().find(|s| same_source_id(mid, &s.id)) {
+                // Listed twice (in any case): one member.
+                Some(s) if members.iter().any(|m| m.source_id == s.id) => {}
+                Some(s) => members.push(AngleMember {
+                    source_id: s.id.clone(),
                     offset_secs: 0.0, // filled in by compute_offsets
                     start_in_master: 0.0,
                     end_in_master: 0.0,
@@ -140,7 +144,7 @@ fn groups_from_config(sources: &[Source], cfgs: &[AngleGroupCfg]) -> Vec<AngleGr
             continue;
         }
         out.push(AngleGroup {
-            master_id: c.master.clone(),
+            master_id: master.id.clone(),
             members,
         });
     }
@@ -302,10 +306,8 @@ pub fn compute_offsets<F>(
             let mode = cfg.sync;
             let (offset, source) = match mode {
                 SyncMethod::Manual => {
-                    let manual = manual_offsets
-                        .get(&g.master_id)
-                        .and_then(|m| m.get(&member_src.id))
-                        .and_then(|s| parse_signed_humantime(s));
+                    let manual = manual_offset_for(&manual_offsets, &g.master_id, &member_src.id)
+                        .and_then(parse_signed_humantime);
                     match manual {
                         Some(o) => (o, OffsetSource::Manual),
                         None => {
@@ -400,6 +402,25 @@ fn manual_offsets_index<'a>(
         out.insert(g.master.clone(), &g.offsets);
     }
     out
+}
+
+/// The configured `offsets` entry for `member_id` in the group whose
+/// configured master is `master_id`, both matched ignoring letter case
+/// (the config may spell an id `gx010042` for the source `GX010042`).
+fn manual_offset_for<'a>(
+    index: &BTreeMap<String, &'a BTreeMap<String, String>>,
+    master_id: &str,
+    member_id: &str,
+) -> Option<&'a str> {
+    index
+        .iter()
+        .filter(|(m, _)| same_source_id(m, master_id))
+        .find_map(|(_, offsets)| {
+            offsets
+                .iter()
+                .find(|(k, _)| same_source_id(k, member_id))
+                .map(|(_, v)| v.as_str())
+        })
 }
 
 /// Parse a signed humantime duration like `"+2.4s"`, `"-800ms"`, `"500ms"`.
@@ -709,6 +730,44 @@ mod tests {
         assert_eq!(groups[0].master_id, "B");
         let ids: Vec<_> = groups[0].members.iter().map(|m| m.source_id.as_str()).collect();
         assert_eq!(ids, vec!["B", "C"]);
+    }
+
+    #[test]
+    fn configured_ids_match_sources_ignoring_case() {
+        // Ids as files name them; the config typed in lowercase (and one
+        // member listed twice).
+        let sources = vec![
+            make_source("DJI_0001", 60.0, Some("2026-05-07T10:00:00.0Z")),
+            make_source("GX010042", 60.0, Some("2026-05-07T10:00:00.0Z")),
+            make_source("IMG_7", 60.0, Some("2026-05-07T10:00:00.0Z")),
+        ];
+        let mut offsets = BTreeMap::new();
+        offsets.insert("gx010042".to_string(), "+1.5s".to_string());
+        let cfg = MultiAngle {
+            enabled: true,
+            sync: SyncMethod::Manual,
+            groups: vec![AngleGroupCfg {
+                master: "dji_0001".into(),
+                members: vec!["gx010042".into(), "GX010042".into(), "Dji_0001".into()],
+                offsets,
+            }],
+            ..Default::default()
+        };
+        let mut groups = discover_groups(&sources, &cfg, 1.0);
+        assert_eq!(groups.len(), 1);
+        // The sources' own ids, as the segments carry them.
+        assert_eq!(groups[0].master_id, "DJI_0001");
+        let ids: Vec<_> = groups[0].members.iter().map(|m| m.source_id.as_str()).collect();
+        assert_eq!(ids, vec!["DJI_0001", "GX010042"]);
+        compute_offsets::<fn(&camino::Utf8Path, &camino::Utf8Path, f32, f32) -> Option<(f64, f32)>>(
+            &mut groups,
+            &sources,
+            &cfg,
+            None,
+        );
+        let gx = &groups[0].members[1];
+        assert!((gx.offset_secs - 1.5).abs() < 1e-6, "manual offset not found: {}", gx.offset_secs);
+        assert_eq!(gx.offset_source, OffsetSource::Manual);
     }
 
     #[test]

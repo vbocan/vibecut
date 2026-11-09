@@ -555,7 +555,8 @@ pub struct Selection {
 /// by 1.5 before composing the pick set. `weight = 0.0` effectively
 /// drops the source from candidacy entirely (it only fills slots
 /// nothing else can). Last-write-wins if the
-/// same `source_id` appears more than once.
+/// same `source_id` appears more than once. `source_id` matches the
+/// source's id ignoring letter case (`"dji_0001"` weights `DJI_0001`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]

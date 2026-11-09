@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use vibecut::project_config::{
     BeatBurstMode, Config, SelectionExclude, Soundtrack, SourceWeight,
 };
+use vibecut::selection_planner::same_source_id;
 
 use crate::error::OpsError;
 use crate::paths::resolve_projects;
@@ -230,29 +231,33 @@ fn apply_source_weight(
     let mut notes = Vec::new();
     for sid in source_ids {
         // The picker reads the last entry for a source, so that's the
-        // current weight; unset means 1.0.
-        let current = cfg
+        // current weight; unset means 1.0. Ids match ignoring letter
+        // case, as the picker matches them (`same_source_id`): "less of
+        // clip dji_0001" finds an entry written `DJI_0001`.
+        let existing = cfg
             .selection
             .source_weights
             .iter()
             .rev()
-            .find(|w| w.source_id == *sid)
-            .map(|w| w.weight);
+            .find(|w| same_source_id(&w.source_id, sid));
+        let current = existing.map(|w| w.weight);
+        // Keep the key as the config already spells it; a new one as asked.
+        let key = existing.map_or_else(|| sid.clone(), |w| w.source_id.clone());
         let before = current
             .map(|w| format!("{w:.3}"))
             .unwrap_or_else(|| "(unset; default 1.0)".to_string());
         let weight = stepped_weight(current.unwrap_or(1.0), step);
-        // Replace any prior entries for the same source_id, so repeated
+        // Replace any prior entries for the same source, so repeated
         // MoreOf / LessOf calls leave exactly one entry.
         cfg.selection
             .source_weights
-            .retain(|w| w.source_id != *sid);
+            .retain(|w| !same_source_id(&w.source_id, sid));
         cfg.selection.source_weights.push(SourceWeight {
-            source_id: sid.clone(),
+            source_id: key.clone(),
             weight,
         });
         notes.push(note(
-            &format!("selection.source_weights[{sid}]"),
+            &format!("selection.source_weights[{key}]"),
             &before,
             &format!("{weight:.3}"),
         ));
@@ -1175,6 +1180,32 @@ stabilize = false
         let ok = apply_feedback_to_file(&p, &FeedbackAction::DifferentMusic { path: song.clone() }).await.unwrap();
         assert_eq!(ok.changes[0].after, song);
         assert!(std::fs::read_to_string(&path).unwrap().contains(&song));
+    }
+
+    /// "less of clip dji_0001" (the tell-it grammar lowercases what the
+    /// user types) steps the entry the config already has for `DJI_0001`,
+    /// keeping its key as written, and leaves one entry.
+    #[test]
+    fn source_weights_match_ids_ignoring_case_and_keep_the_written_key() {
+        let mut cfg = base_config();
+        cfg.selection.source_weights = vec![SourceWeight { source_id: "DJI_0001".into(), weight: 2.0 }];
+        let notes = apply(&mut cfg, &FeedbackAction::LessOf { source_ids: vec!["dji_0001".into()] }).unwrap();
+        assert_eq!(cfg.selection.source_weights.len(), 1, "{:?}", cfg.selection.source_weights);
+        assert_eq!(cfg.selection.source_weights[0].source_id, "DJI_0001");
+        assert!((cfg.selection.source_weights[0].weight - 1.0).abs() < 1e-6);
+        assert_eq!(notes[0].field, "selection.source_weights[DJI_0001]");
+        assert_eq!(notes[0].before, "2.000");
+        // And back up, typed another way.
+        apply(&mut cfg, &FeedbackAction::MoreOf { source_ids: vec!["Dji_0001".into()] }).unwrap();
+        assert_eq!(cfg.selection.source_weights.len(), 1);
+        assert_eq!(cfg.selection.source_weights[0].source_id, "DJI_0001");
+        assert!((cfg.selection.source_weights[0].weight - 2.0).abs() < 1e-6);
+        // A source with no entry yet gets one as asked; the pipeline
+        // matches it to the source ignoring case too.
+        apply(&mut cfg, &FeedbackAction::LessOf { source_ids: vec!["img_1234".into()] }).unwrap();
+        assert_eq!(cfg.selection.source_weights.len(), 2);
+        assert_eq!(cfg.selection.source_weights[1].source_id, "img_1234");
+        assert!((cfg.selection.source_weights[1].weight - 0.5).abs() < 1e-6);
     }
 
     #[test]

@@ -656,16 +656,12 @@ fn execute_pipeline(cfg: &Config, no_visual: bool, no_cache: bool, explain: bool
     // Apply [[selection.source_weights]] BEFORE excludes.
     // Last-write-wins on duplicate source_ids; weight is clamped to
     // [0, 10]. weight = 0 effectively drops the source from picks
-    // (every score becomes 0 → picker won't choose it).
+    // (every score becomes 0 → picker won't choose it). Keys match
+    // source ids ignoring letter case (`same_source_id`).
     if !cfg.selection.source_weights.is_empty() {
-        use std::collections::HashMap;
-        let mut weights: HashMap<&str, f32> = HashMap::new();
-        for w in &cfg.selection.source_weights {
-            weights.insert(w.source_id.as_str(), w.weight.clamp(0.0, 10.0));
-        }
         let mut applied = 0usize;
         for (src, curve) in sources.iter().zip(curves.iter_mut()) {
-            if let Some(&w) = weights.get(src.id.as_str()) {
+            if let Some(w) = source_weight_for(&cfg.selection.source_weights, &src.id) {
                 curve.scale(w);
                 applied += 1;
             }
@@ -2398,6 +2394,42 @@ pub fn short_hash(full: &str) -> String {
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+/// The `[[selection.source_weights]]` weight for source `id`, clamped to
+/// [0, 10]: the last entry whose key names it, ignoring letter case
+/// ([`crate::selection_planner::same_source_id`]), so a key typed as
+/// `dji_0001` weights the source `DJI_0001`. `None` when no entry does.
+fn source_weight_for(weights: &[crate::project_config::SourceWeight], id: &str) -> Option<f32> {
+    weights
+        .iter()
+        .rev()
+        .find(|w| crate::selection_planner::same_source_id(&w.source_id, id))
+        .map(|w| w.weight.clamp(0.0, 10.0))
+}
+
+#[cfg(test)]
+mod source_weight_tests {
+    use super::*;
+    use crate::project_config::SourceWeight;
+
+    fn w(id: &str, weight: f32) -> SourceWeight {
+        SourceWeight { source_id: id.into(), weight }
+    }
+
+    #[test]
+    fn keys_match_ids_ignoring_case_and_the_last_entry_wins() {
+        let weights = vec![w("DJI_0001", 2.0), w("gx010042", 0.5), w("dji_0001", 0.25), w("0318", 20.0)];
+        // Typed lowercase, written uppercase, or the other way round.
+        assert_eq!(source_weight_for(&weights, "DJI_0001"), Some(0.25));
+        assert_eq!(source_weight_for(&weights, "dji_0001"), Some(0.25));
+        assert_eq!(source_weight_for(&weights, "GX010042"), Some(0.5));
+        // Clamped; other ids untouched.
+        assert_eq!(source_weight_for(&weights, "0318"), Some(10.0));
+        assert_eq!(source_weight_for(&weights, "IMG_1234"), None);
+        // Case only: never a different id.
+        assert_eq!(source_weight_for(&weights, "DJI_00010"), None);
+    }
 }
 
 /// One output in the body's own shape, with no cap of its own: the mux

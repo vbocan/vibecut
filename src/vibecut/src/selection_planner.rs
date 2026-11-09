@@ -176,6 +176,17 @@ pub fn group_into_sources(files: &[ProbedFile]) -> Vec<Source> {
     sources
 }
 
+/// Whether a source id written somewhere (a `source_weights` key, a
+/// `[[multi_angle.groups]]` master / member / offset key, a "more of / less
+/// of" feedback request) names the source `id`. Letter case doesn't count,
+/// the same rule [`group_into_sources`] uses to decide that two ids clash
+/// (so no two sources ever match one key): "less of clip dji_0001", which
+/// the UI's tell-it grammar lowercases, finds the source `DJI_0001`. Keys
+/// keep whatever case they were written with.
+pub fn same_source_id(written: &str, id: &str) -> bool {
+    written.eq_ignore_ascii_case(id)
+}
+
 /// Give every source a distinct id. Ids are what `[selection]
 /// source_weights`, `[multi_angle]` groups and the manifest refer to, so a
 /// clash (recording 0042 on two cameras or two cards) must not silently

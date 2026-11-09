@@ -570,6 +570,13 @@ weight (down to 0.125, never 0 — the source still appears, just less) and
 "more of" doubles it (up to 8), so one undoes the other. "Drop this
 moment" adds an `exclude` for the footage that played there.
 
+Source ids in `source_weights`, `[[multi_angle.groups]]` (`master`,
+`members`, `offsets` keys) and the "more of / less of clip …" feedback
+match ignoring letter case — `source_id = "dji_0001"` weights the clip
+`DJI_0001.MP4` — and a feedback step keeps an existing key spelled as it
+was written. No two sources ever differ only in case (such ids clash and
+are renamed, above).
+
 Use `max_per_source` when target duration is large vs. number of sources
 (e.g., 5-min cut over 80 sources where each has only a couple of strong
 moments) — without it the auto-cap = 1 will under-fill.
